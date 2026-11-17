@@ -120,7 +120,7 @@ def analyze_news_ai(news_items, api_key):
             "Content-Type": "application/json"
         }
         payload = {
-            "model": "llama3-8b-8192",
+            "model": "llama-3.1-8b-instant",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1
         }
@@ -193,7 +193,7 @@ def get_ai_trading_mentor(price, tech_score, oi_trend, pattern_exp, news_exp, ap
     try:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         payload = {
-            "model": "llama3-8b-8192",
+            "model": "llama-3.1-8b-instant",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2
         }
