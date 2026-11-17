@@ -28,7 +28,7 @@ except Exception:
 # within a single asset analysis.
 # ============================================================
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.1"
 DB_PATH = "saliga_journal.sqlite3"
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
@@ -122,7 +122,6 @@ def cached_market_symbols(name: str) -> list[str]:
             if m.get("base") == base and m.get("quote") == "USDT" and m.get("swap") and m.get("active", True)
         ]
         if candidates:
-            # Prefer linear USDT-settled perpetual swap.
             candidates.sort(key=lambda m: (not bool(m.get("linear")), not bool(m.get("settle") == "USDT")))
             found.append(candidates[0]["symbol"])
         else:
@@ -140,7 +139,6 @@ def resolve_symbol(ex, name: str, symbol: str) -> str:
     if candidates:
         candidates.sort(key=lambda m: (not bool(m.get("linear")), not bool(m.get("settle") == "USDT")))
         return candidates[0]["symbol"]
-    # Spot is deliberately not silently substituted for perpetual data.
     raise ValueError(f"{name}: nem található aktív USDT perpetual piac ehhez: {symbol}")
 
 
@@ -161,15 +159,6 @@ def fetch_ohlcv_cached(exchange_name: str, symbol: str, timeframe: str, limit: i
     return df
 
 
-def fetch_ticker_price(ex, symbol: str) -> float:
-    unified_symbol = resolve_symbol(ex, ex.id.upper() if ex.id else "", symbol)
-    ticker = ex.fetch_ticker(unified_symbol)
-    price = safe_float(ticker.get("last")) or safe_float(ticker.get("close"))
-    if price is None or price <= 0:
-        raise RuntimeError("A tőzsde nem adott érvényes aktuális árat.")
-    return price
-
-
 def load_asset_market(symbol: str) -> dict:
     errors = []
     for venue in EXCHANGE_ORDER:
@@ -177,7 +166,6 @@ def load_asset_market(symbol: str) -> dict:
             ex = exchange_client(venue)
             unified_symbol = resolve_symbol(ex, venue, symbol)
             frames = {}
-            # One venue for every timeframe in this asset; no mixed-exchange candles.
             for tf in TIMEFRAMES:
                 frames[tf] = fetch_ohlcv_cached(venue, symbol, tf, 500 if tf != "1d" else 250)
             ticker = ex.fetch_ticker(unified_symbol)
@@ -208,7 +196,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x["sma50"] = close.rolling(50).mean()
     x["vol_sma20"] = x.volume.rolling(20).mean()
     x["volume_ratio"] = x.volume / x.vol_sma20.replace(0, np.nan)
-    # Candle-direction delta is only a rough proxy, clearly labelled as estimated.
     x["estimated_delta"] = np.where(close >= x.open, x.volume, -x.volume)
     x["estimated_delta_20"] = x.estimated_delta.rolling(20).sum()
     return x
@@ -230,11 +217,10 @@ def swing_points(df: pd.DataFrame, left: int = 3, right: int = 3) -> tuple[list[
 
 
 def market_structure(df: pd.DataFrame) -> dict:
-    x = df.iloc[:-1].copy() if len(df) > 2 else df.copy()  # exclude live candle
+    x = df.iloc[:-1].copy() if len(df) > 2 else df.copy()
     if len(x) < 40:
         return {"bias": 0, "label": "Kevés adat", "bos": "N/A", "last_swing_high": None, "last_swing_low": None, "score": 0}
     highs, lows = swing_points(x.tail(180).reset_index(drop=True))
-    # Indices are local to the tail frame.
     sh = [v for _, v in highs[-4:]]
     sl = [v for _, v in lows[-4:]]
     hh = len(sh) >= 2 and sh[-1] > sh[-2]
@@ -286,7 +272,6 @@ def liquidity_map(df: pd.DataFrame) -> dict:
         sweep = "Felső likviditás kisöprés – bearish visszazárás"
     elif last.low < prior_low and last.close > prior_low:
         sweep = "Alsó likviditás kisöprés – bullish visszazárás"
-    # Three-candle fair value gap; last completed candle only.
     fvg = "Nincs friss FVG"
     if len(x) >= 3:
         c1, c3 = x.iloc[-3], x.iloc[-1]
@@ -299,7 +284,6 @@ def liquidity_map(df: pd.DataFrame) -> dict:
 
 
 def volume_profile_proxy(df: pd.DataFrame, bins: int = 24) -> dict:
-    # OHLCV-based approximation, not exchange tick-level volume profile.
     x = df.iloc[:-1].tail(250)
     if len(x) < 30:
         return {"poc": None, "vah": None, "val": None}
@@ -486,7 +470,6 @@ def timeframe_analysis(frames: dict) -> tuple[dict, dict]:
     details = {}
     for tf, weight in TF_WEIGHTS.items():
         df = analyzed[tf]
-        # Use last completed candle, not the currently forming candle.
         row = df.iloc[-2] if len(df) > 2 else df.iloc[-1]
         struct = structures.get(tf, market_structure(df))
         s = 0.0
@@ -505,7 +488,6 @@ def timeframe_analysis(frames: dict) -> tuple[dict, dict]:
 
 
 def macro_score(macro: dict) -> Optional[float]:
-    # Risk-on proxy: weaker USD / lower VIX / stronger Nasdaq are supportive.
     parts = []
     dxy = macro.get("DXY")
     vix = macro.get("VIX")
@@ -518,21 +500,21 @@ def macro_score(macro: dict) -> Optional[float]:
 
 def make_decision(mtf: float, oi: dict, flow: dict, orderbook: dict, funding: Optional[float], liquidity: dict,
                   macro: dict, news_score: Optional[float], analyzed: dict) -> dict:
-    # Supporting signals normalized to [-1, +1]. Missing sources are excluded.
-    # OI history is requested at 5-minute granularity, so align its
-    # price confirmation with the latest completed 5m candle.
     last_5m = analyzed["5m"].iloc[-2]
     prev_5m = analyzed["5m"].iloc[-3]
     price_change = (float(last_5m.close) / float(prev_5m.close) - 1) * 100 if prev_5m.close else None
     position = classify_position_flow(oi.get("oi_change_pct"), price_change, flow.get("delta_pct"))
+    
+    # ITT JAVÍTVA: last_1h helyett az analyzed["1h"] utolsó lezárt gyertyáját használjuk biztonságosan
+    last_1h = analyzed["1h"].iloc[-2] if len(analyzed["1h"]) > 2 else analyzed["1h"].iloc[-1]
     rsi = safe_float(last_1h.rsi)
+    
     momentum = None if rsi is None else float(np.clip((rsi - 50) / 20, -1, 1))
     cvd_score = None if flow.get("delta_pct") is None else float(np.clip(flow["delta_pct"] / 25, -1, 1))
     oi_score = position.get("score")
     ob_score = None if orderbook.get("imbalance_pct") is None else float(np.clip(orderbook["imbalance_pct"] / 25, -1, 1))
     funding_score = None
     if funding is not None:
-        # Extreme positive funding is a contrarian crowding warning; mild funding is neutral.
         funding_score = -0.5 if funding > 0.05 else 0.5 if funding < -0.05 else 0.0
     sweep_text = liquidity.get("sweep", "")
     sweep_score = 0.6 if "Alsó" in sweep_text else -0.6 if "Felső" in sweep_text else None
@@ -567,7 +549,6 @@ def make_decision(mtf: float, oi: dict, flow: dict, orderbook: dict, funding: Op
             available += weights[name]
     score = weighted / available if available else 0.0
     coverage = available * 100
-    # Do not emit directional signals when critical market data is absent.
     if coverage < 55 or oi.get("oi_change_pct") is None or flow.get("delta_pct") is None:
         signal = "KIVÁRÁS – HIÁNYOS ADAT"
     elif score >= 0.48:
