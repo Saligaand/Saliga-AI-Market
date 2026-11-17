@@ -21,7 +21,15 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("AI Hírhangulat & Mentor Beállítás")
-    groq_api_key = st.text_input("Groq API Kulcs", type="password", help="Ingyenesen igényelhető a console.groq.com oldalon.")
+    
+    # Automatikusan kiolvassa a Secrets-ből, ha van beállítva
+    default_groq = ""
+    try:
+        default_groq = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        pass
+        
+    groq_api_key = st.text_input("Groq API Kulcs", value=default_groq, type="password", help="Ingyenesen igényelhető a console.groq.com oldalon.")
     
     st.markdown("---")
     st.subheader("Telegram Riasztás Beállítások")
@@ -126,12 +134,15 @@ def analyze_news_ai(news_items, api_key):
         }
         response = requests.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=10)
         res_json = response.json()
-        content = res_json["choices"][0]["message"]["content"]
         
-        parts = content.split("|")
-        score = float(parts[0].strip().replace("[", "").replace("]", ""))
-        explanation = parts[1].strip() if len(parts) > 1 else "AI értékelés kész."
-        return max(min(score, 2.0), -2.0), explanation
+        if "choices" in res_json:
+            content = res_json["choices"][0]["message"]["content"]
+            parts = content.split("|")
+            score = float(parts[0].strip().replace("[", "").replace("]", ""))
+            explanation = parts[1].strip() if len(parts) > 1 else "AI értékelés kész."
+            return max(min(score, 2.0), -2.0), explanation
+        else:
+            return analyze_news_sentiment_fallback(news_items), f"Groq hír API hiba: {res_json.get('error', {}).get('message', 'Ismeretlen hiba')}"
     except Exception as e:
         return analyze_news_sentiment_fallback(news_items), f"AI hiba ({e}), kulcsszavas módszerre váltva."
 
@@ -199,7 +210,12 @@ def get_ai_trading_mentor(price, tech_score, oi_trend, pattern_exp, news_exp, ap
         }
         response = requests.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=12)
         res_json = response.json()
-        return res_json["choices"][0]["message"]["content"]
+        
+        if "choices" in res_json:
+            return res_json["choices"][0]["message"]["content"]
+        else:
+            error_msg = res_json.get('error', {}).get('message', 'Ismeretlen hiba a válaszban')
+            return f"Groq API hiba: {error_msg}"
     except Exception as e:
         return f"Nem sikerült elérni az AI Mentort: {e}"
 
