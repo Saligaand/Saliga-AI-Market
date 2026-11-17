@@ -14,8 +14,8 @@ st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
 # --- 15 MÁSODPERCES AUTOMATIKUS FRISSÍTÉS ---
 st_autorefresh(interval=15000, key="saliga_auto_refresh")
 
-st.title("SALIGA AI – Intézményi Market Intelligence + Első Impulzus Volumen Szintek")
-st.caption("15mp Auto-Refresh • Multi-Timeframe Liq Matrix • Első Volumen Spike Szintek • Trade Journal • AI Mentor")
+st.title("SALIGA AI – Intézményi Market Intelligence + Makro DXY & Volumen Motor")
+st.caption("15mp Auto-Refresh • Multi-Timeframe Liq Matrix • Első Impulzus Volumen • DXY Makro Szűrő • Trade Journal")
 
 # --- Session State inicializálása a Kötési Naplóhoz ---
 if "trade_journal" not in st.session_state:
@@ -83,6 +83,25 @@ def get_ohlcv(exchange_name, symbol, timeframe, target_limit=5000):
     df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
     return df
 
+@st.cache_data(ttl=60)
+def get_dxy_macro_trend():
+    """Lekéri a DXY (USD Index) mozgását a makro korrelációhoz"""
+    try:
+        url = "https://query1.finance.com/v8/finance/chart/DX-Y.NYB?interval=1d&range=5d"
+        # Használhatunk egy ingyenes Yahoo public endpoint alternatívát vagy sima fallbacket
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1h&range=2d", headers=headers, timeout=4)
+        j = r.json()
+        closes = j["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        valid_closes = [c for c in closes if c is not None]
+        if len(valid_closes) >= 2:
+            change = ((valid_closes[-1] - valid_closes[-2]) / valid_closes[-2]) * 100
+            trend = "Erősödő Dollár (DXY Rádium / Kripto Negatív)" if change > 0 else "Gyengülő Dollár (Kripto Pozitív)"
+            return change, trend
+    except Exception:
+        pass
+    return 0.0, "DXY Adat semleges"
+
 @st.cache_data(ttl=300)
 def get_crypto_news():
     try:
@@ -141,25 +160,19 @@ def pattern_matching_analysis(df, window_size=20):
     return max(min(score, 2.0), -2.0), f"A top 5 múltbeli mintából {bull_cnt} emelkedett."
 
 def get_first_impulse_volume_levels(df):
-    """Megkeresi az aktuális emelkedő/csökkenő hullám ELSŐ kiugró volumengyertyáját (az impulzus kezdetét)"""
-    x = df.tail(40).copy() # Az utolsó 40 gyertyát vizsgáljuk
+    x = df.tail(40).copy()
     x["vol_sma"] = x["volume"].rolling(15).mean()
-    
-    # Keressük azokat a gyertyákat, ahol a volumen átlag felett van
     spikes = x[x["volume"] > x["vol_sma"] * 1.8]
-    
     if spikes.empty:
         spike_row = x.iloc[-1]
     else:
-        # IDŐRENDBEN AZ ELSŐ kiugrást vesszük (az impulzus indulását, nem a legnagyobbat!)
         spike_row = spikes.iloc[0]
-    
     return float(spike_row["high"]), float(spike_row["low"])
 
-def get_ai_trading_mentor(price, direction, conf, tech, oi, liq_sum, vol_info, rr, api_key):
+def get_ai_trading_mentor(price, direction, conf, tech, oi, liq_sum, vol_info, dxy_info, rr, api_key):
     if not api_key: return "Nincs Groq kulcs."
     prompt = f"""
-    Profi kvantitatív mentor vagy. Adatok: Irány: {direction} ({conf:.0f}%), Ár: {price}, Technikai pont: {tech}, OI: {oi}, Likviditás: {liq_sum}, Első Impulzus Volumen Szintek: {vol_info}, R:R arány: {rr}.
+    Profi kvantitatív mentor vagy. Adatok: Irány: {direction} ({conf:.0f}%), Ár: {price}, Technikai pont: {tech}, OI: {oi}, Likviditás: {liq_sum}, Első Impulzus Volumen Szintek: {vol_info}, DXY Makro Környezet: {dxy_info}, R:R arány: {rr}.
     Adj meg: 1. Szignál szintézis, 2. Kereskedési stratégia, 3. Fő kockázat. Magyarul, tömören.
     """
     try:
@@ -234,10 +247,12 @@ def load_all(exc, sym):
     return {tf: get_ohlcv(exc, sym, tf, target_limit=5000) for tf in TIMEFRAMES}
 
 try:
-    with st.spinner("Multi-Faktor Szignálmotor & Első Impulzus Elemzés futtatása..."):
+    with st.spinner("Multi-Faktor Szignálmotor & Makro DXY elemzés futtatása..."):
         frames = load_all(exchange_choice, symbol)
         deriv = get_derivatives_data(exchange_choice, symbol)
         news = get_crypto_news()
+        dxy_change, dxy_trend_text = get_dxy_macro_trend()
+        
         news_score, news_exp = analyze_news_ai(news, groq_api_key) if groq_api_key else (analyze_news_sentiment_fallback(news), "Fallback")
         pat_score, pat_exp = pattern_matching_analysis(frames["1h"], 20)
 
@@ -254,19 +269,20 @@ try:
     swing_liq_short = price + (atr_1h * 2.2)
     swing_liq_long = price - (atr_1h * 2.2)
 
-    # Az ELSŐ impulzus volumen gyertya szintjei (1h chart alapján)
     impulse_high, impulse_low = get_first_impulse_volume_levels(frames["1h"])
 
-    # Bias: ha az ár visszateszteli az első impulzus alját/tetejét
     vol_bias = 0.0
     if price <= impulse_low * 1.003 and price >= impulse_low * 0.995:
-        vol_bias = 0.5 # Visszatesztelte az első impulzus alját -> Erős Long esély
+        vol_bias = 0.5 
     elif price >= impulse_high * 0.997 and price <= impulse_high * 1.005:
-        vol_bias = -0.5 # Elérte az első impulzus tetejét -> Short ellenállás
+        vol_bias = -0.5 
 
     liq_bias = 0.5 if price < (scalp_liq_long + atr_1h*0.3) else (-0.5 if price > (scalp_liq_short - atr_1h*0.3) else 0.0)
     
-    total_score = tech_weighted*0.30 + news_score*0.15 + pat_score*0.15 + liq_bias*0.20 + vol_bias*0.20
+    # Makro DXY bias (ha a dollár erősödik, az bünteti a longot, ha gyengül, támogatja)
+    dxy_bias = -0.3 if dxy_change > 0.05 else (0.3 if dxy_change < -0.05 else 0.0)
+
+    total_score = tech_weighted*0.25 + news_score*0.15 + pat_score*0.15 + liq_bias*0.20 + vol_bias*0.15 + dxy_bias*0.10
     
     oi_chg = deriv.get("oi_change")
     if oi_chg is not None:
@@ -295,9 +311,10 @@ try:
     leverage_rec = min(50, max(1, int((position_size_units * price) / account_balance))) if account_balance > 0 else 1
 
     liq_sum_text = f"Scalp Liq: Long {scalp_liq_long:,.2f} / Short {scalp_liq_short:,.2f}"
-    vol_info_text = f"Első Impulzus Volumen Szintek - Felső határ: {impulse_high:,.2f}, Alsó határ (Teszt szint): {impulse_low:,.2f}"
+    vol_info_text = f"Első Impulzus Volumen Szintek - Felső: {impulse_high:,.2f}, Alsó (Teszt): {impulse_low:,.2f}"
+    dxy_info_text = f"DXY Változás: {dxy_change:+.2f}% ({dxy_trend_text})"
 
-    ai_mentor = get_ai_trading_mentor(price, direction, conf, round(tech_weighted, 2), deriv.get("oi_trend"), liq_sum_text, vol_info_text, f"1:{rr_ratio:.2f}", groq_api_key)
+    ai_mentor = get_ai_trading_mentor(price, direction, conf, round(tech_weighted, 2), deriv.get("oi_trend"), liq_sum_text, vol_info_text, dxy_info_text, f"1:{rr_ratio:.2f}", groq_api_key)
 
     # --- UI: ÉLŐ JELZÉS DOBOZ ---
     st.markdown("---")
@@ -323,17 +340,17 @@ try:
     a.metric("Aktuális Ár", f"{price:,.4f} USDT")
     b.metric("Kockázat-Hozam (R:R)", f"1 : {rr_ratio:.2f}")
     c.metric("Ajánlott Tőkeáttétel", f"~{leverage_rec}x")
-    d.metric("OI Trend", deriv.get("oi_trend", "N/A"))
+    d.metric("Makro DXY Trend", f"{dxy_change:+.2f}%")
 
     # --- Panel ---
-    st.markdown("### 🗺️ Intézményi Zónák & Első Impulzus Volumen Szintek")
+    st.markdown("### 🗺️ Intézményi Zónák, Volumen & Makro DXY Mátrix")
     m1, m2, m3 = st.columns(3)
     with m1:
         st.info(f"⚡ **Scalp Liq Zónák:**\n- Short Fal: `{scalp_liq_short:,.2f}`\n- Long Zóna: `{scalp_liq_long:,.2f}`")
     with m2:
-        st.warning(f"📊 **Első Impulzus (Volumen Start):**\n- Felső Szint: `{impulse_high:,.2f}`\n- Tesztelhető Alsó Szint: `{impulse_low:,.2f}`")
+        st.warning(f"📊 **Első Impulzus (Volumen):**\n- Felső Szint: `{impulse_high:,.2f}`\n- Teszt Alsó: `{impulse_low:,.2f}`")
     with m3:
-        st.success(f"🌊 **Swing Liq Zónák:**\n- Short Fal: `{swing_liq_short:,.2f}`\n- Long Zóna: `{swing_liq_long:,.2f}`")
+        st.success(f"🌐 **Makro Korreláció (DXY):**\n- Status: `{dxy_trend_text}`\n- Változás: `{dxy_change:+.2f}%`")
 
     st.success(f"📊 **Kockázatkezelési Szintek:** Stop-Loss: `{stop_loss:,.4f}` | Take-Profit: `{take_profit:,.4f}` | Kockáztatott tőke: `{risk_amount_usdt:.2f} USDT`")
 
