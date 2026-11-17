@@ -23,15 +23,22 @@ except Exception:
     st_autorefresh = None
 
 # ============================================================
-# SALIGA AI — MARKET INTELLIGENCE PRO (v3.0.7 - Ultimate Fusion)
+# SALIGA AI — MARKET INTELLIGENCE PRO (v3.0.9 - Secure Secrets)
 # ============================================================
 
-APP_VERSION = "3.0.7"
+APP_VERSION = "3.0.9"
 DB_PATH = "saliga_journal.sqlite3"
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
 TF_WEIGHTS = {"4h": 0.30, "1h": 0.30, "15m": 0.20, "5m": 0.12, "1m": 0.08}
 EXCHANGE_ORDER = ["OKX", "Bybit"]
+
+# Biztonságos kulcskezelés a Streamlit Secrets-ből
+EMBEDDED_GROQ_KEY = ""
+try:
+    EMBEDDED_GROQ_KEY = st.secrets.get("GROQ_API_KEY", "")
+except Exception:
+    pass
 
 st.set_page_config(page_title="SALIGA AI — Market Intelligence PRO", layout="wide")
 
@@ -340,8 +347,11 @@ with st.sidebar:
     refresh_choice = st.selectbox("Automatikus frissítés", ["Kézi", "30 mp", "60 mp"], index=1)
     account_balance = st.number_input("Számlaegyenleg (USDT)", min_value=10.0, value=1000.0, step=100.0)
     risk_pct = st.slider("Kockázat / kötés (%)", 0.25, 3.0, 1.0, 0.25)
-    groq_key = st.text_input("Groq API-kulcs (Mentorhoz)", type="password")
     show_chart = st.checkbox("Grafikon mutatása", True)
+    if EMBEDDED_GROQ_KEY:
+        st.success("Groq AI Kulcs: Titkosítva ✔️")
+    else:
+        st.warning("Groq AI Kulcs hiányzik a Secrets-ből!")
 
 if refresh_choice != "Kézi" and st_autorefresh is not None:
     st_autorefresh(interval={"30 mp": 30000, "60 mp": 60000}[refresh_choice], key="saliga_refresh")
@@ -430,12 +440,12 @@ if available:
     else:
         st.warning("Nincs elegendő ATR adat a Stop Loss kiszámításához.")
 
-    ai_text = groq_explanation(groq_key, selected, dec["signal"], dec["score"], dec["components"], macro_data)
+    ai_text = groq_explanation(EMBEDDED_GROQ_KEY, selected, dec["signal"], dec["score"], dec["components"], macro_data)
     if ai_text:
         with st.expander("🤖 Groq AI Mentor Elemzése", expanded=True):
             st.write(ai_text)
     else:
-        st.info("Add meg a Groq API-kulcsot az oldalsávban az AI mentori elemzéshez.")
+        st.info("Az AI mentor jelenleg nem elérhető (hiányzó titkos kulcs a Streamliten).")
 
     note = st.text_input("Megjegyzés a naplóbejegyzéshez", key="journal_note")
     if st.button("💾 Aktuális jelzés mentése a naplóba", type="primary"):
