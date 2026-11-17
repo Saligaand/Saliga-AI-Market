@@ -23,10 +23,10 @@ except Exception:
     st_autorefresh = None
 
 # ============================================================
-# SALIGA AI — MARKET INTELLIGENCE PRO (v3.0.4 - Full Details + Performance Tracker)
+# SALIGA AI — MARKET INTELLIGENCE PRO (v3.0.7 - Ultimate Fusion)
 # ============================================================
 
-APP_VERSION = "3.0.4"
+APP_VERSION = "3.0.7"
 DB_PATH = "saliga_journal.sqlite3"
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
@@ -90,7 +90,7 @@ def read_journal(limit: int = 100) -> pd.DataFrame:
     return df
 
 # ----------------------------
-# Exchange connection & data
+# Exchange connection / symbol resolution
 # ----------------------------
 
 @st.cache_resource(show_spinner=False)
@@ -129,14 +129,14 @@ def load_asset_market(symbol: str) -> dict:
             frames = {tf: fetch_ohlcv_cached(venue, symbol, tf, 500 if tf != "1d" else 250) for tf in TIMEFRAMES}
             ticker = ex.fetch_ticker(unified_symbol)
             price = safe_float(ticker.get("last")) or safe_float(ticker.get("close"))
-            if price is None or price <= 0: raise RuntimeError("Érvénytelen ár")
+            if price is None or price <= 0: raise RuntimeError("Érvénytelen ticker ár")
             return {"ok": True, "exchange": venue, "client": ex, "market_symbol": unified_symbol, "frames": frames, "price": price, "error": None}
         except Exception as exc:
             errors.append(f"{venue}: {str(exc)[:200]}")
-    return {"ok": False, "error": " | ".join(errors)}
+    return {"ok": False, "exchange": None, "frames": None, "price": None, "error": " | ".join(errors)}
 
 # ----------------------------
-# Indicators & Engine
+# Indicators & Technical Engines
 # ----------------------------
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -154,14 +154,17 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x["sma50"] = close.rolling(50).mean()
     x["vol_sma20"] = x.volume.rolling(20).mean()
     x["volume_ratio"] = x.volume / x.vol_sma20.replace(0, np.nan)
+    x["estimated_delta"] = np.where(close >= x.open, x.volume, -x.volume)
     return x
 
 def swing_points(df: pd.DataFrame, left: int = 3, right: int = 3) -> tuple[list, list]:
     highs, lows = [], []
     h, l = df.high.to_numpy(), df.low.to_numpy()
     for i in range(left, len(df) - right):
-        if h[i] >= np.max(h[i-left:i+right+1]): highs.append((i, float(h[i])))
-        if l[i] <= np.min(l[i-left:i+right+1]): lows.append((i, float(l[i])))
+        if h[i] >= np.max(h[i-left:i+right+1]) and np.sum(h[i] == h[i-left:i+right+1]) == 1:
+            highs.append((i, float(h[i])))
+        if l[i] <= np.min(l[i-left:i+right+1]) and np.sum(l[i] == l[i-left:i+right+1]) == 1:
+            lows.append((i, float(l[i])))
     return highs, lows
 
 def market_structure(df: pd.DataFrame) -> dict:
@@ -171,19 +174,41 @@ def market_structure(df: pd.DataFrame) -> dict:
     sh, sl = [v for _, v in highs[-4:]], [v for _, v in lows[-4:]]
     hh, hl = len(sh) >= 2 and sh[-1] > sh[-2], len(sl) >= 2 and sl[-1] > sl[-2]
     lh, ll = len(sh) >= 2 and sh[-1] < sh[-2], len(sl) >= 2 and sl[-1] < sl[-2]
+    last_close = float(x.close.iloc[-1])
+    ref = x.tail(35).iloc[:-1]
+    prev_high, prev_low = float(ref.high.max()), float(ref.low.min())
+    bos = "Nincs friss BOS"
+    if last_close > prev_high: bos = "Bullish BOS"
+    elif last_close < prev_low: bos = "Bearish BOS"
     score = (1 if hh else 0) + (1 if hl else 0) - (1 if lh else 0) - (1 if ll else 0)
+    if "Bullish BOS" in bos: score += 1
+    elif "Bearish BOS" in bos: score -= 1
     bias = 1 if score > 0 else -1 if score < 0 else 0
     label = "Bullish struktúra" if bias > 0 else "Bearish struktúra" if bias < 0 else "Semleges struktúra"
-    return {"bias": bias, "label": label, "bos": "BOS aktív", "score": score}
+    return {"bias": bias, "label": label, "bos": bos, "score": score}
 
 def liquidity_map(df: pd.DataFrame) -> dict:
     x = df.iloc[:-1].tail(150).copy()
     if len(x) < 20: return {"equal_high": None, "equal_low": None, "sweep": "N/A"}
     highs, lows = swing_points(x.reset_index(drop=True), 2, 2)
     tol = float(x.close.iloc[-1]) * 0.003
-    eq_h = highs[-1][1] if len(highs) >= 2 and abs(highs[-2][1] - highs[-1][1]) <= tol else None
-    eq_l = lows[-1][1] if len(lows) >= 2 and abs(lows[-2][1] - lows[-1][1]) <= tol else None
-    return {"equal_high": eq_h, "equal_low": eq_l, "sweep": "Nincs friss kisöprés"}
+    eq_h, eq_l = None, None
+    if len(highs) >= 2:
+        for i in range(len(highs)-1):
+            if abs(highs[i][1] - highs[-1][1]) <= tol:
+                eq_h = highs[-1][1]
+                break
+    if len(lows) >= 2:
+        for i in range(len(lows)-1):
+            if abs(lows[i][1] - lows[-1][1]) <= tol:
+                eq_l = lows[-1][1]
+                break
+    last = x.iloc[-1]
+    prior_high, prior_low = float(x.high.iloc[-21:-1].max()), float(x.low.iloc[-21:-1].min())
+    sweep = "Nincs friss kisöprés"
+    if last.high > prior_high and last.close < prior_high: sweep = "Felső likviditás kisöprés"
+    elif last.low < prior_low and last.close > prior_low: sweep = "Alsó likviditás kisöprés"
+    return {"equal_high": eq_h, "equal_low": eq_l, "sweep": sweep}
 
 def volume_profile_proxy(df: pd.DataFrame) -> dict:
     x = df.iloc[:-1].tail(250)
@@ -191,7 +216,7 @@ def volume_profile_proxy(df: pd.DataFrame) -> dict:
     typical = (x.high + x.low + x.close) / 3
     hist, edges = np.histogram(typical, bins=24, weights=x.volume)
     idx = int(np.argmax(hist))
-    return {"poc": float((edges[idx] + edges[idx+1]) / 2), "vah": float(edges[min(24, idx+4)]), "val": float(edges[max(0, idx-4)])}
+    return {"poc": float((edges[idx] + edges[idx+1]) / 2)}
 
 def fetch_oi_funding(ex, symbol: str) -> dict:
     out = {"oi_change_pct": None, "funding_pct": None, "oi_status": "Nincs adat"}
@@ -222,6 +247,18 @@ def fetch_taker_flow(ex, symbol: str) -> dict:
     except Exception: pass
     return {"delta_pct": 0.0, "trades": 0, "status": "Hiba"}
 
+def fetch_orderbook_imbalance(ex, symbol: str) -> dict:
+    try:
+        ob = ex.fetch_order_book(symbol, limit=25)
+        bids = sum(float(p) * float(a) for p, a in ob.get("bids", [])[:20])
+        asks = sum(float(p) * float(a) for p, a in ob.get("asks", [])[:20])
+        total = bids + asks
+        if total <= 0: return {"imbalance_pct": None, "label": "Kiegyensúlyozott"}
+        pct = (bids - asks) / total * 100
+        return {"imbalance_pct": pct, "label": "Bid fölény" if pct > 8 else "Ask fölény" if pct < -8 else "Kiegyensúlyozott"}
+    except Exception:
+        return {"imbalance_pct": None, "label": "API limit"}
+
 @st.cache_data(ttl=300, show_spinner=False)
 def yahoo_change(ticker: str) -> Optional[float]:
     try:
@@ -233,6 +270,13 @@ def yahoo_change(ticker: str) -> Optional[float]:
 @st.cache_data(ttl=300, show_spinner=False)
 def get_macro_data() -> dict:
     return {"DXY": yahoo_change("DX-Y.NYB"), "VIX": yahoo_change("^VIX"), "US10Y": yahoo_change("^TNX"), "NASDAQ": yahoo_change("^IXIC"), "SP500": yahoo_change("^GSPC")}
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_crypto_news() -> list[str]:
+    try:
+        parsed = feedparser.parse("https://cointelegraph.com/rss")
+        return [e.title for e in parsed.entries[:10] if hasattr(e, "title")]
+    except Exception: return []
 
 def groq_explanation(api_key: str, symbol: str, signal: str, score: float, components: dict, macro: dict) -> Optional[str]:
     if not api_key: return None
@@ -247,25 +291,27 @@ def timeframe_analysis(frames: dict) -> tuple[dict, dict]:
     structures = {tf: market_structure(analyzed[tf]) for tf in ["4h", "1h", "15m", "5m"]}
     scores, details = {}, {}
     for tf, weight in TF_WEIGHTS.items():
-        row = analyzed[tf].iloc[-2] if len(analyzed[tf]) > 2 else analyzed[tf].iloc[-1]
-        struct = structures.get(tf, market_structure(analyzed[tf]))
+        df = analyzed[tf]
+        row = df.iloc[-2] if len(df) > 2 else df.iloc[-1]
+        struct = structures.get(tf, market_structure(df))
         s = float(struct["bias"])
         scores[tf] = float(np.clip(s, -1, 1))
         details[tf] = {"score": scores[tf], "rsi": safe_float(row.rsi), "structure": struct}
     mtf = sum(scores[tf] * TF_WEIGHTS[tf] for tf in TF_WEIGHTS)
     return analyzed, {"scores": scores, "details": details, "mtf": mtf, "structures": structures}
 
-def make_decision(mtf: float, oi: dict, flow: dict, macro: dict, analyzed: dict) -> dict:
+def make_decision(mtf: float, oi: dict, flow: dict, orderbook: dict, macro: dict, analyzed: dict) -> dict:
     last_5m = analyzed["5m"].iloc[-2]
     prev_5m = analyzed["5m"].iloc[-3]
     price_change = (float(last_5m.close) / float(prev_5m.close) - 1) * 100 if prev_5m.close else 0.0
     
     oi_score = 0.5 if (oi.get("oi_change_pct") or 0) > 0.10 else 0.0
+    cvd_score = float(np.clip((flow.get("delta_pct") or 0.0) / 25, -1, 1))
     dxy = macro.get("DXY") or 0.0
     macro_s = -np.sign(dxy) * min(abs(dxy) / 0.15, 1)
     
-    components = {"MTF struktúra": mtf, "OI Flow": oi_score, "Makró (DXY)": macro_s}
-    score = sum(components.values()) / len(components)
+    components = {"MTF struktúra": mtf, "OI Flow": oi_score, "Taker CVD": cvd_score, "Makró (DXY)": macro_s}
+    score = sum(v for v in components.values() if v is not None) / len(components)
     
     if score >= 0.35: signal = "ERŐS LONG"
     elif score >= 0.10: signal = "LONG"
@@ -275,8 +321,8 @@ def make_decision(mtf: float, oi: dict, flow: dict, macro: dict, analyzed: dict)
     return {"signal": signal, "score": score, "strength": abs(score) * 100, "coverage": 95.0, "components": components}
 
 def risk_plan(price: float, atr: Optional[float], signal: str, balance: float, risk_pct: float) -> dict:
-    if atr is None or atr <= 0 or "LONG" not in signal and "SHORT" not in signal: return {"valid": False}
-    is_long = "LONG" in signal
+    if atr is None or atr <= 0: return {"valid": False}
+    is_long = "SHORT" not in signal
     sl_dist = 1.5 * atr
     tp_dist = 3.0 * atr
     sl = price - sl_dist if is_long else price + sl_dist
@@ -301,7 +347,7 @@ if refresh_choice != "Kézi" and st_autorefresh is not None:
     st_autorefresh(interval={"30 mp": 30000, "60 mp": 60000}[refresh_choice], key="saliga_refresh")
 
 st.title("⚡ SALIGA AI — MARKET INTELLIGENCE PRO")
-st.caption(f"v{APP_VERSION} • Determinisztikus Quants Motor + AI Mentor + Teljesítmény-követő")
+st.caption(f"v{APP_VERSION} • Determinisztikus Quants Motor + AI Mentor + Teljesítmény-követő Napló")
 
 with st.spinner("Piaci adatok elemzése..."):
     macro_data = get_macro_data()
@@ -315,8 +361,9 @@ with st.spinner("Piaci adatok elemzése..."):
             ex, sym = market["client"], market["market_symbol"]
             analyzed, mtf = timeframe_analysis(market["frames"])
             oi, flow = fetch_oi_funding(ex, sym), fetch_taker_flow(ex, sym)
+            ob = fetch_orderbook_imbalance(ex, sym)
             liq, vp = liquidity_map(analyzed["1h"]), volume_profile_proxy(analyzed["1h"])
-            decision = make_decision(mtf["mtf"], oi, flow, macro_data, analyzed)
+            decision = make_decision(mtf["mtf"], oi, flow, ob, macro_data, analyzed)
             market_results[symbol] = {
                 "ok": True, "symbol": symbol, "exchange": market["exchange"], "price": market["price"],
                 "frames": analyzed, "mtf": mtf, "oi": oi, "flow": flow, "decision": decision,
@@ -358,21 +405,18 @@ if available:
     
     st.header(f"📊 {selected} — Részletes Piaci Intelligencia")
     
-    # Részletes adatok oszlopai
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Végső Szignál", dec["signal"])
     col2.metric("Erősség", f"{dec['strength']:.1f}%")
     col3.metric("OI Változás", f"{d['oi']['oi_change_pct']:+.2f}%" if d['oi']['oi_change_pct'] is not None else "N/A")
     col4.metric("Funding Rate", f"{d['oi']['funding_pct']:+.4f}%" if d['oi']['funding_pct'] is not None else "N/A")
 
-    # Likviditási térkép és zónák
     st.subheader("💧 Likviditási Térkép & Zónák")
     l1, l2, l3 = st.columns(3)
     l1.metric("Equal Highs", fmt(d["liquidity"]["equal_high"], 2))
     l2.metric("Equal Lows", fmt(d["liquidity"]["equal_low"], 2))
     l3.metric("Volume Profile POC", fmt(d["volume_profile"]["poc"], 2))
 
-    # Kockázatkezelési terv (Stop Loss / Take Profit)
     st.subheader("🛡️ Kockázatkezelés & ATR Terv")
     atr_1h = safe_float(d["frames"]["1h"].iloc[-2]["atr"])
     plan = risk_plan(d["price"], atr_1h, dec["signal"], account_balance, risk_pct)
@@ -382,23 +426,21 @@ if available:
         r2.metric("Take Profit (TP)", f"{plan['tp']:,.2f}")
         r3.metric("Kockáztatott tőke", f"{plan['risk_cash']:.2f} USDT")
         r4.metric("Risk / Reward (R:R)", f"1:{plan['rr']:.2f}")
-        st.info(f"Ajánlott pozíciómennyiség: **{plan['quantity']:.4f}** {selected.split('/')[0]} (Névérték: **{plan['notional']:.2f} USDT**)")
+        st.info(f"Pozíciómennyiség: **{plan['quantity']:.4f}** {selected.split('/')[0]} (Névérték: **{plan['notional']:.2f} USDT**)")
     else:
-        st.warning("Jelenleg Kivárás státusz van, vagy nincs elegendő ATR adat a Stop Loss kiszámításához.")
+        st.warning("Nincs elegendő ATR adat a Stop Loss kiszámításához.")
 
-    # AI Mentor magyarázat
     ai_text = groq_explanation(groq_key, selected, dec["signal"], dec["score"], dec["components"], macro_data)
     if ai_text:
         with st.expander("🤖 Groq AI Mentor Elemzése", expanded=True):
             st.write(ai_text)
     else:
-        st.info("Add meg a Groq API-kulcsot az oldalsávban, ha szeretnél szöveges AI mentori elemzést kapni a matematikai szignál mellé.")
+        st.info("Add meg a Groq API-kulcsot az oldalsávban az AI mentori elemzéshez.")
 
-    # Naplózás
     note = st.text_input("Megjegyzés a naplóbejegyzéshez", key="journal_note")
     if st.button("💾 Aktuális jelzés mentése a naplóba", type="primary"):
         save_signal({"symbol": selected, "exchange": d["exchange"], "price": d["price"], "signal": dec["signal"], "score": dec["score"], "coverage": dec["coverage"]}, note)
-        st.success("Sikeresen elmentve a helyi SQLite adatbázisba!")
+        st.success("Sikeresen elmentve a helyi SQLite naplóba!")
 
     if show_chart:
         st.subheader("📈 1 Órás Árfolyam & Volumen")
@@ -410,7 +452,7 @@ if available:
         st.plotly_chart(fig, use_container_width=True)
 
 # ----------------------------
-# 📈 Teljesítmény-követő (Performance Tracker)
+# 📈 Teljesítmény-követő (Performance Tracker) & Napló
 # ----------------------------
 st.markdown("---")
 st.subheader("📈 Mentett Jelek Teljesítmény-kiértékelése (SQLite Napló)")
