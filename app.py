@@ -9,8 +9,8 @@ import feedparser
 import ccxt
 
 st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
-st.title("SALIGA AI – Intézményi Market Intelligence + ATR Stop/TP & Auto Telegram")
-st.caption("Kriptopiaci elemző MVP • Technikai + ATR Kockázatkezelés + OI + AI Hír + Minta + Auto Riasztás")
+st.title("SALIGA AI – Intézményi Market Intelligence + AI Kereskedési Mentor")
+st.caption("Kriptopiaci elemző MVP • Technikai + AI Mentor + ATR Stop/TP + OI + Minta + Auto Riasztás")
 
 # --- Settings & API Keys ---
 with st.sidebar:
@@ -20,7 +20,7 @@ with st.sidebar:
     show_chart = st.checkbox("Gyertyagrafikon", value=True)
     
     st.markdown("---")
-    st.subheader("AI Hírhangulat Beállítás")
+    st.subheader("AI Hírhangulat & Mentor Beállítás")
     groq_api_key = st.text_input("Groq API Kulcs", type="password", help="Ingyenesen igényelhető a console.groq.com oldalon.")
     
     st.markdown("---")
@@ -169,6 +169,40 @@ def pattern_matching_analysis(df, window_size=20):
     explanation = f"A leginkább hasonló 5 múltbeli minta közül {bullish_count} esetben váltotta fel emelkedés (átlagos hozam: {avg_future_return*100:.2f}%)."
     return max(min(pattern_score, 2.0), -2.0), explanation
 
+def get_ai_trading_mentor(price, tech_score, oi_trend, pattern_exp, news_exp, api_key):
+    """AI Kereskedési Mentor modul, amely szintetizálja az adatokat és javaslatot tesz"""
+    if not api_key:
+        return "Nincs megadva Groq API kulcs az AI Mentor aktiválásához."
+        
+    prompt = f"""
+    Te egy profi kriptopiaci kvantitatív kockázatkezelő és kereskedési mentor vagy.
+    Elemezd az alábbi élő piaci adatokat, és adj egyértelmű kereskedési iránymutatást:
+    
+    - Aktuális ár: {price} USDT
+    - Technikai pontszám (5-ös skálán): {tech_score}
+    - Open Interest (OI) trend: {oi_trend}
+    - Történelmi mintafelismerés: {pattern_exp}
+    - Hír-hangulat elemzés: {news_exp}
+    
+    Kérlek, add meg a válaszodat magyar nyelven, az alábbi tömör szerkezetben:
+    1. **Piaci Állapot:** (Rövid összefoglaló 2 mondatban)
+    2. **AI Javaslat:** (LONG, SHORT vagy KIVÁRÁS és miért)
+    3. **Kockázati Figyelmeztetés:** (Mire figyeljen a kereskedő)
+    """
+    
+    try:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": "llama3-8b-8192",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2
+        }
+        response = requests.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=12)
+        res_json = response.json()
+        return res_json["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"Nem sikerült elérni az AI Mentort: {e}"
+
 @st.cache_data(ttl=30)
 def get_derivatives_data(exchange_name, symbol):
     pair = symbol.replace("/", "")
@@ -219,7 +253,6 @@ def get_derivatives_data(exchange_name, symbol):
             j = r.json()
             data = j.get("data", [])
             if data:
-                result["oi_now"] = float(data[0]["oi"])
                 result["oi_trend"] = "OKX Aktuális OI adatok elérhetők"
         except Exception:
             pass
@@ -306,7 +339,7 @@ def load_all(exc, sym):
     return {tf: get_ohlcv(exc, sym, tf, target_limit=5000) for tf in TIMEFRAMES}
 
 try:
-    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + ATR & OI & Hírek + Mintakeresés..."):
+    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + AI Mentor + ATR + OI + Hírek..."):
         frames = load_all(exchange_choice, symbol)
         deriv = get_derivatives_data(exchange_choice, symbol)
         news_items = get_crypto_news()
@@ -366,7 +399,10 @@ try:
         stop_loss = price - (1.5 * current_atr)
         take_profit = price + (2.5 * current_atr)
 
-    alert_msg = f"🚨 *SALIGA AI Automatikus Riasztás*\n\nPiac: `{symbol}` ({exchange_choice})\nIrány: *{direction}*\nKomplex Erősség: `{confidence:.0f}%` (Küszöb: {alert_threshold}%)\nAktuális ár: `{price:,.4f} USDT`\n\n🎯 *Ajánlott Kockázatkezelés (ATR)*:\n- Stop-Loss: `{stop_loss:,.4f}`\n- Take-Profit: `{take_profit:,.4f}`\n\n- Technikai pont: `{tech_weighted:+.2f}`\n- Hír-hangulat: `{news_score:+.2f}`\n- Múltbeli minta: `{pattern_score:+.2f}`"
+    # AI Mentor futtatása a háttérben
+    ai_mentor_advice = get_ai_trading_mentor(price, round(tech_weighted, 2), deriv.get("oi_trend"), pattern_explanation, news_explanation, groq_api_key)
+
+    alert_msg = f"🚨 *SALIGA AI Automatikus Riasztás*\n\nPiac: `{symbol}` ({exchange_choice})\nIrány: *{direction}*\nKomplex Erősség: `{confidence:.0f}%` (Küszöb: {alert_threshold}%)\nAktuális ár: `{price:,.4f} USDT`\n\n🎯 *ATR Kockázatkezelés*:\n- Stop-Loss: `{stop_loss:,.4f}`\n- Take-Profit: `{take_profit:,.4f}`"
 
     if send_alert_btn:
         success, msg = send_telegram_message(telegram_token, telegram_chat_id, alert_msg)
@@ -396,6 +432,10 @@ try:
 
     # ATR Szintek vizuális kiemelése
     st.info(f"📊 **ATR Alapú Kockázatkezelési Szintek (1h chart alapján):**  \n🔴 **Ajánlott Stop-Loss:** `{stop_loss:,.4f} USDT` | 🟢 **Ajánlott Take-Profit:** `{take_profit:,.4f} USDT` (ATR: `{current_atr:.2f}`)")
+
+    # AI Kereskedési Mentor kártya kiemelése
+    st.subheader("🤖 AI Kereskedési Mentor Elemzése")
+    st.success(ai_mentor_advice)
 
     col_left, col_right = st.columns([1.2, 1])
 
