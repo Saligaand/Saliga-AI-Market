@@ -9,8 +9,8 @@ import feedparser
 import ccxt
 
 st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
-st.title("SALIGA AI – Market Intelligence + AI Sentiment")
-st.caption("Kriptopiaci elemző MVP • Technikai + Derivatív + AI-alapú Hírhangulat")
+st.title("SALIGA AI – Market Intelligence + AI Sentiment Analízis")
+st.caption("Kriptopiaci elemző MVP • Technikai + Derivatív + AI Hír-kalkuláció")
 
 # --- Settings & API Keys ---
 with st.sidebar:
@@ -22,8 +22,8 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("AI Hírhangulat Beállítás")
-    groq_api_key = st.text_input("Groq API Kulcs (opcionális)", type="password", help="Ingyenesen igényelhető a console.groq.com oldalon. Ha nincs megadva, kulcsszó-alapú elemzés fut.")
-    st.caption("Adatforrás: Cointelegraph RSS + LLM elemzés.")
+    groq_api_key = st.text_input("Groq API Kulcs", type="password", help="Ingyenesen igényelhető a console.groq.com oldalon.")
+    st.caption("A hírek hatása közvetlenül módosítja a végső pontszámot.")
 
 TIMEFRAMES = {
     "1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h"
@@ -43,33 +43,32 @@ def get_ohlcv(exchange_name, symbol, timeframe, limit=300):
 
 @st.cache_data(ttl=300)
 def get_crypto_news():
-    """RSS hírek lekérése a piaci hangulat felméréséhez"""
     try:
         feed = feedparser.parse("https://cointelegraph.com/rss")
         news_items = []
-        for entry in feed.entries[:6]:
+        for entry in feed.entries[:5]: # Top 5 friss hír
             news_items.append({"title": entry.title, "link": entry.link})
         return news_items
     except Exception:
         return []
 
 def analyze_news_ai(news_items, api_key):
-    """AI alapú hangulatelemzés Groq API-n keresztül (Llama 3 modell)"""
+    """AI alapú hangulatelemzés, ami számértéket és indoklást ad a hírekre"""
     titles = [item["title"] for item in news_items]
     titles_str = "\n".join([f"- {t}" for t in titles])
     
-    # Ha nincs API kulcs, visszatérünk egy alapértelmezett semleges értékkel és kulcsszavas módszerrel
     if not api_key:
-        return analyze_news_sentiment_fallback(news_items), "Kulcsszó-alapú (Nincs AI kulcs megadva)"
+        return analyze_news_sentiment_fallback(news_items), "Nincs megadva Groq API kulcs (kulcsszavas fallback használva)."
 
     prompt = f"""
-    Elemezd az alábbi kriptopiaci hírlevelek címsorait a piaci hangulat szempontjából. 
-    Határozz meg egyetlen számot -2.0 (extrém medvés/short) és +2.0 (extrém bikás/long) között, ami a globális piaci hatást mutatja.
+    Elemezd az alábbi kriptopiaci hírek címsorait a piaci hatás szempontjából.
+    Adj meg egy pontos számot -2.0 (extrém medvés / short hatás) és +2.0 (extrém bikás / long hatás) között.
+    Emellett mondd meg, hogy a hírek összességében hogyan tolják el a piacot.
     
     Címsorok:
     {titles_str}
     
-    Válaszd ki pontosan a számot, majd rövid indoklás magyarul. Formátum: [SZÁM] | [Indoklás]
+    Válasz formátum pontosan ez legyen: [SZÁM] | [Rövid elemzés, hogy miért ez a hatás a long/short irányra]
     """
     
     try:
@@ -86,13 +85,12 @@ def analyze_news_ai(news_items, api_key):
         res_json = response.json()
         content = res_json["choices"][0]["message"]["content"]
         
-        # Elemzés kiszedése a válaszból
         parts = content.split("|")
         score = float(parts[0].strip().replace("[", "").replace("]", ""))
-        explanation = parts[1].strip() if len(parts) > 1 else "AI elemzés sikeres."
+        explanation = parts[1].strip() if len(parts) > 1 else "AI értékelés kész."
         return max(min(score, 2.0), -2.0), explanation
     except Exception as e:
-        return analyze_news_sentiment_fallback(news_items), f"AI hiba ({e}), fallback használva."
+        return analyze_news_sentiment_fallback(news_items), f"AI hiba ({e}), kulcsszavas módszerre váltva."
 
 def analyze_news_sentiment_fallback(news_items):
     bullish_words = ["surge", "rally", "bull", "jump", "growth", "high", "approval", "etf", "gain", "up", "record", "bullish"]
@@ -101,9 +99,9 @@ def analyze_news_sentiment_fallback(news_items):
     for item in news_items:
         title_lower = item["title"].lower()
         for w in bullish_words:
-            if w in title_lower: score += 0.25
+            if w in title_lower: score += 0.3
         for w in bearish_words:
-            if w in title_lower: score -= 0.25
+            if w in title_lower: score -= 0.3
     return max(min(score, 2.0), -2.0)
 
 @st.cache_data(ttl=30)
@@ -212,10 +210,6 @@ def structure_score(df):
     elif last.rsi <= 45: score -= 1
     if last.delta_sum > 0: score += 1
     elif last.delta_sum < 0: score -= 1
-    if last.volume > last.vol_avg * 1.2:
-        details["volume"] = "Átlag feletti"
-    else:
-        details["volume"] = "Átlagos/alacsony"
     details.update({
         "RSI": round(float(last.rsi), 1),
         "SMA20": float(last.sma20),
@@ -238,17 +232,17 @@ def load_all(exc, sym):
     return {tf: get_ohlcv(exc, sym, tf, 300) for tf in TIMEFRAMES}
 
 try:
-    with st.spinner(f"Piaci adatok lekérése és AI hír-elemzés ({exchange_choice})..."):
+    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + AI hír-kalkuláció..."):
         frames = load_all(exchange_choice, symbol)
         deriv = get_derivatives_data(exchange_choice, symbol)
         news_items = get_crypto_news()
         
-        # AI vagy kulcsszavas elemzés hívása
+        # Hírek elemzése AI-val
         if groq_api_key:
             news_score, news_explanation = analyze_news_ai(news_items, groq_api_key)
         else:
             news_score = analyze_news_sentiment_fallback(news_items)
-            news_explanation = "Kulcsszó-alapú elemzés (adj meg Groq API kulcsot az AI-hoz)."
+            news_explanation = "Kulcsszó-alapú becslés (adj meg Groq kulcsot az AI-értékeléshez)."
 
     analyzed = {tf: add_indicators(df) for tf, df in frames.items()}
     scores = {}
@@ -256,7 +250,7 @@ try:
     for tf, df in frames.items():
         scores[tf], details[tf] = structure_score(df)
 
-    # Technikai multi-timeframe súlyozás
+    # 1. Technikai pontszám (idősíkok átlaga)
     tech_weighted = (
         scores["4h"] * 0.30 +
         scores["1h"] * 0.30 +
@@ -265,18 +259,11 @@ try:
         scores["1m"] * 0.08
     )
     
-    # Végső pontszám: 70% Technikai + 30% AI Hírhangulat
+    # 2. VÉGLEGES ÖSSZESÍTETT PONT: 70% Technikai + 30% Hír-hangulat AI kalkuláció
     weighted = tech_weighted * 0.70 + news_score * 0.30
 
     oi = deriv.get("oi_change")
     funding = deriv.get("funding")
-    oi_note = "Nincs adat"
-    if oi is not None:
-        if exchange_choice == "Bybit":
-            oi_note = f"{oi:+.3f}% az utolsó két 5 perces mérés között"
-        else:
-            oi_note = f"Aktuális OI: {deriv.get('oi_now', 0):,.0f}"
-
     if funding is not None:
         if funding > 0.03: weighted -= 0.15
         elif funding < -0.03: weighted += 0.15
@@ -285,65 +272,49 @@ try:
     confidence = min(90, 50 + abs(weighted) * 8)
     price = float(frames["1m"].iloc[-1]["close"])
 
-    a, b, c = st.columns(3)
+    # --- Kijelzés a felületen ---
+    a, b, c, d = st.columns(4)
     a.metric("Aktuális ár", f"{price:,.4f} USDT")
-    b.metric("Összesített komplex pontszám", f"{weighted:+.2f} / 5")
-    c.metric("Jelzés erőssége (Tech + AI Hírek)", f"{confidence:.0f}%")
+    b.metric("Technikai pont", f"{tech_weighted:+.2f} / 5")
+    c.metric("Hír-hangulat pont", f"{news_score:+.2f} (-2 / +2)")
+    d.metric("Végső Komplex Pont", f"{weighted:+.2f}")
 
-    if status == "success": st.success(direction)
-    elif status == "error": st.error(direction)
-    else: st.warning(direction)
+    if status == "success": st.success(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
+    elif status == "error": st.error(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
+    else: st.warning(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
 
-    # Két oszlop: Balra a Technikai idősíkok, Jobbra az AI Hírhangulat panel
-    col_left, col_right = st.columns([1.2, 1])
+    # Két részletes oszlop
+    col_left, col_right = st.columns(1.2, 1) if hasattr(st, 'columns') else st.columns(2)
 
     with col_left:
-        st.subheader("Idősíkok összehasonlítása")
+        st.subheader("Technikai Idősíkok")
         rows = []
         for tf in ["4h", "1h", "15m", "5m", "1m"]:
             sc = scores[tf]
-            d = details[tf]
-            rows.append({
-                "Idősík": tf,
-                "Pontszám": sc,
-                "Irány": "LONG" if sc > 0 else ("SHORT" if sc < 0 else "Semleges"),
-                "RSI": d.get("RSI"),
-                "Becsült delta": d.get("Becsült delta")
-            })
+            rows.append({"Idősík": tf, "Pontszám": sc, "Irány": "LONG" if sc > 0 else ("SHORT" if sc < 0 else "Semleges")})
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     with col_right:
-        st.subheader("AI Piaci Hangulat & Hírek")
-        if news_items:
-            for item in news_items[:3]:
+        st.subheader("Hogyan kalkulálta be a híreket az AI?")
+        st.info(f"**Hatás a pontszámra:** {news_score:+.2f} pont (a 30%-os súllyal módosítja a végső irányt).")
+        st.write(f"**AI Indoklás:** {news_explanation}")
+        with st.expander("Vizsgált hírek listája"):
+            for item in news_items:
                 st.markdown(f"- [{item['title']}]({item['link']})")
-            st.info(f"**AI Értékelés:** {news_explanation} (Pontszám: {news_score:+.2f})")
-        else:
-            st.write("Nem sikerült híreket lekérni.")
-
-    st.subheader(f"Derivatív adatok – {exchange_choice}")
-    d1, d2 = st.columns(2)
-    d1.metric("Open Interest", oi_note)
-    d2.metric("Funding rate", f"{funding:.5f}%" if funding is not None else "Nincs adat")
 
     if show_chart:
         st.subheader("1 órás chart")
         chart = analyzed["1h"].tail(180)
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            vertical_spacing=0.04, row_heights=[0.72, 0.28])
-        fig.add_trace(go.Candlestick(
-            x=chart["time"], open=chart["open"], high=chart["high"],
-            low=chart["low"], close=chart["close"], name=symbol
-        ), row=1, col=1)
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.72, 0.28])
+        fig.add_trace(go.Candlestick(x=chart["time"], open=chart["open"], high=chart["high"], low=chart["low"], close=chart["close"], name=symbol), row=1, col=1)
         fig.add_trace(go.Scatter(x=chart["time"], y=chart["sma20"], name="SMA20"), row=1, col=1)
         fig.add_trace(go.Scatter(x=chart["time"], y=chart["sma50"], name="SMA50"), row=1, col=1)
         fig.add_trace(go.Bar(x=chart["time"], y=chart["est_delta"], name="Becsült delta"), row=2, col=1)
-        fig.update_layout(height=600, xaxis_rangeslider_visible=False)
+        fig.update_layout(height=550, xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
 
 except Exception as e:
-    st.error(f"Adatlekérési hiba: {e}")
-    st.write("Ellenőrizd az internetkapcsolatot vagy az API kulcsot.")
+    st.error(f"Hiba történt: {e}")
 
 if refresh != "Kézi":
     seconds = {"30 mp": 30, "60 mp": 60, "5 perc": 300}[refresh]
