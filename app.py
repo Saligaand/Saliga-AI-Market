@@ -31,7 +31,6 @@ TIMEFRAMES = {
 
 @st.cache_data(ttl=15)
 def get_ohlcv(exchange_name, symbol, timeframe, limit=1000):
-    # Megemeltük a limitet 1000-re, hogy több hónapos múltat is vizsgálhasson a mintafelismerés
     if exchange_name == "OKX":
         ex = ccxt.okx({"enableRateLimits": True})
     else:
@@ -112,19 +111,15 @@ def pattern_matching_analysis(df, window_size=20):
     closes = df['close'].values
     current_window = closes[-window_size:]
     
-    # Normalizálás (z-score), hogy az árszinttől függetlenül a formát/alakzatot vizsgáljuk
     curr_norm = (current_window - np.mean(current_window)) / (np.std(current_window) + 1e-8)
     
     matches = []
-    # Visszamenőleges csúszóablakos keresés a múltban
     for i in range(len(closes) - window_size * 2):
         hist_window = closes[i:i+window_size]
         hist_norm = (hist_window - np.mean(hist_window)) / (np.std(hist_window) + 1e-8)
         
-        # Euklideszi távolság a minták között (kisebb érték = nagyobb hasonlóság)
         dist = np.linalg.norm(curr_norm - hist_norm)
         
-        # Megnézzük, mi történt a minta utáni 5. gyertyánál
         future_idx = i + window_size
         if future_idx + 5 < len(closes):
             future_return = (closes[future_idx + 5] - closes[future_idx]) / closes[future_idx]
@@ -133,17 +128,16 @@ def pattern_matching_analysis(df, window_size=20):
     if not matches:
         return 0.0, "Nem talált elegendő hasonló múltbeli mintát."
         
-    # Leghasonlóbb 5 minta kiválasztása
     matches.sort(key=lambda x: x[0])
     top_matches = matches[:5]
     
     avg_future_return = np.mean([m[1] for m in top_matches])
     bullish_count = sum(1 for m in top_matches if m[1] > 0)
     
-    # Pontszám skálázás -2.0 és +2.0 közé
     pattern_score = (bullish_count / len(top_matches)) * 4.0 - 2.0 
     
-    explanation = f"A múltbeli adatokból a leginkább hasonló 5 minta közül {bullish_count esetben váltotta fel emelkedés (átlagos hozam: {avg_future_return*100:.2f}%)."
+    # ITT VOLT A HIBA (a zárójel rossz helyen volt):
+    explanation = f"A múltbeli adatokból a leginkább hasonló 5 minta közül {bullish_count} esetben váltotta fel emelkedés (átlagos hozam: {avg_future_return*100:.2f}%)."
     return max(min(pattern_score, 2.0), -2.0), explanation
 
 @st.cache_data(ttl=30)
@@ -279,14 +273,12 @@ try:
         deriv = get_derivatives_data(exchange_choice, symbol)
         news_items = get_crypto_news()
         
-        # 1. Hírek elemzése AI-val vagy fallbackkel
         if groq_api_key:
             news_score, news_explanation = analyze_news_ai(news_items, groq_api_key)
         else:
             news_score = analyze_news_sentiment_fallback(news_items)
             news_explanation = "Kulcsszó-alapú becslés (adj meg Groq kulcsot az AI-értékeléshez)."
 
-        # 2. Múltbeli mintafelismerés az 1 órás (1h) charton
         pattern_score, pattern_explanation = pattern_matching_analysis(frames["1h"], window_size=20)
 
     analyzed = {tf: add_indicators(df) for tf, df in frames.items()}
@@ -295,7 +287,6 @@ try:
     for tf, df in frames.items():
         scores[tf], details[tf] = structure_score(df)
 
-    # Technikai pontszám (idősíkok súlyozott átlaga)
     tech_weighted = (
         scores["4h"] * 0.30 +
         scores["1h"] * 0.30 +
@@ -304,7 +295,6 @@ try:
         scores["1m"] * 0.08
     )
     
-    # VÉGLEGES ÖSSZESÍTETT PONT: 50% Technikai + 25% Hír-hangulat + 25% Múltbeli minták
     weighted = tech_weighted * 0.50 + news_score * 0.25 + pattern_score * 0.25
 
     funding = deriv.get("funding")
@@ -316,7 +306,6 @@ try:
     confidence = min(90, 50 + abs(weighted) * 8)
     price = float(frames["1m"].iloc[-1]["close"])
 
-    # --- Kijelzés a felületen ---
     a, b, c, d = st.columns(4)
     a.metric("Aktuális ár", f"{price:,.4f} USDT")
     b.metric("Technikai pont", f"{tech_weighted:+.2f} / 5")
@@ -327,7 +316,6 @@ try:
     elif status == "error": st.error(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
     else: st.warning(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
 
-    # Részletes oszlopok
     col_left, col_right = st.columns([1.2, 1])
 
     with col_left:
