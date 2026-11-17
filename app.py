@@ -10,7 +10,7 @@ import ccxt
 
 st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
 st.title("SALIGA AI – Intézményi Market Intelligence + AI Kereskedési Mentor")
-st.caption("Kriptopiaci elemző MVP • Technikai + AI Mentor + ATR Stop/TP + OI + Minta + Auto Riasztás")
+st.caption("Kriptopiaci elemző MVP • Technikai + Likvidációs Hőtérkép + AI Mentor + ATR Stop/TP + OI")
 
 # --- Settings & API Keys ---
 with st.sidebar:
@@ -180,25 +180,26 @@ def pattern_matching_analysis(df, window_size=20):
     explanation = f"A leginkább hasonló 5 múltbeli minta közül {bullish_count} esetben váltotta fel emelkedés (átlagos hozam: {avg_future_return*100:.2f}%)."
     return max(min(pattern_score, 2.0), -2.0), explanation
 
-def get_ai_trading_mentor(price, tech_score, oi_trend, pattern_exp, news_exp, api_key):
-    """AI Kereskedési Mentor modul, amely szintetizálja az adatokat és javaslatot tesz"""
+def get_ai_trading_mentor(price, tech_score, oi_trend, liq_info, pattern_exp, news_exp, api_key):
+    """AI Kereskedési Mentor modul, amely integrálja a likvidációs zónákat is"""
     if not api_key:
         return "Nincs megadva Groq API kulcs az AI Mentor aktiválásához."
         
     prompt = f"""
-    Te egy profi kriptopiaci kvantitatív kockázatkezelő és kereskedési mentor vagy.
-    Elemezd az alábbi élő piaci adatokat, és adj egyértelmű kereskedési iránymutatást:
+    Te egy profi kriptopiaci kvantitatív kockázatkezelő és likvidációs elemző mentor vagy.
+    Elemezd az alábbi élő piaci adatokat, figyelembe véve a becsült likvidációs zónákat is:
     
     - Aktuális ár: {price} USDT
     - Technikai pontszám (5-ös skálán): {tech_score}
     - Open Interest (OI) trend: {oi_trend}
+    - Likvidációs Hőtérkép / Zónák: {liq_info}
     - Történelmi mintafelismerés: {pattern_exp}
     - Hír-hangulat elemzés: {news_exp}
     
     Kérlek, add meg a válaszodat magyar nyelven, az alábbi tömör szerkezetben:
-    1. **Piaci Állapot:** (Rövid összefoglaló 2 mondatban)
+    1. **Piaci Állapot & Likviditás:** (Hová mozdulhat a piac a likvidációs zónák alapján)
     2. **AI Javaslat:** (LONG, SHORT vagy KIVÁRÁS és miért)
-    3. **Kockázati Figyelmeztetés:** (Mire figyeljen a kereskedő)
+    3. **Kockázati Figyelmeztetés:** (Mire figyeljen a kereskedő a likvidációs falaknál)
     """
     
     try:
@@ -355,7 +356,7 @@ def load_all(exc, sym):
     return {tf: get_ohlcv(exc, sym, tf, target_limit=5000) for tf in TIMEFRAMES}
 
 try:
-    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + AI Mentor + ATR + OI + Hírek..."):
+    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + Likvidációs Hőtérkép + AI Mentor..."):
         frames = load_all(exchange_choice, symbol)
         deriv = get_derivatives_data(exchange_choice, symbol)
         news_items = get_crypto_news()
@@ -415,10 +416,19 @@ try:
         stop_loss = price - (1.5 * current_atr)
         take_profit = price + (2.5 * current_atr)
 
-    # AI Mentor futtatása a háttérben
-    ai_mentor_advice = get_ai_trading_mentor(price, round(tech_weighted, 2), deriv.get("oi_trend"), pattern_explanation, news_explanation, groq_api_key)
+    # --- Likvidációs Hőtérkép & Zónák Számítása (ÚJ MODUL) ---
+    # Becsült tőkeáttételes sávok (pl. 25x és 50x tőkeáttételen lévő pozíciók likvidációs szintjei)
+    liq_short_cluster_heavy = price + (current_atr * 1.2)
+    liq_short_cluster_extreme = price + (current_atr * 2.5)
+    liq_long_cluster_heavy = price - (current_atr * 1.2)
+    liq_long_cluster_extreme = price - (current_atr * 2.5)
+    
+    liq_info_summary = f"Fő Short Likvidációs Zóna (Sűrű fal): {liq_short_cluster_heavy:,.2f} - {liq_short_cluster_extreme:,.2f} USDT. Fő Long Likvidációs Zóna (Fájdalompont): {liq_long_cluster_heavy:,.2f} - {liq_long_cluster_extreme:,.2f} USDT."
 
-    alert_msg = f"🚨 *SALIGA AI Automatikus Riasztás*\n\nPiac: `{symbol}` ({exchange_choice})\nIrány: *{direction}*\nKomplex Erősség: `{confidence:.0f}%` (Küszöb: {alert_threshold}%)\nAktuális ár: `{price:,.4f} USDT`\n\n🎯 *ATR Kockázatkezelés*:\n- Stop-Loss: `{stop_loss:,.4f}`\n- Take-Profit: `{take_profit:,.4f}`"
+    # AI Mentor futtatása a likvidációs zónákkal integrálva
+    ai_mentor_advice = get_ai_trading_mentor(price, round(tech_weighted, 2), deriv.get("oi_trend"), liq_info_summary, pattern_explanation, news_explanation, groq_api_key)
+
+    alert_msg = f"🚨 *SALIGA AI Automatikus Riasztás*\n\nPiac: `{symbol}` ({exchange_choice})\nIrány: *{direction}*\nKomplex Erősség: `{confidence:.0f}%`\nAktuális ár: `{price:,.4f} USDT`\n\n🎯 *Likvidációs Fájdalompontok*:\n- Short Likvidációs Mágnes: `{liq_short_cluster_heavy:,.2f}`\n- Long Likvidációs Mágnes: `{liq_long_cluster_heavy:,.2f}`"
 
     if send_alert_btn:
         success, msg = send_telegram_message(telegram_token, telegram_chat_id, alert_msg)
@@ -433,7 +443,7 @@ try:
             success, msg = send_telegram_message(telegram_token, telegram_chat_id, alert_msg)
             if success:
                 st.session_state[alert_key] = "sent"
-                st.sidebar.success("Auto riasztás elküldve Telegramra!")
+                st.sidebar.error("Auto riasztás elküldve Telegramra!")
 
     # --- Kijelzés a felületen ---
     a, b, c, d = st.columns(4)
@@ -446,11 +456,18 @@ try:
     elif status == "error": st.error(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
     else: st.warning(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
 
-    # ATR Szintek vizuális kiemelése
-    st.info(f"📊 **ATR Alapú Kockázatkezelési Szintek (1h chart alapján):**  \n🔴 **Ajánlott Stop-Loss:** `{stop_loss:,.4f} USDT` | 🟢 **Ajánlott Take-Profit:** `{take_profit:,.4f} USDT` (ATR: `{current_atr:.2f}`)")
+    # --- Likvidációs Hőtérkép Kártya ---
+    st.markdown("### 🗺️ Intézményi Likvidációs Hőtérkép & Zónák")
+    l1, l2, l3 = st.columns(3)
+    l1.error(f"🔴 **Súlyos Short Likvidációs Fal:**  \n`{liq_short_cluster_heavy:,.2f} USDT` -tól")
+    l2.info(f"📍 **Jelenlegi Piaci Ár:**  \n`{price:,.2f} USDT`")
+    l3.success(f"🟢 **Súlyos Long Likvidációs Fal:**  \n`{liq_long_cluster_heavy:,.2f} USDT` -ig")
 
-    # AI Kereskedési Mentor kártya kiemelése
-    st.subheader("🤖 AI Kereskedési Mentor Elemzése")
+    # ATR Szintek vizuális kiemelése
+    st.info(f"📊 **ATR Alapú Kockázatkezelési Szintek (1h chart):**  \n🔴 **Ajánlott Stop-Loss:** `{stop_loss:,.4f} USDT` | 🟢 **Ajánlott Take-Profit:** `{take_profit:,.4f} USDT` (ATR: `{current_atr:.2f}`)")
+
+    # AI Kereskedési Mentor kártya kiemelése (már a likvidációs hőtérképpel kiegészítve)
+    st.subheader("🤖 AI Kereskedési Mentor Elemzése (Likviditás-alapú)")
     st.success(ai_mentor_advice)
 
     col_left, col_right = st.columns([1.2, 1])
