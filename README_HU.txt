@@ -1,27 +1,44 @@
-# SALIGA AI – Market Intelligence (MVP)
+SALIGA AI — MARKET INTELLIGENCE PRO v3.0
 
-## Mi ez?
-Egy első, futtatható Python-alapú kriptopiaci elemző felület. BTC, SOL és ETH piacot figyel,
-1m/5m/15m/1h/4h idősíkokat hasonlít össze, és választás szerint nyilvános OKX vagy Bybit adatokat használ.
+TELEPÍTÉS
+1. Telepíts Python 3.10 vagy újabb verziót.
+2. Csomagold ki a ZIP-et egy mappába.
+3. Nyiss terminált ebben a mappában.
+4. Telepítsd a függőségeket:
+   pip install -r requirements.txt
+5. Indítsd el:
+   streamlit run app.py
 
-## Telepítés Windows alatt (PyCharm vagy terminál)
-1. Telepítsd a Python 3.11 vagy 3.12 verziót.
-2. Csomagold ki a ZIP-et.
-3. Nyisd meg a mappát PyCharmban.
-4. A PyCharm Terminal ablakában futtasd:
-   `python -m venv .venv`
-5. Aktiválás Windows PowerShellben:
-   `.venv\\Scripts\\Activate.ps1`
-6. Függőségek telepítése:
-   `pip install -r requirements.txt`
-7. Indítás:
-   `streamlit run app.py`
-8. A program a böngészőben nyílik meg (általában http://localhost:8501).
+ADATFORRÁSOK
+- Elsődleges: OKX USDT perpetual piacok.
+- Tartalék: Bybit USDT perpetual piacok.
+- Binance API-t nem használ.
+- Ha egy tőzsde elérhetetlen (például ország-/hálózati 403), megpróbálja a következő forrást.
+- Egy adott coin összes gyertyáját egyetlen tőzsdéről kéri le; nem keveri a venue-k árait.
 
-## Fontos
-- Az alapverzióhoz nem kell API-kulcs.
-- Az oldalsávban (Sidebar) kiválasztható, hogy az OKX-ről vagy a Bybit-ről húzza be az adatokat.
-- A program nem ad automatikus megbízást, csak elemzést.
-- A százalékos „jelzés erőssége” jelenleg pontszámból képzett kijelzés, NEM valódi,
-  historikusan kalibrált valószínűség vagy garantált találati arány.
-- A gyertyából számolt delta csak közelítés, nem valódi bid/ask CVD.
+FUNKCIÓK
+- BTC, ETH, SOL egyidejű vizsgálata.
+- 1m, 5m, 15m, 1h, 4h, 1d OHLCV.
+- Több idősíkos piaci struktúra és BOS-közelítés.
+- RSI, ATR, SMA20/SMA50 (EMA nincs).
+- OI és funding lekérdezési kísérlet.
+- Taker oldali delta a legutóbb lekért kötésekből.
+- Orderbook bid/ask egyensúly.
+- Equal highs/lows, liquidity sweep és FVG-közelítés.
+- OHLCV-alapú volume profile proxy.
+- DXY, VIX, US10Y, NASDAQ, S&P500 makróváltozás.
+- Kriptós RSS hírek kulcsszavas értékelése.
+- Opcionális Groq AI magyarázat (nem ez számolja a jelet).
+- ATR-alapú kockázati terv.
+- Tartós SQLite jelzésnapló és CSV export.
+
+FONTOS KORLÁTOK
+- A CVD itt nem teljes tőzsdei kumulatív delta: az utolsó lekért kötések taker oldali mintája.
+- OI-history támogatás tőzsde- és CCXT-verziófüggő; ha nincs adat, a rendszer jelzi.
+- A flow besorolás ár + OI + delta alapján következtetés, nem bizonyítja a piaci szereplők szándékát.
+- A liquidity / FVG / volume profile részek OHLCV-alapú közelítések, nem teljes order-flow vagy likvidációs heatmap.
+- A makró Yahoo Finance adatforrásból érkezik, késhet vagy időnként hiányozhat.
+- A modellpontszám nem találati valószínűség. A rendszer még nem tartalmaz validált backtestet vagy statisztikai kalibrációt.
+- Éles kereskedés előtt paper trading, költségmodellezés és független tesztelés szükséges.
+
+A program nem küld megbízást, nem kezel API-kulcsos kereskedési hozzáférést, és nem automata kereskedő.
