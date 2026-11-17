@@ -14,8 +14,8 @@ st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
 # --- 15 MÁSODPERCES AUTOMATIKUS FRISSÍTÉS ---
 st_autorefresh(interval=15000, key="saliga_auto_refresh")
 
-st.title("SALIGA AI – Intézményi Market Intelligence + Volumen Order Blockok")
-st.caption("15mp Auto-Refresh • Multi-Timeframe Liq Matrix • Volumen Spike Szintek • Trade Journal • AI Mentor")
+st.title("SALIGA AI – Intézményi Market Intelligence + Első Impulzus Volumen Szintek")
+st.caption("15mp Auto-Refresh • Multi-Timeframe Liq Matrix • Első Volumen Spike Szintek • Trade Journal • AI Mentor")
 
 # --- Session State inicializálása a Kötési Naplóhoz ---
 if "trade_journal" not in st.session_state:
@@ -140,25 +140,26 @@ def pattern_matching_analysis(df, window_size=20):
     score = (bull_cnt / len(top)) * 4.0 - 2.0
     return max(min(score, 2.0), -2.0), f"A top 5 múltbeli mintából {bull_cnt} emelkedett."
 
-def get_volume_spike_levels(df):
-    """Keresi a legutibb kiugró volumengyertyát (Volume Spike / Order Block) és visszaadja a szintjeit"""
-    x = df.copy()
-    x["vol_sma"] = x["volume"].rolling(20).mean()
-    # Kiugró volumen: ha a volumen legalább 2.5-szöröse az elmúlt 20 gyertya átlagának
-    spikes = x[x["volume"] > x["vol_sma"] * 2.5]
-    if spikes.empty:
-        # Ha nincs extrém kiugrás, akkor a legutóbbi 30 gyertya legnagyobb volumenét veszi
-        max_idx = x["volume"].tail(30).idxmax()
-        spike_row = x.loc[max_idx]
-    else:
-        spike_row = spikes.iloc[-1]
+def get_first_impulse_volume_levels(df):
+    """Megkeresi az aktuális emelkedő/csökkenő hullám ELSŐ kiugró volumengyertyáját (az impulzus kezdetét)"""
+    x = df.tail(40).copy() # Az utolsó 40 gyertyát vizsgáljuk
+    x["vol_sma"] = x["volume"].rolling(15).mean()
     
-    return float(spike_row["high"]), float(spike_row["low"]), float(spike_row["close"]) >= float(spike_row["open"])
+    # Keressük azokat a gyertyákat, ahol a volumen átlag felett van
+    spikes = x[x["volume"] > x["vol_sma"] * 1.8]
+    
+    if spikes.empty:
+        spike_row = x.iloc[-1]
+    else:
+        # IDŐRENDBEN AZ ELSŐ kiugrást vesszük (az impulzus indulását, nem a legnagyobbat!)
+        spike_row = spikes.iloc[0]
+    
+    return float(spike_row["high"]), float(spike_row["low"])
 
 def get_ai_trading_mentor(price, direction, conf, tech, oi, liq_sum, vol_info, rr, api_key):
     if not api_key: return "Nincs Groq kulcs."
     prompt = f"""
-    Profi kvantitatív mentor vagy. Adatok: Irány: {direction} ({conf:.0f}%), Ár: {price}, Technikai pont: {tech}, OI: {oi}, Likviditás: {liq_sum}, Volumen Order Block szintek: {vol_info}, R:R arány: {rr}.
+    Profi kvantitatív mentor vagy. Adatok: Irány: {direction} ({conf:.0f}%), Ár: {price}, Technikai pont: {tech}, OI: {oi}, Likviditás: {liq_sum}, Első Impulzus Volumen Szintek: {vol_info}, R:R arány: {rr}.
     Adj meg: 1. Szignál szintézis, 2. Kereskedési stratégia, 3. Fő kockázat. Magyarul, tömören.
     """
     try:
@@ -233,7 +234,7 @@ def load_all(exc, sym):
     return {tf: get_ohlcv(exc, sym, tf, target_limit=5000) for tf in TIMEFRAMES}
 
 try:
-    with st.spinner("Multi-Faktor Szignálmotor & Volumen Elemzés futtatása..."):
+    with st.spinner("Multi-Faktor Szignálmotor & Első Impulzus Elemzés futtatása..."):
         frames = load_all(exchange_choice, symbol)
         deriv = get_derivatives_data(exchange_choice, symbol)
         news = get_crypto_news()
@@ -248,25 +249,23 @@ try:
     price = float(last_row["close"])
     atr_1h = float(last_row["atr"]) if not np.isnan(last_row["atr"]) else price * 0.01
 
-    # Multi-Timeframe Likvidációs Mátrix
     scalp_liq_short = price + (atr_1h * 0.8)
     scalp_liq_long = price - (atr_1h * 0.8)
     swing_liq_short = price + (atr_1h * 2.2)
     swing_liq_long = price - (atr_1h * 2.2)
 
-    # Volumen Spike / Order Block Szintek (1h chart alapján)
-    vol_high, vol_low, is_bullish_spike = get_volume_spike_levels(frames["1h"])
+    # Az ELSŐ impulzus volumen gyertya szintjei (1h chart alapján)
+    impulse_high, impulse_low = get_first_impulse_volume_levels(frames["1h"])
 
-    # Volumen bias a szignálhoz (ha az ár közeleg a volumen támaszhoz/ellenálláshoz)
+    # Bias: ha az ár visszateszteli az első impulzus alját/tetejét
     vol_bias = 0.0
-    if price <= vol_low * 1.005:
-        vol_bias = 0.4 # Közel a volumen támaszhoz -> Long bias
-    elif price >= vol_high * 0.995:
-        vol_bias = -0.4 # Közel a volumen ellenálláshoz -> Short bias
+    if price <= impulse_low * 1.003 and price >= impulse_low * 0.995:
+        vol_bias = 0.5 # Visszatesztelte az első impulzus alját -> Erős Long esély
+    elif price >= impulse_high * 0.997 and price <= impulse_high * 1.005:
+        vol_bias = -0.5 # Elérte az első impulzus tetejét -> Short ellenállás
 
     liq_bias = 0.5 if price < (scalp_liq_long + atr_1h*0.3) else (-0.5 if price > (scalp_liq_short - atr_1h*0.3) else 0.0)
     
-    # Súlyozott összegzés (beleértve a volumen bias-t is)
     total_score = tech_weighted*0.30 + news_score*0.15 + pat_score*0.15 + liq_bias*0.20 + vol_bias*0.20
     
     oi_chg = deriv.get("oi_change")
@@ -277,7 +276,6 @@ try:
     direction, status = label(total_score)
     conf = min(95, 50 + abs(total_score) * 10)
 
-    # ATR Stop-Loss & Take-Profit
     if "LONG" in direction:
         stop_loss = price - (1.5 * atr_1h)
         take_profit = price + (2.5 * atr_1h)
@@ -297,7 +295,7 @@ try:
     leverage_rec = min(50, max(1, int((position_size_units * price) / account_balance))) if account_balance > 0 else 1
 
     liq_sum_text = f"Scalp Liq: Long {scalp_liq_long:,.2f} / Short {scalp_liq_short:,.2f}"
-    vol_info_text = f"Volumen OB (Order Block) - Ellenállás: {vol_high:,.2f}, Támasz: {vol_low:,.2f}"
+    vol_info_text = f"Első Impulzus Volumen Szintek - Felső határ: {impulse_high:,.2f}, Alsó határ (Teszt szint): {impulse_low:,.2f}"
 
     ai_mentor = get_ai_trading_mentor(price, direction, conf, round(tech_weighted, 2), deriv.get("oi_trend"), liq_sum_text, vol_info_text, f"1:{rr_ratio:.2f}", groq_api_key)
 
@@ -327,13 +325,13 @@ try:
     c.metric("Ajánlott Tőkeáttétel", f"~{leverage_rec}x")
     d.metric("OI Trend", deriv.get("oi_trend", "N/A"))
 
-    # --- Multi-Timeframe Likvidációs Mátrix & Volumen Spike Panel ---
-    st.markdown("### 🗺️ Intézményi Zónák & Volumen Order Blockok")
+    # --- Panel ---
+    st.markdown("### 🗺️ Intézményi Zónák & Első Impulzus Volumen Szintek")
     m1, m2, m3 = st.columns(3)
     with m1:
         st.info(f"⚡ **Scalp Liq Zónák:**\n- Short Fal: `{scalp_liq_short:,.2f}`\n- Long Zóna: `{scalp_liq_long:,.2f}`")
     with m2:
-        st.warning(f"📊 **Volumen Spike Szintek:**\n- Ellenállás (High): `{vol_high:,.2f}`\n- Támasz (Low): `{vol_low:,.2f}`")
+        st.warning(f"📊 **Első Impulzus (Volumen Start):**\n- Felső Szint: `{impulse_high:,.2f}`\n- Tesztelhető Alsó Szint: `{impulse_low:,.2f}`")
     with m3:
         st.success(f"🌊 **Swing Liq Zónák:**\n- Short Fal: `{swing_liq_short:,.2f}`\n- Long Zóna: `{swing_liq_long:,.2f}`")
 
@@ -362,7 +360,6 @@ try:
             with st.expander(f"Mentett ügyletek ({len(st.session_state.trade_journal)})"):
                 st.dataframe(pd.DataFrame(st.session_state.trade_journal), use_container_width=True)
 
-    # --- Technikai Táblázat & Chart ---
     col_left, col_right = st.columns([1.2, 1])
     with col_left:
         st.subheader("Technikai Idősíkok")
