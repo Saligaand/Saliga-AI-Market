@@ -2,7 +2,7 @@
 
 ## Mi ez?
 Egy első, futtatható Python-alapú kriptopiaci elemző felület. BTC, SOL és ETH piacot figyel,
-1m/5m/15m/1h/4h idősíkokat hasonlít össze, és nyilvános Binance + Bybit adatokat használ.
+1m/5m/15m/1h/4h idősíkokat hasonlít össze, és választás szerint nyilvános OKX vagy Bybit adatokat használ.
 
 ## Telepítés Windows alatt (PyCharm vagy terminál)
 1. Telepítsd a Python 3.11 vagy 3.12 verziót.
@@ -20,9 +20,8 @@ Egy első, futtatható Python-alapú kriptopiaci elemző felület. BTC, SOL és 
 
 ## Fontos
 - Az alapverzióhoz nem kell API-kulcs.
+- Az oldalsávban (Sidebar) kiválasztható, hogy az OKX-ről vagy a Bybit-ről húzza be az adatokat.
 - A program nem ad automatikus megbízást, csak elemzést.
 - A százalékos „jelzés erőssége” jelenleg pontszámból képzett kijelzés, NEM valódi,
   historikusan kalibrált valószínűség vagy garantált találati arány.
 - A gyertyából számolt delta csak közelítés, nem valódi bid/ask CVD.
-- A következő fejlesztési lépés a historikus backtest, majd a valós order-flow adatok
-  és makrogazdasági naptár integrálása.
