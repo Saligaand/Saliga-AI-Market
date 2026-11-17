@@ -46,13 +46,26 @@ def get_crypto_news():
     try:
         feed = feedparser.parse("https://cointelegraph.com/rss")
         news_items = []
-        for entry in feed.entries[:5]:
+        for entry in feed.entries[:5]: # Top 5 friss hír
             news_items.append({"title": entry.title, "link": entry.link})
         return news_items
     except Exception:
         return []
 
+def analyze_news_sentiment_fallback(news_items):
+    bullish_words = ["surge", "rally", "bull", "jump", "growth", "high", "approval", "etf", "gain", "up", "record", "bullish"]
+    bearish_words = ["drop", "crash", "bear", "fall", "dump", "loss", "risk", "hack", "ban", "down", "low", "fear", "sec"]
+    score = 0.0
+    for item in news_items:
+        title_lower = item["title"].lower()
+        for w in bullish_words:
+            if w in title_lower: score += 0.3
+        for w in bearish_words:
+            if w in title_lower: score -= 0.3
+    return max(min(score, 2.0), -2.0)
+
 def analyze_news_ai(news_items, api_key):
+    """AI alapú hangulatelemzés, ami számértéket és indoklást ad a hírekre"""
     titles = [item["title"] for item in news_items]
     titles_str = "\n".join([f"- {t}" for t in titles])
     
@@ -91,18 +104,6 @@ def analyze_news_ai(news_items, api_key):
     except Exception as e:
         return analyze_news_sentiment_fallback(news_items), f"AI hiba ({e}), kulcsszavas módszerre váltva."
 
-def analyze_news_sentiment_fallback(news_items):
-    bullish_words = ["surge", "rally", "bull", "jump", "growth", "high", "approval", "etf", "gain", "up", "record", "bullish"]
-    bearish_words = ["drop", "crash", "bear", "fall", "dump", "loss", "risk", "hack", "ban", "down", "low", "fear", "sec"]
-    score = 0.0
-    for item in news_items:
-        title_lower = item["title"].lower()
-        for w in bullish_words:
-            if w in title_lower: score += 0.3
-        for w in bearish_words:
-            if w in title_lower: score -= 0.3
-    return max(min(score, 2.0), -2.0)
-
 @st.cache_data(ttl=30)
 def get_derivatives_data(exchange_name, symbol):
     pair = symbol.replace("/", "")
@@ -121,4 +122,200 @@ def get_derivatives_data(exchange_name, symbol):
                 newest = float(rows[0]["openInterest"])
                 older = float(rows[1]["openInterest"])
                 result["oi_now"] = newest
-                result["oi_change"] = ((newest - older) / older * 1
+                result["oi_change"] = ((newest - older) / older * 100) if older else None
+        except Exception:
+            pass
+            
+        try:
+            r = requests.get(
+                "https://api.bybit.com/v5/market/funding/history",
+                params={"category": "linear", "symbol": pair, "limit": 1},
+                timeout=8
+            )
+            j = r.json()
+            rows = j.get("result", {}).get("list", [])
+            if rows:
+                result["funding"] = float(rows[0]["fundingRate"]) * 100
+        except Exception:
+            pass
+            
+    elif exchange_name == "OKX":
+        try:
+            okx_inst = f"{symbol.split('/')[0]}-USDT-SWAP"
+            r = requests.get(
+                "https://www.okx.com/api/v5/public/open-interest",
+                params={"instType": "SWAP", "instId": okx_inst},
+                timeout=8
+            )
+            j = r.json()
+            data = j.get("data", [])
+            if data:
+                result["oi_now"] = float(data[0]["oi"])
+                result["oi_change"] = 0.0 
+        except Exception:
+            pass
+            
+        try:
+            okx_inst = f"{symbol.split('/')[0]}-USDT-SWAP"
+            r = requests.get(
+                "https://www.okx.com/api/v5/public/funding-rate",
+                params={"instId": okx_inst},
+                timeout=8
+            )
+            j = r.json()
+            data = j.get("data", [])
+            if data:
+                result["funding"] = float(data[0]["fundingRate"]) * 100
+        except Exception:
+            pass
+            
+    return result
+
+def add_indicators(df):
+    x = df.copy()
+    x["sma20"] = x["close"].rolling(20).mean()
+    x["sma50"] = x["close"].rolling(50).mean()
+    delta = x["close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    x["rsi"] = 100 - (100 / (1 + rs))
+    prev_close = x["close"].shift(1)
+    tr = pd.concat([
+        x["high"] - x["low"],
+        (x["high"] - prev_close).abs(),
+        (x["low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    x["atr"] = tr.rolling(14).mean()
+    x["est_delta"] = np.where(x["close"] >= x["open"], x["volume"], -x["volume"])
+    x["delta_sum"] = x["est_delta"].rolling(20).sum()
+    x["vol_avg"] = x["volume"].rolling(20).mean()
+    return x
+
+def structure_score(df):
+    x = add_indicators(df).dropna()
+    if len(x) < 5:
+        return 0, {}
+    last = x.iloc[-1]
+    prev = x.iloc[-2]
+    score = 0
+    details = {}
+    if last.close > last.sma20: score += 1
+    else: score -= 1
+    if last.sma20 > last.sma50: score += 1
+    else: score -= 1
+    if last.close > prev.high: score += 1
+    elif last.close < prev.low: score -= 1
+    if last.rsi >= 55: score += 1
+    elif last.rsi <= 45: score -= 1
+    if last.delta_sum > 0: score += 1
+    elif last.delta_sum < 0: score -= 1
+    details.update({
+        "RSI": round(float(last.rsi), 1),
+        "SMA20": float(last.sma20),
+        "SMA50": float(last.sma50),
+        "Becsült delta": "Pozitív" if last.delta_sum > 0 else "Negatív",
+        "ATR": float(last.atr),
+        "score": score
+    })
+    return score, details
+
+def label(score):
+    if score >= 3: return "LONG irányú fölény", "success"
+    if score >= 1: return "Enyhe LONG fölény", "success"
+    if score <= -3: return "SHORT irányú fölény", "error"
+    if score <= -1: return "Enyhe SHORT fölény", "error"
+    return "Semleges / kivárás", "warning"
+
+@st.cache_data(ttl=15)
+def load_all(exc, sym):
+    return {tf: get_ohlcv(exc, sym, tf, 300) for tf in TIMEFRAMES}
+
+try:
+    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + AI hír-kalkuláció..."):
+        frames = load_all(exchange_choice, symbol)
+        deriv = get_derivatives_data(exchange_choice, symbol)
+        news_items = get_crypto_news()
+        
+        # Hírek elemzése AI-val vagy fallbackkel
+        if groq_api_key:
+            news_score, news_explanation = analyze_news_ai(news_items, groq_api_key)
+        else:
+            news_score = analyze_news_sentiment_fallback(news_items)
+            news_explanation = "Kulcsszó-alapú becslés (adj meg Groq kulcsot az AI-értékeléshez)."
+
+    analyzed = {tf: add_indicators(df) for tf, df in frames.items()}
+    scores = {}
+    details = {}
+    for tf, df in frames.items():
+        scores[tf], details[tf] = structure_score(df)
+
+    # 1. Technikai pontszám (idősíkok súlyozott átlaga)
+    tech_weighted = (
+        scores["4h"] * 0.30 +
+        scores["1h"] * 0.30 +
+        scores["15m"] * 0.20 +
+        scores["5m"] * 0.12 +
+        scores["1m"] * 0.08
+    )
+    
+    # 2. VÉGLEGES ÖSSZESÍTETT PONT: 70% Technikai + 30% Hír-hangulat AI kalkuláció
+    weighted = tech_weighted * 0.70 + news_score * 0.30
+
+    funding = deriv.get("funding")
+    if funding is not None:
+        if funding > 0.03: weighted -= 0.15
+        elif funding < -0.03: weighted += 0.15
+
+    direction, status = label(weighted)
+    confidence = min(90, 50 + abs(weighted) * 8)
+    price = float(frames["1m"].iloc[-1]["close"])
+
+    # --- Kijelzés a felületen ---
+    a, b, c, d = st.columns(4)
+    a.metric("Aktuális ár", f"{price:,.4f} USDT")
+    b.metric("Technikai pont", f"{tech_weighted:+.2f} / 5")
+    c.metric("Hír-hangulat pont", f"{news_score:+.2f} (-2 / +2)")
+    d.metric("Végső Komplex Pont", f"{weighted:+.2f}")
+
+    if status == "success": st.success(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
+    elif status == "error": st.error(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
+    else: st.warning(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
+
+    # Két részletes oszlop
+    col_left, col_right = st.columns([1.2, 1])
+
+    with col_left:
+        st.subheader("Technikai Idősíkok")
+        rows = []
+        for tf in ["4h", "1h", "15m", "5m", "1m"]:
+            sc = scores[tf]
+            rows.append({"Idősík": tf, "Pontszám": sc, "Irány": "LONG" if sc > 0 else ("SHORT" if sc < 0 else "Semleges")})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    with col_right:
+        st.subheader("Hogyan kalkulálta be a híreket az AI?")
+        st.info(f"**Hatás a pontszámra:** {news_score:+.2f} pont (a 30%-os súllyal módosítja a végső irányt).")
+        st.write(f"**AI Indoklás:** {news_explanation}")
+        with st.expander("Vizsgált hírek listája"):
+            for item in news_items:
+                st.markdown(f"- [{item['title']}]({item['link']})")
+
+    if show_chart:
+        st.subheader("1 órás chart")
+        chart = analyzed["1h"].tail(180)
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.72, 0.28])
+        fig.add_trace(go.Candlestick(x=chart["time"], open=chart["open"], high=chart["high"], low=chart["low"], close=chart["close"], name=symbol), row=1, col=1)
+        fig.add_trace(go.Scatter(x=chart["time"], y=chart["sma20"], name="SMA20"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=chart["time"], y=chart["sma50"], name="SMA50"), row=1, col=1)
+        fig.add_trace(go.Bar(x=chart["time"], y=chart["est_delta"], name="Becsült delta"), row=2, col=1)
+        fig.update_layout(height=550, xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+except Exception as e:
+    st.error(f"Hiba történt: {e}")
+
+if refresh != "Kézi":
+    seconds = {"30 mp": 30, "60 mp": 60, "5 perc": 300}[refresh]
+    time.sleep(seconds)
+    st.rerun()
