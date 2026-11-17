@@ -9,8 +9,8 @@ import feedparser
 import ccxt
 
 st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
-st.title("SALIGA AI – Intézményi Market Intelligence + OI + Telegram Riasztás")
-st.caption("Kriptopiaci elemző MVP • Technikai + Derivatív (OI) + AI Hír + Minta + Riasztás")
+st.title("SALIGA AI – Intézményi Market Intelligence + ATR Stop/TP & Auto Telegram")
+st.caption("Kriptopiaci elemző MVP • Technikai + ATR Kockázatkezelés + OI + AI Hír + Minta + Auto Riasztás")
 
 # --- Settings & API Keys ---
 with st.sidebar:
@@ -27,6 +27,10 @@ with st.sidebar:
     st.subheader("Telegram Riasztás Beállítások")
     telegram_token = st.text_input("Telegram Bot Token", type="password", help="BotFather-től kapott HTTP API token.")
     telegram_chat_id = st.text_input("Telegram Chat ID", type="password", help="A cél chat vagy csatorna ID-ja.")
+    
+    auto_alert_enabled = st.checkbox("Automatikus riasztás bekapcsolva", value=False)
+    alert_threshold = st.slider("Min. Erősség küszöb (%)", min_value=50, max_value=90, value=75, step=5)
+    
     send_alert_btn = st.button("Riasztás küldése Telegramra most")
 
 TIMEFRAMES = {
@@ -237,7 +241,6 @@ def get_derivatives_data(exchange_name, symbol):
     return result
 
 def send_telegram_message(token, chat_id, message):
-    """Segédfüggvény a Telegram riasztás elküldésére"""
     if not token or not chat_id:
         return False, "Hiányzó Telegram Token vagy Chat ID."
     try:
@@ -303,7 +306,7 @@ def load_all(exc, sym):
     return {tf: get_ohlcv(exc, sym, tf, target_limit=5000) for tf in TIMEFRAMES}
 
 try:
-    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + OI adatok + Hír-elemzés + Mintakeresés..."):
+    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + ATR & OI & Hírek + Mintakeresés..."):
         frames = load_all(exchange_choice, symbol)
         deriv = get_derivatives_data(exchange_choice, symbol)
         news_items = get_crypto_news()
@@ -347,10 +350,23 @@ try:
 
     direction, status = label(weighted)
     confidence = min(90, 50 + abs(weighted) * 8)
-    price = float(frames["1m"].iloc[-1]["close"])
+    
+    last_row = analyzed["1h"].iloc[-1]
+    price = float(last_row["close"])
+    current_atr = float(last_row["atr"]) if not np.isnan(last_row["atr"]) else price * 0.01
 
-    # Ha megnyomják a gombot, vagy automatikusan küldhetjük a Telegram üzenetet
-    alert_msg = f"🚨 *SALIGA AI Riasztás*\n\nPiac: `{symbol}` ({exchange_choice})\nIrány: *{direction}*\nKomplex Erősség: `{confidence:.0f}%`\nAktuális ár: `{price:,.4f} USDT`\n\n- Technikai pont: `{tech_weighted:+.2f}`\n- Hír-hangulat: `{news_score:+.2f}`\n- Múltbeli minta: `{pattern_score:+.2f}`"
+    # ATR alapú Stop-Loss és Take-Profit kalkuláció
+    if "LONG" in direction:
+        stop_loss = price - (1.5 * current_atr)
+        take_profit = price + (2.5 * current_atr)
+    elif "SHORT" in direction:
+        stop_loss = price + (1.5 * current_atr)
+        take_profit = price - (2.5 * current_atr)
+    else:
+        stop_loss = price - (1.5 * current_atr)
+        take_profit = price + (2.5 * current_atr)
+
+    alert_msg = f"🚨 *SALIGA AI Automatikus Riasztás*\n\nPiac: `{symbol}` ({exchange_choice})\nIrány: *{direction}*\nKomplex Erősség: `{confidence:.0f}%` (Küszöb: {alert_threshold}%)\nAktuális ár: `{price:,.4f} USDT`\n\n🎯 *Ajánlott Kockázatkezelés (ATR)*:\n- Stop-Loss: `{stop_loss:,.4f}`\n- Take-Profit: `{take_profit:,.4f}`\n\n- Technikai pont: `{tech_weighted:+.2f}`\n- Hír-hangulat: `{news_score:+.2f}`\n- Múltbeli minta: `{pattern_score:+.2f}`"
 
     if send_alert_btn:
         success, msg = send_telegram_message(telegram_token, telegram_chat_id, alert_msg)
@@ -358,6 +374,14 @@ try:
             st.sidebar.success(msg)
         else:
             st.sidebar.error(msg)
+
+    if auto_alert_enabled and confidence >= alert_threshold:
+        alert_key = f"last_alert_{symbol}_{direction}_{int(confidence)}"
+        if st.session_state.get(alert_key) != "sent":
+            success, msg = send_telegram_message(telegram_token, telegram_chat_id, alert_msg)
+            if success:
+                st.session_state[alert_key] = "sent"
+                st.sidebar.success("Auto riasztás elküldve Telegramra!")
 
     # --- Kijelzés a felületen ---
     a, b, c, d = st.columns(4)
@@ -369,6 +393,9 @@ try:
     if status == "success": st.success(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
     elif status == "error": st.error(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
     else: st.warning(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
+
+    # ATR Szintek vizuális kiemelése
+    st.info(f"📊 **ATR Alapú Kockázatkezelési Szintek (1h chart alapján):**  \n🔴 **Ajánlott Stop-Loss:** `{stop_loss:,.4f} USDT` | 🟢 **Ajánlott Take-Profit:** `{take_profit:,.4f} USDT` (ATR: `{current_atr:.2f}`)")
 
     col_left, col_right = st.columns([1.2, 1])
 
