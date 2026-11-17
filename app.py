@@ -9,8 +9,8 @@ import feedparser
 import ccxt
 
 st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
-st.title("SALIGA AI – Intézményi Market Intelligence + AI Kereskedési Mentor")
-st.caption("Kriptopiaci elemző MVP • Technikai + Likvidációs Hőtérkép + AI Mentor + ATR Stop/TP + OI")
+st.title("SALIGA AI – Intézményi Market Intelligence + Multi-Faktor Szignál Motor")
+st.caption("Teljesen szinkronizált MVP • Likvidációs Zónák + Multi-Faktor Szignál + AI Mentor + ATR")
 
 # --- Settings & API Keys ---
 with st.sidebar:
@@ -180,26 +180,27 @@ def pattern_matching_analysis(df, window_size=20):
     explanation = f"A leginkább hasonló 5 múltbeli minta közül {bullish_count} esetben váltotta fel emelkedés (átlagos hozam: {avg_future_return*100:.2f}%)."
     return max(min(pattern_score, 2.0), -2.0), explanation
 
-def get_ai_trading_mentor(price, tech_score, oi_trend, liq_info, pattern_exp, news_exp, api_key):
-    """AI Kereskedési Mentor modul, amely integrálja a likvidációs zónákat is"""
+def get_ai_trading_mentor(price, unified_direction, confidence, tech_score, oi_trend, liq_summary, pattern_exp, news_exp, api_key):
+    """Szinkronizált AI Kereskedési Mentor, ami a közös szignálmotor eredményét kapja meg"""
     if not api_key:
         return "Nincs megadva Groq API kulcs az AI Mentor aktiválásához."
         
     prompt = f"""
-    Te egy profi kriptopiaci kvantitatív kockázatkezelő és likvidációs elemző mentor vagy.
-    Elemezd az alábbi élő piaci adatokat, figyelembe véve a becsült likvidációs zónákat is:
+    Te egy profi kriptopiaci kvantitatív vezérigazgató és kereskedési mentor vagy.
+    A rendszerünk egy szinkronizált multi-faktoros szignálmotor alapján kiszámolta az alábbi egységesített piaci irányt:
     
+    - Egységes Piaci Irány: {unified_direction} (Erősség: {confidence:.0f}%)
     - Aktuális ár: {price} USDT
     - Technikai pontszám (5-ös skálán): {tech_score}
-    - Open Interest (OI) trend: {oi_trend}
-    - Likvidációs Hőtérkép / Zónák: {liq_info}
-    - Történelmi mintafelismerés: {pattern_exp}
-    - Hír-hangulat elemzés: {news_exp}
+    - Open Interest & Tőkeáramlás: {oi_trend}
+    - Likvidációs Zónák / Hőtérkép: {liq_summary}
+    - Historikus Minta Elemzés: {pattern_exp}
+    - Hír-hangulat: {news_exp}
     
     Kérlek, add meg a válaszodat magyar nyelven, az alábbi tömör szerkezetben:
-    1. **Piaci Állapot & Likviditás:** (Hová mozdulhat a piac a likvidációs zónák alapján)
-    2. **AI Javaslat:** (LONG, SHORT vagy KIVÁRÁS és miért)
-    3. **Kockázati Figyelmeztetés:** (Mire figyeljen a kereskedő a likvidációs falaknál)
+    1. **Szignál Szintézis:** (Magyarázd meg, hogy a technika, a likvidációs hőtérkép és a tőkeáramlás hogyan erősíti meg ezt az irányt)
+    2. **AI Kereskedési Stratégia:** (Pontos belépési és kezelési javaslat a szignálnak megfelelően)
+    3. **Fő Kockázati Zóna:** (Hol érvénytelenítődik ez a szignál a likvidációs falak alapján)
     """
     
     try:
@@ -331,7 +332,6 @@ def structure_score(df):
     last = x.iloc[-1]
     prev = x.iloc[-2]
     score = 0
-    details = {}
     if last.close > last.sma20: score += 1
     else: score -= 1
     if last.sma20 > last.sma50: score += 1
@@ -342,7 +342,7 @@ def structure_score(df):
     elif last.rsi <= 45: score -= 1
     if last.delta_sum > 0: score += 1
     elif last.delta_sum < 0: score -= 1
-    return score, details
+    return score, {}
 
 def label(score):
     if score >= 3: return "LONG irányú fölény", "success"
@@ -356,7 +356,7 @@ def load_all(exc, sym):
     return {tf: get_ohlcv(exc, sym, tf, target_limit=5000) for tf in TIMEFRAMES}
 
 try:
-    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + Likvidációs Hőtérkép + AI Mentor..."):
+    with st.spinner(f"Multi-Faktor Szignálmotor futtatása ({exchange_choice})..."):
         frames = load_all(exchange_choice, symbol)
         deriv = get_derivatives_data(exchange_choice, symbol)
         news_items = get_crypto_news()
@@ -365,7 +365,7 @@ try:
             news_score, news_explanation = analyze_news_ai(news_items, groq_api_key)
         else:
             news_score = analyze_news_sentiment_fallback(news_items)
-            news_explanation = "Kulcsszó-alapú becslés (adj meg Groq kulcsot az AI-értékeléshez)."
+            news_explanation = "Kulcsszó-alapú becslés."
 
         pattern_score, pattern_explanation = pattern_matching_analysis(frames["1h"], window_size=20)
 
@@ -382,60 +382,63 @@ try:
         scores["1m"] * 0.08
     )
     
-    weighted = tech_weighted * 0.45 + news_score * 0.25 + pattern_score * 0.30
-
-    oi_change = deriv.get("oi_change")
-    funding = deriv.get("funding")
-    
-    if oi_change is not None:
-        price_direction = 1 if frames["1h"].iloc[-1]["close"] > frames["1h"].iloc[-2]["close"] else -1
-        if oi_change > 0:
-            weighted += 0.2 * price_direction
-        else:
-            weighted -= 0.1 * price_direction
-
-    if funding is not None:
-        if funding > 0.03: weighted -= 0.15
-        elif funding < -0.03: weighted += 0.15
-
-    direction, status = label(weighted)
-    confidence = min(90, 50 + abs(weighted) * 8)
-    
     last_row = analyzed["1h"].iloc[-1]
     price = float(last_row["close"])
     current_atr = float(last_row["atr"]) if not np.isnan(last_row["atr"]) else price * 0.01
 
-    # ATR alapú Stop-Loss és Take-Profit kalkuláció
+    # Likvidációs Hőtérkép zónák kiszámítása
+    liq_short_heavy = price + (current_atr * 1.2)
+    liq_short_extreme = price + (current_atr * 2.5)
+    liq_long_heavy = price - (current_atr * 1.2)
+    liq_long_extreme = price - (current_atr * 2.5)
+
+    # --- KÖZÖS MULTI-FAKTOROS SZIGNÁLMOTOR ---
+    # Itt adjuk össze a technikai, hírek, minta, OI ÉS a likvidációs hőtérkép szignáljait!
+    # Ha az ár közelebb van a long likvidációs zónához, az bikás visszapattanási esélyt ad, stb.
+    liq_bias = 0.5 if price < (liq_long_heavy + current_atr) else (-0.5 if price > (liq_short_heavy - current_atr) else 0.0)
+    
+    total_weighted_score = (
+        tech_weighted * 0.35 +
+        news_score * 0.20 +
+        pattern_score * 0.20 +
+        liq_bias * 0.25
+    )
+
+    oi_change = deriv.get("oi_change")
+    funding = deriv.get("funding")
+    if oi_change is not None:
+        price_dir = 1 if frames["1h"].iloc[-1]["close"] > frames["1h"].iloc[-2]["close"] else -1
+        total_weighted_score += (0.15 * price_dir if oi_change > 0 else -0.1 * price_dir)
+
+    direction, status = label(total_weighted_score)
+    confidence = min(95, 50 + abs(total_weighted_score) * 10)
+
+    # ATR alapú Stop-Loss és Take-Profit a szignál alapján
     if "LONG" in direction:
         stop_loss = price - (1.5 * current_atr)
         take_profit = price + (2.5 * current_atr)
+        liq_summary_text = f"Ár a long likvidációs zóna közelében ({liq_long_heavy:,.2f} USDT). Célpont a short fal ({liq_short_heavy:,.2f} USDT)."
     elif "SHORT" in direction:
         stop_loss = price + (1.5 * current_atr)
         take_profit = price - (2.5 * current_atr)
+        liq_summary_text = f"Ár a short likvidációs fal közelében ({liq_short_heavy:,.2f} USDT). Célpont a long zóna ({liq_long_heavy:,.2f} USDT)."
     else:
         stop_loss = price - (1.5 * current_atr)
         take_profit = price + (2.5 * current_atr)
+        liq_summary_text = f"A piac egyensúlyban van a likvidációs falak között ({liq_long_heavy:,.2f} és {liq_short_heavy:,.2f} USDT)."
 
-    # --- Likvidációs Hőtérkép & Zónák Számítása (ÚJ MODUL) ---
-    # Becsült tőkeáttételes sávok (pl. 25x és 50x tőkeáttételen lévő pozíciók likvidációs szintjei)
-    liq_short_cluster_heavy = price + (current_atr * 1.2)
-    liq_short_cluster_extreme = price + (current_atr * 2.5)
-    liq_long_cluster_heavy = price - (current_atr * 1.2)
-    liq_long_cluster_extreme = price - (current_atr * 2.5)
-    
-    liq_info_summary = f"Fő Short Likvidációs Zóna (Sűrű fal): {liq_short_cluster_heavy:,.2f} - {liq_short_cluster_extreme:,.2f} USDT. Fő Long Likvidációs Zóna (Fájdalompont): {liq_long_cluster_heavy:,.2f} - {liq_long_cluster_extreme:,.2f} USDT."
+    # Szinkronizált AI Mentor futtatása
+    ai_mentor_advice = get_ai_trading_mentor(
+        price, direction, confidence, round(tech_weighted, 2), 
+        deriv.get("oi_trend"), liq_summary_text, pattern_explanation, news_explanation, groq_api_key
+    )
 
-    # AI Mentor futtatása a likvidációs zónákkal integrálva
-    ai_mentor_advice = get_ai_trading_mentor(price, round(tech_weighted, 2), deriv.get("oi_trend"), liq_info_summary, pattern_explanation, news_explanation, groq_api_key)
-
-    alert_msg = f"🚨 *SALIGA AI Automatikus Riasztás*\n\nPiac: `{symbol}` ({exchange_choice})\nIrány: *{direction}*\nKomplex Erősség: `{confidence:.0f}%`\nAktuális ár: `{price:,.4f} USDT`\n\n🎯 *Likvidációs Fájdalompontok*:\n- Short Likvidációs Mágnes: `{liq_short_cluster_heavy:,.2f}`\n- Long Likvidációs Mágnes: `{liq_long_cluster_heavy:,.2f}`"
+    alert_msg = f"🚨 *SALIGA AI Multi-Faktor Riasztás*\n\nPiac: `{symbol}` ({exchange_choice})\nEgységes Irány: *{direction}* (`{confidence:.0f}%`)\nÁr: `{price:,.4f} USDT`\n\n🎯 *Stratégia*:\n- SL: `{stop_loss:,.4f}`\n- TP: `{take_profit:,.4f}`"
 
     if send_alert_btn:
         success, msg = send_telegram_message(telegram_token, telegram_chat_id, alert_msg)
-        if success:
-            st.sidebar.success(msg)
-        else:
-            st.sidebar.error(msg)
+        if success: st.sidebar.success(msg)
+        else: st.sidebar.error(msg)
 
     if auto_alert_enabled and confidence >= alert_threshold:
         alert_key = f"last_alert_{symbol}_{direction}_{int(confidence)}"
@@ -443,31 +446,31 @@ try:
             success, msg = send_telegram_message(telegram_token, telegram_chat_id, alert_msg)
             if success:
                 st.session_state[alert_key] = "sent"
-                st.sidebar.error("Auto riasztás elküldve Telegramra!")
+                st.sidebar.error("Auto riasztás elküldve!")
 
     # --- Kijelzés a felületen ---
     a, b, c, d = st.columns(4)
     a.metric("Aktuális ár", f"{price:,.4f} USDT")
-    b.metric("Technikai pont", f"{tech_weighted:+.2f} / 5")
-    c.metric("OI Trend & Tőke", deriv.get("oi_trend", "N/A"))
-    d.metric("Múltbeli Minta pont", f"{pattern_score:+.2f} (-2 / +2)")
+    b.metric("Multi-Faktor Pont", f"{total_weighted_score:+.2f}")
+    c.metric("Szignál Erősség", f"{confidence:.0f}%")
+    d.metric("OI Trend", deriv.get("oi_trend", "N/A"))
 
-    if status == "success": st.success(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
-    elif status == "error": st.error(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
-    else: st.warning(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
+    if status == "success": st.success(f"🎯 Egységes Szignál Irány: {direction} (Konvergencia Erősség: {confidence:.0f}%)")
+    elif status == "error": st.error(f"🎯 Egységes Szignál Irány: {direction} (Konvergencia Erősség: {confidence:.0f}%)")
+    else: st.warning(f"🎯 Egységes Szignál Irány: {direction} (Konvergencia Erősség: {confidence:.0f}%)")
 
-    # --- Likvidációs Hőtérkép Kártya ---
+    # Likvidációs Hőtérkép Panel
     st.markdown("### 🗺️ Intézményi Likvidációs Hőtérkép & Zónák")
     l1, l2, l3 = st.columns(3)
-    l1.error(f"🔴 **Súlyos Short Likvidációs Fal:**  \n`{liq_short_cluster_heavy:,.2f} USDT` -tól")
-    l2.info(f"📍 **Jelenlegi Piaci Ár:**  \n`{price:,.2f} USDT`")
-    l3.success(f"🟢 **Súlyos Long Likvidációs Fal:**  \n`{liq_long_cluster_heavy:,.2f} USDT` -ig")
+    l1.error(f"🔴 **Short Likvidációs Fal:**  \n`{liq_short_heavy:,.2f} USDT`")
+    l2.info(f"📍 **Jelenlegi Ár:**  \n`{price:,.2f} USDT`")
+    l3.success(f"🟢 **Long Likvidációs Zóna:**  \n`{liq_long_heavy:,.2f} USDT`")
 
-    # ATR Szintek vizuális kiemelése
-    st.info(f"📊 **ATR Alapú Kockázatkezelési Szintek (1h chart):**  \n🔴 **Ajánlott Stop-Loss:** `{stop_loss:,.4f} USDT` | 🟢 **Ajánlott Take-Profit:** `{take_profit:,.4f} USDT` (ATR: `{current_atr:.2f}`)")
+    # ATR Szintek
+    st.info(f"📊 **Kockázatkezelési Szintek (ATR alapú):**  \n🔴 **Stop-Loss:** `{stop_loss:,.4f} USDT` | 🟢 **Take-Profit:** `{take_profit:,.4f} USDT`")
 
-    # AI Kereskedési Mentor kártya kiemelése (már a likvidációs hőtérképpel kiegészítve)
-    st.subheader("🤖 AI Kereskedési Mentor Elemzése (Likviditás-alapú)")
+    # Szinkronizált AI Mentor Elemzés
+    st.subheader("🤖 AI Kereskedési Mentor Elemzése (Multi-Faktor Szintézis)")
     st.success(ai_mentor_advice)
 
     col_left, col_right = st.columns([1.2, 1])
