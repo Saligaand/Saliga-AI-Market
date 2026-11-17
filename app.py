@@ -9,7 +9,7 @@ import feedparser
 import ccxt
 
 st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
-st.title("SALIGA AI – Intézményi Market Intelligence + Multi-Faktor Szignál Motor")
+st.title("SALIGA AI – Intézményi Market Intelligence + Élő Irányjelző")
 st.caption("Teljesen szinkronizált MVP • Likvidációs Zónák + Multi-Faktor Szignál + AI Mentor + ATR")
 
 # --- Settings & API Keys ---
@@ -22,7 +22,6 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("AI Hírhangulat & Mentor Beállítás")
     
-    # Automatikusan kiolvassa a Secrets-ből, ha van beállítva
     default_groq = ""
     try:
         default_groq = st.secrets.get("GROQ_API_KEY", "")
@@ -181,7 +180,6 @@ def pattern_matching_analysis(df, window_size=20):
     return max(min(pattern_score, 2.0), -2.0), explanation
 
 def get_ai_trading_mentor(price, unified_direction, confidence, tech_score, oi_trend, liq_summary, pattern_exp, news_exp, api_key):
-    """Szinkronizált AI Kereskedési Mentor, ami a közös szignálmotor eredményét kapja meg"""
     if not api_key:
         return "Nincs megadva Groq API kulcs az AI Mentor aktiválásához."
         
@@ -345,11 +343,11 @@ def structure_score(df):
     return score, {}
 
 def label(score):
-    if score >= 3: return "LONG irányú fölény", "success"
-    if score >= 1: return "Enyhe LONG fölény", "success"
-    if score <= -3: return "SHORT irányú fölény", "error"
-    if score <= -1: return "Enyhe SHORT fölény", "error"
-    return "Semleges / kivárás", "warning"
+    if score >= 3: return "LONG NYITÁS AJÁNLOTT", "success"
+    if score >= 1: return "ENYHE LONG NYITÁS", "success"
+    if score <= -3: return "SHORT NYITÁS AJÁNLOTT", "error"
+    if score <= -1: return "ENYHE SHORT NYITÁS", "error"
+    return "KIVÁRÁS / SEMLEGES", "warning"
 
 @st.cache_data(ttl=15)
 def load_all(exc, sym):
@@ -386,15 +384,11 @@ try:
     price = float(last_row["close"])
     current_atr = float(last_row["atr"]) if not np.isnan(last_row["atr"]) else price * 0.01
 
-    # Likvidációs Hőtérkép zónák kiszámítása
     liq_short_heavy = price + (current_atr * 1.2)
     liq_short_extreme = price + (current_atr * 2.5)
     liq_long_heavy = price - (current_atr * 1.2)
     liq_long_extreme = price - (current_atr * 2.5)
 
-    # --- KÖZÖS MULTI-FAKTOROS SZIGNÁLMOTOR ---
-    # Itt adjuk össze a technikai, hírek, minta, OI ÉS a likvidációs hőtérkép szignáljait!
-    # Ha az ár közelebb van a long likvidációs zónához, az bikás visszapattanási esélyt ad, stb.
     liq_bias = 0.5 if price < (liq_long_heavy + current_atr) else (-0.5 if price > (liq_short_heavy - current_atr) else 0.0)
     
     total_weighted_score = (
@@ -413,7 +407,6 @@ try:
     direction, status = label(total_weighted_score)
     confidence = min(95, 50 + abs(total_weighted_score) * 10)
 
-    # ATR alapú Stop-Loss és Take-Profit a szignál alapján
     if "LONG" in direction:
         stop_loss = price - (1.5 * current_atr)
         take_profit = price + (2.5 * current_atr)
@@ -427,7 +420,6 @@ try:
         take_profit = price + (2.5 * current_atr)
         liq_summary_text = f"A piac egyensúlyban van a likvidációs falak között ({liq_long_heavy:,.2f} és {liq_short_heavy:,.2f} USDT)."
 
-    # Szinkronizált AI Mentor futtatása
     ai_mentor_advice = get_ai_trading_mentor(
         price, direction, confidence, round(tech_weighted, 2), 
         deriv.get("oi_trend"), liq_summary_text, pattern_explanation, news_explanation, groq_api_key
@@ -448,16 +440,39 @@ try:
                 st.session_state[alert_key] = "sent"
                 st.sidebar.error("Auto riasztás elküldve!")
 
-    # --- Kijelzés a felületen ---
+    # ==========================================
+    # --- NAGY, KIEGIELTÍTETT AKTUÁLIS JELZÉS ---
+    # ==========================================
+    st.markdown("---")
+    if "LONG" in direction:
+        st.markdown(f"""
+            <div style="background-color: #d4edda; padding: 25px; border-radius: 10px; border: 2px solid #28a745; text-align: center;">
+                <h1 style="color: #155724; margin: 0; font-size: 38px;">🟢 AKTUÁLIS AJÁNLAT: {direction}</h1>
+                <p style="color: #155724; font-size: 18px; margin-top: 10px;">Konvergencia Erősség: <b>{confidence:.0f}%</b> | Piac: <b>{symbol}</b></p>
+            </div>
+        """, unsafe_allow_html=True)
+    elif "SHORT" in direction:
+        st.markdown(f"""
+            <div style="background-color: #f8d7da; padding: 25px; border-radius: 10px; border: 2px solid #dc3545; text-align: center;">
+                <h1 style="color: #721c24; margin: 0; font-size: 38px;">🔴 AKTUÁLIS AJÁNLAT: {direction}</h1>
+                <p style="color: #721c24; font-size: 18px; margin-top: 10px;">Konvergencia Erősség: <b>{confidence:.0f}%</b> | Piac: <b>{symbol}</b></p>
+            </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+            <div style="background-color: #fff3cd; padding: 25px; border-radius: 10px; border: 2px solid #ffc107; text-align: center;">
+                <h1 style="color: #856404; margin: 0; font-size: 38px;">🟡 AKTUÁLIS AJÁNLAT: {direction}</h1>
+                <p style="color: #856404; font-size: 18px; margin-top: 10px;">Konvergencia Erősség: <b>{confidence:.0f}%</b> | Piac: <b>{symbol}</b></p>
+            </div>
+        """, unsafe_allow_html=True)
+    st.markdown("---")
+
+    # --- Kijelzés a felületen (Metrikák) ---
     a, b, c, d = st.columns(4)
     a.metric("Aktuális ár", f"{price:,.4f} USDT")
     b.metric("Multi-Faktor Pont", f"{total_weighted_score:+.2f}")
     c.metric("Szignál Erősség", f"{confidence:.0f}%")
     d.metric("OI Trend", deriv.get("oi_trend", "N/A"))
-
-    if status == "success": st.success(f"🎯 Egységes Szignál Irány: {direction} (Konvergencia Erősség: {confidence:.0f}%)")
-    elif status == "error": st.error(f"🎯 Egységes Szignál Irány: {direction} (Konvergencia Erősség: {confidence:.0f}%)")
-    else: st.warning(f"🎯 Egységes Szignál Irány: {direction} (Konvergencia Erősség: {confidence:.0f}%)")
 
     # Likvidációs Hőtérkép Panel
     st.markdown("### 🗺️ Intézményi Likvidációs Hőtérkép & Zónák")
