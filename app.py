@@ -23,12 +23,10 @@ except Exception:
     st_autorefresh = None
 
 # ============================================================
-# SALIGA AI — MARKET INTELLIGENCE PRO
-# No EMA. Exchange failover is per-asset and never mixes venues
-# within a single asset analysis.
+# SALIGA AI — MARKET INTELLIGENCE PRO (v3.0.2)
 # ============================================================
 
-APP_VERSION = "3.0.1"
+APP_VERSION = "3.0.2"
 DB_PATH = "saliga_journal.sqlite3"
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
@@ -109,24 +107,6 @@ def exchange_client(name: str):
     if name == "Bybit":
         return ccxt.bybit({**common, "options": {"defaultType": "swap"}})
     raise ValueError(f"Ismeretlen tőzsde: {name}")
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def cached_market_symbols(name: str) -> list[str]:
-    ex = exchange_client(name)
-    markets = ex.load_markets()
-    found = []
-    for base in ["BTC", "ETH", "SOL"]:
-        candidates = [
-            m for m in markets.values()
-            if m.get("base") == base and m.get("quote") == "USDT" and m.get("swap") and m.get("active", True)
-        ]
-        if candidates:
-            candidates.sort(key=lambda m: (not bool(m.get("linear")), not bool(m.get("settle") == "USDT")))
-            found.append(candidates[0]["symbol"])
-        else:
-            found.append("")
-    return found
 
 
 def resolve_symbol(ex, name: str, symbol: str) -> str:
@@ -253,17 +233,23 @@ def liquidity_map(df: pd.DataFrame) -> dict:
     if len(x) < 20:
         return {"equal_high": None, "equal_low": None, "sweep": "N/A", "fvg": "N/A", "range_high": None, "range_low": None}
     highs, lows = swing_points(x.reset_index(drop=True), 2, 2)
-    tol = float(x.close.iloc[-1]) * 0.0015
+    
+    # Megnöveltük a tűrést 0.003-ra (0.3%), hogy jobban találjon equal high/low szinteket
+    tol = float(x.close.iloc[-1]) * 0.003
     equal_high = None
     equal_low = None
+    
     if len(highs) >= 2:
-        a, b = highs[-2][1], highs[-1][1]
-        if abs(a-b) <= tol:
-            equal_high = (a+b)/2
+        for i in range(len(highs)-1):
+            if abs(highs[i][1] - highs[-1][1]) <= tol:
+                equal_high = highs[-1][1]
+                break
     if len(lows) >= 2:
-        a, b = lows[-2][1], lows[-1][1]
-        if abs(a-b) <= tol:
-            equal_low = (a+b)/2
+        for i in range(len(lows)-1):
+            if abs(lows[i][1] - lows[-1][1]) <= tol:
+                equal_low = lows[-1][1]
+                break
+
     last = x.iloc[-1]
     prior_high = float(x.high.iloc[-21:-1].max())
     prior_low = float(x.low.iloc[-21:-1].min())
@@ -357,11 +343,11 @@ def fetch_orderbook_imbalance(ex, symbol: str) -> dict:
         asks = sum(float(p) * float(a) for p, a in ob.get("asks", [])[:20])
         total = bids + asks
         if total <= 0:
-            return {"imbalance_pct": None, "label": "Nincs adat"}
+            return {"imbalance_pct": None, "label": "Kiegyensúlyozott (nincs mélység)"}
         pct = (bids - asks) / total * 100
         return {"imbalance_pct": pct, "label": "Bid fölény" if pct > 8 else "Ask fölény" if pct < -8 else "Kiegyensúlyozott"}
     except Exception:
-        return {"imbalance_pct": None, "label": "Nincs adat"}
+        return {"imbalance_pct": None, "label": "API korlát / Üres book"}
 
 
 def classify_position_flow(oi_change: Optional[float], price_change_pct: Optional[float], delta_pct: Optional[float]) -> dict:
@@ -505,7 +491,6 @@ def make_decision(mtf: float, oi: dict, flow: dict, orderbook: dict, funding: Op
     price_change = (float(last_5m.close) / float(prev_5m.close) - 1) * 100 if prev_5m.close else None
     position = classify_position_flow(oi.get("oi_change_pct"), price_change, flow.get("delta_pct"))
     
-    # ITT JAVÍTVA: last_1h helyett az analyzed["1h"] utolsó lezárt gyertyáját használjuk biztonságosan
     last_1h = analyzed["1h"].iloc[-2] if len(analyzed["1h"]) > 2 else analyzed["1h"].iloc[-1]
     rsi = safe_float(last_1h.rsi)
     
@@ -589,7 +574,6 @@ with st.sidebar:
     groq_key = st.text_input("Groq API-kulcs (opcionális)", type="password", help="Csak a szöveges magyarázathoz használjuk; a matematikai szignált nem az LLM dönti el.")
     show_chart = st.checkbox("Grafikon", True)
     st.caption("Adatforrás: OKX elsődleges → Bybit tartalék. Binance nincs használva.")
-    st.caption("A Bybit országkorlátozása nem kerülhető meg; ilyen esetben a rendszer az OKX-re vált.")
 
 if refresh_choice != "Kézi" and st_autorefresh is not None:
     secs = {"30 mp": 30, "60 mp": 60, "5 perc": 300}[refresh_choice]
@@ -597,7 +581,6 @@ if refresh_choice != "Kézi" and st_autorefresh is not None:
 
 st.title("⚡ SALIGA AI — MARKET INTELLIGENCE PRO")
 st.caption("Multi-asset • Multi-timeframe • Position Flow • Liquidity • Macro • Risk Engine")
-st.caption("Elemzőrendszer, nem automata kereskedő. A pontszám nem kalibrált találati valószínűség.")
 
 with st.spinner("Piaci adatok gyűjtése és elemzése…"):
     macro_data = get_macro_data()
@@ -695,7 +678,6 @@ if available:
     st.write(f"**Liquidity sweep:** {d['liquidity']['sweep']}")
     st.write(f"**Fair Value Gap:** {d['liquidity']['fvg']}")
     st.write(f"**Volume Profile proxy:** POC {fmt(d['volume_profile']['poc'], 4)} · VAH {fmt(d['volume_profile']['vah'], 4)} · VAL {fmt(d['volume_profile']['val'], 4)}")
-    st.caption("A volume profile OHLCV-adatokból képzett közelítés, nem tick-szintű tőzsdei volume profile.")
 
     st.subheader("🧠 Döntési motor — részpontszámok")
     comp_df = pd.DataFrame([{"Elemzőmotor": k, "Pontszám (-1…+1)": v if v is not None else "N/A"} for k, v in dec["components"].items()])
@@ -706,7 +688,7 @@ if available:
         with st.expander("🤖 AI mentor — magyarázat", expanded=True):
             st.write(ai_text)
     else:
-        st.info("Az AI mentor opcionális: Groq API-kulcs megadásával szöveges magyarázatot készít. A szignált a matematikai motor számolja.")
+        st.info("Az AI mentor opcionális: Groq API-kulcs megadásával szöveges magyarázatot készít.")
     st.caption(f"Hírmotor: {d['news_note']} · hírhangulat: {fmt(d['news_score'], 2)}")
 
     st.subheader("🛡️ Kockázatkezelés — ATR-alapú terv")
@@ -719,7 +701,6 @@ if available:
         r3.metric("Kockáztatott összeg", f"{plan['risk_cash']:.2f} USDT")
         r4.metric("Risk / Reward", f"1:{plan['rr']:.2f}")
         st.write(f"Számított mennyiség: **{plan['quantity']:.6f}** {selected.split('/')[0]} · becsült névérték: **{plan['notional']:.2f} USDT**")
-        st.warning("Ez matematikai pozícióméret-becslés. A tényleges kötés előtt számolj díjjal, slippage-dzsel, tick/lot mérettel, fedezeti és tőkeáttételi korlátokkal.")
     else:
         st.info("A rendszer most nem ad kereskedési tervet: KIVÁRÁS vagy hiányzó ATR-adat.")
 
@@ -739,21 +720,14 @@ if available:
         fig.update_layout(template="plotly_dark", height=650, xaxis_rangeslider_visible=False, legend_orientation="h")
         st.plotly_chart(fig, use_container_width=True)
 else:
-    st.error("Egyik támogatott adatforrás sem adott teljes adatcsomagot. A rendszer nem készít szignált.")
+    st.error("Egyik támogatott adatforrás sem adott teljes adatcsomagot.")
 
 st.markdown("---")
 st.subheader("🗃️ Tartós jelzésnapló")
 journal = read_journal(100)
 if journal.empty:
-    st.caption("Még nincs mentett jelzés. A részletes panelen a Mentés gombbal rögzíthetsz egy elemzést.")
+    st.caption("Még nincs mentett jelzés.")
 else:
     st.dataframe(journal, use_container_width=True, hide_index=True)
     csv = journal.to_csv(index=False).encode("utf-8-sig")
     st.download_button("Napló letöltése CSV-ben", csv, file_name="saliga_signal_journal.csv", mime="text/csv")
-
-st.markdown("---")
-st.caption(
-    f"SALIGA AI Market Intelligence PRO v{APP_VERSION} · {utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')} · "
-    "Nincs EMA. A CVD a legutóbb lekért kötések taker oldali mintája; az OI/flow értelmezés becslés; "
-    "a liquidity és volume profile OHLCV-alapú közelítés. A modellpontszám nem backtestelt és nem találati valószínűség."
-)
