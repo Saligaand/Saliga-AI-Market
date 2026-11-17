@@ -97,8 +97,12 @@ def analyze_news_sentiment_fallback(news_items):
     score = 0.0
     for item in news_items:
         t = item["title"].lower()
-        for w in bullish: if w in t: score += 0.3
-        for w in bearish: if w in t: score -= 0.3
+        for w in bullish:
+            if w in t:
+                score += 0.3
+        for w in bearish:
+            if w in t:
+                score -= 0.3
     return max(min(score, 2.0), -2.0)
 
 def analyze_news_ai(news_items, api_key):
@@ -231,7 +235,6 @@ try:
     price = float(last_row["close"])
     atr_1h = float(last_row["atr"]) if not np.isnan(last_row["atr"]) else price * 0.01
 
-    # --- 1. Multi-Timeframe Likvidációs Mátriz (Scalp vs Swing falak) ---
     scalp_liq_short = price + (atr_1h * 0.8)
     scalp_liq_long = price - (atr_1h * 0.8)
     swing_liq_short = price + (atr_1h * 2.2)
@@ -248,7 +251,6 @@ try:
     direction, status = label(total_score)
     conf = min(95, 50 + abs(total_score) * 10)
 
-    # --- ATR Stop-Loss & Take-Profit ---
     if "LONG" in direction:
         stop_loss = price - (1.5 * atr_1h)
         take_profit = price + (2.5 * atr_1h)
@@ -259,7 +261,6 @@ try:
         stop_loss = price - (1.5 * atr_1h)
         take_profit = price + (2.5 * atr_1h)
 
-    # --- 2. Risk/Reward (R:R) & Pozícióméret Számítás ---
     risk_pips = abs(price - stop_loss)
     reward_pips = abs(take_profit - price)
     rr_ratio = reward_pips / risk_pips if risk_pips > 0 else 0.0
@@ -272,7 +273,6 @@ try:
 
     ai_mentor = get_ai_trading_mentor(price, direction, conf, round(tech_weighted, 2), deriv.get("oi_trend"), liq_sum_text, f"1:{rr_ratio:.2f}", groq_api_key)
 
-    # --- UI: ÉLŐ JELZÉS DOBOZ ---
     st.markdown("---")
     if "LONG" in direction:
         st.markdown(f"""<div style="background-color: #d4edda; padding: 22px; border-radius: 10px; border: 2px solid #28a745; text-align: center;">
@@ -291,14 +291,12 @@ try:
         </div>""", unsafe_allow_html=True)
     st.markdown("---")
 
-    # --- Metrikák ---
     a, b, c, d = st.columns(4)
     a.metric("Aktuális Ár", f"{price:,.4f} USDT")
     b.metric("Kockázat-Hozam (R:R)", f"1 : {rr_ratio:.2f}")
     c.metric("Ajánlott Tőkeáttétel", f"~{leverage_rec}x")
     d.metric("OI Trend", deriv.get("oi_trend", "N/A"))
 
-    # --- 3. Multi-Timeframe Likvidációs Mátrix UI ---
     st.markdown("### 🗺️ Multi-Timeframe Likvidációs Mátrix & Hőtérkép")
     m1, m2 = st.columns(2)
     with m1:
@@ -306,10 +304,8 @@ try:
     with m2:
         st.warning(f"🌊 **Swing Zónák (Hosszú táv):**\n- Short Fal: `{swing_liq_short:,.2f}`\n- Long Zóna: `{swing_liq_long:,.2f}`")
 
-    # ATR Szintek & R:R Részletek
     st.success(f"📊 **Kockázatkezelési Szintek:** Stop-Loss: `{stop_loss:,.4f}` | Take-Profit: `{take_profit:,.4f}` | Kockáztatott tőke: `{risk_amount_usdt:.2f} USDT`")
 
-    # --- 4. Trade Journal (Kötési Napló) Funkció ---
     col_j1, col_j2 = st.columns([2, 1])
     with col_j1:
         st.subheader("🤖 AI Kereskedési Mentor Elemzése")
@@ -333,7 +329,6 @@ try:
             with st.expander(f"Mentett ügyletek ({len(st.session_state.trade_journal)})"):
                 st.dataframe(pd.DataFrame(st.session_state.trade_journal), use_container_width=True)
 
-    # --- Technikai Táblázat & Chart ---
     col_left, col_right = st.columns([1.2, 1])
     with col_left:
         st.subheader("Technikai Idősíkok")
