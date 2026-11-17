@@ -9,8 +9,8 @@ import feedparser
 import ccxt
 
 st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
-st.title("SALIGA AI – Market Intelligence + AI Sentiment Analízis")
-st.caption("Kriptopiaci elemző MVP • Technikai + Derivatív + AI Hír-kalkuláció")
+st.title("SALIGA AI – Market Intelligence + AI Hírek + Mintafelismerés")
+st.caption("Kriptopiaci elemző MVP • Technikai + Derivatív + AI Hír + Történelmi Minta")
 
 # --- Settings & API Keys ---
 with st.sidebar:
@@ -30,7 +30,8 @@ TIMEFRAMES = {
 }
 
 @st.cache_data(ttl=15)
-def get_ohlcv(exchange_name, symbol, timeframe, limit=300):
+def get_ohlcv(exchange_name, symbol, timeframe, limit=1000):
+    # Megemeltük a limitet 1000-re, hogy több hónapos múltat is vizsgálhasson a mintafelismerés
     if exchange_name == "OKX":
         ex = ccxt.okx({"enableRateLimits": True})
     else:
@@ -46,7 +47,7 @@ def get_crypto_news():
     try:
         feed = feedparser.parse("https://cointelegraph.com/rss")
         news_items = []
-        for entry in feed.entries[:5]: # Top 5 friss hír
+        for entry in feed.entries[:5]: 
             news_items.append({"title": entry.title, "link": entry.link})
         return news_items
     except Exception:
@@ -65,7 +66,6 @@ def analyze_news_sentiment_fallback(news_items):
     return max(min(score, 2.0), -2.0)
 
 def analyze_news_ai(news_items, api_key):
-    """AI alapú hangulatelemzés, ami számértéket és indoklást ad a hírekre"""
     titles = [item["title"] for item in news_items]
     titles_str = "\n".join([f"- {t}" for t in titles])
     
@@ -103,6 +103,48 @@ def analyze_news_ai(news_items, api_key):
         return max(min(score, 2.0), -2.0), explanation
     except Exception as e:
         return analyze_news_sentiment_fallback(news_items), f"AI hiba ({e}), kulcsszavas módszerre váltva."
+
+def pattern_matching_analysis(df, window_size=20):
+    """Múltbeli minták keresése a gyertya adatokban (hasonlóság vizsgálat)"""
+    if len(df) < window_size * 5:
+        return 0.0, "Nincs elég múltbeli adat a mintakereséshez."
+    
+    closes = df['close'].values
+    current_window = closes[-window_size:]
+    
+    # Normalizálás (z-score), hogy az árszinttől függetlenül a formát/alakzatot vizsgáljuk
+    curr_norm = (current_window - np.mean(current_window)) / (np.std(current_window) + 1e-8)
+    
+    matches = []
+    # Visszamenőleges csúszóablakos keresés a múltban
+    for i in range(len(closes) - window_size * 2):
+        hist_window = closes[i:i+window_size]
+        hist_norm = (hist_window - np.mean(hist_window)) / (np.std(hist_window) + 1e-8)
+        
+        # Euklideszi távolság a minták között (kisebb érték = nagyobb hasonlóság)
+        dist = np.linalg.norm(curr_norm - hist_norm)
+        
+        # Megnézzük, mi történt a minta utáni 5. gyertyánál
+        future_idx = i + window_size
+        if future_idx + 5 < len(closes):
+            future_return = (closes[future_idx + 5] - closes[future_idx]) / closes[future_idx]
+            matches.append((dist, future_return))
+            
+    if not matches:
+        return 0.0, "Nem talált elegendő hasonló múltbeli mintát."
+        
+    # Leghasonlóbb 5 minta kiválasztása
+    matches.sort(key=lambda x: x[0])
+    top_matches = matches[:5]
+    
+    avg_future_return = np.mean([m[1] for m in top_matches])
+    bullish_count = sum(1 for m in top_matches if m[1] > 0)
+    
+    # Pontszám skálázás -2.0 és +2.0 közé
+    pattern_score = (bullish_count / len(top_matches)) * 4.0 - 2.0 
+    
+    explanation = f"A múltbeli adatokból a leginkább hasonló 5 minta közül {bullish_count esetben váltotta fel emelkedés (átlagos hozam: {avg_future_return*100:.2f}%)."
+    return max(min(pattern_score, 2.0), -2.0), explanation
 
 @st.cache_data(ttl=30)
 def get_derivatives_data(exchange_name, symbol):
@@ -229,20 +271,23 @@ def label(score):
 
 @st.cache_data(ttl=15)
 def load_all(exc, sym):
-    return {tf: get_ohlcv(exc, sym, tf, 300) for tf in TIMEFRAMES}
+    return {tf: get_ohlcv(exc, sym, tf, 1000) for tf in TIMEFRAMES}
 
 try:
-    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + AI hír-kalkuláció..."):
+    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + Hír-elemzés + Történelmi mintakeresés..."):
         frames = load_all(exchange_choice, symbol)
         deriv = get_derivatives_data(exchange_choice, symbol)
         news_items = get_crypto_news()
         
-        # Hírek elemzése AI-val vagy fallbackkel
+        # 1. Hírek elemzése AI-val vagy fallbackkel
         if groq_api_key:
             news_score, news_explanation = analyze_news_ai(news_items, groq_api_key)
         else:
             news_score = analyze_news_sentiment_fallback(news_items)
             news_explanation = "Kulcsszó-alapú becslés (adj meg Groq kulcsot az AI-értékeléshez)."
+
+        # 2. Múltbeli mintafelismerés az 1 órás (1h) charton
+        pattern_score, pattern_explanation = pattern_matching_analysis(frames["1h"], window_size=20)
 
     analyzed = {tf: add_indicators(df) for tf, df in frames.items()}
     scores = {}
@@ -250,7 +295,7 @@ try:
     for tf, df in frames.items():
         scores[tf], details[tf] = structure_score(df)
 
-    # 1. Technikai pontszám (idősíkok súlyozott átlaga)
+    # Technikai pontszám (idősíkok súlyozott átlaga)
     tech_weighted = (
         scores["4h"] * 0.30 +
         scores["1h"] * 0.30 +
@@ -259,8 +304,8 @@ try:
         scores["1m"] * 0.08
     )
     
-    # 2. VÉGLEGES ÖSSZESÍTETT PONT: 70% Technikai + 30% Hír-hangulat AI kalkuláció
-    weighted = tech_weighted * 0.70 + news_score * 0.30
+    # VÉGLEGES ÖSSZESÍTETT PONT: 50% Technikai + 25% Hír-hangulat + 25% Múltbeli minták
+    weighted = tech_weighted * 0.50 + news_score * 0.25 + pattern_score * 0.25
 
     funding = deriv.get("funding")
     if funding is not None:
@@ -276,13 +321,13 @@ try:
     a.metric("Aktuális ár", f"{price:,.4f} USDT")
     b.metric("Technikai pont", f"{tech_weighted:+.2f} / 5")
     c.metric("Hír-hangulat pont", f"{news_score:+.2f} (-2 / +2)")
-    d.metric("Végső Komplex Pont", f"{weighted:+.2f}")
+    d.metric("Múltbeli Minta pont", f"{pattern_score:+.2f} (-2 / +2)")
 
     if status == "success": st.success(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
     elif status == "error": st.error(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
     else: st.warning(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
 
-    # Két részletes oszlop
+    # Részletes oszlopok
     col_left, col_right = st.columns([1.2, 1])
 
     with col_left:
@@ -294,9 +339,13 @@ try:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     with col_right:
-        st.subheader("Hogyan kalkulálta be a híreket az AI?")
-        st.info(f"**Hatás a pontszámra:** {news_score:+.2f} pont (a 30%-os súllyal módosítja a végső irányt).")
-        st.write(f"**AI Indoklás:** {news_explanation}")
+        st.subheader("AI Hírek & Múltbeli Minták")
+        st.info(f"**Hír-hangulat hatás:** {news_score:+.2f} (25% súly)")
+        st.write(f"**AI Hír Indoklás:** {news_explanation}")
+        
+        st.warning(f"**Múltbeli mintázat hatás:** {pattern_score:+.2f} (25% súly)")
+        st.write(f"**Mintafelismerés:** {pattern_explanation}")
+        
         with st.expander("Vizsgált hírek listája"):
             for item in news_items:
                 st.markdown(f"- [{item['title']}]({item['link']})")
