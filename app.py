@@ -9,7 +9,7 @@ import feedparser
 import ccxt
 
 st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
-st.title("SALIGA AI – Market Intelligence + AI Hírek + Mintafelismerés")
+st.title("SALIGA AI – Market Intelligence + AI Hírek + Mély Mintafelismerés")
 st.caption("Kriptopiaci elemző MVP • Technikai + Derivatív + AI Hír + Történelmi Minta")
 
 # --- Settings & API Keys ---
@@ -29,15 +29,40 @@ TIMEFRAMES = {
     "1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h"
 }
 
-@st.cache_data(ttl=15)
-def get_ohlcv(exchange_name, symbol, timeframe, limit=1000):
+def get_timeframe_ms(tf):
+    mapping = {"1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000, "4h": 14400000}
+    return mapping.get(tf, 3600000)
+
+@st.cache_data(ttl=60)
+def get_ohlcv(exchange_name, symbol, timeframe, target_limit=5000):
+    """Biztonságos lapozásos adatgyűjtés, hogy akár több ezer/tízezer gyertyát is lehozzon a múltból"""
     if exchange_name == "OKX":
         ex = ccxt.okx({"enableRateLimits": True})
     else:
         ex = ccxt.bybit({"enableRateLimits": True, "options": {"defaultType": "future"}})
         
-    data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
+    all_data = []
+    since = None
+    batch_size = 1000
+    
+    while len(all_data) < target_limit:
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=batch_size, since=since)
+            if not data:
+                break
+            if all_data and data[0][0] == all_data[0][0]:
+                break
+            
+            all_data = data + all_data
+            since = data[0][0] - (batch_size * get_timeframe_ms(timeframe))
+            time.sleep(0.1)
+            
+            if len(data) < batch_size:
+                break
+        except Exception:
+            break
+            
+    df = pd.DataFrame(all_data[-target_limit:], columns=["time", "open", "high", "low", "close", "volume"])
     df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
     return df
 
@@ -104,7 +129,7 @@ def analyze_news_ai(news_items, api_key):
         return analyze_news_sentiment_fallback(news_items), f"AI hiba ({e}), kulcsszavas módszerre váltva."
 
 def pattern_matching_analysis(df, window_size=20):
-    """Múltbeli minták keresése a gyertya adatokban (hasonlóság vizsgálat)"""
+    """Mély múltbeli minták keresése a gyertya adatokban (hasonlóság vizsgálat)"""
     if len(df) < window_size * 5:
         return 0.0, "Nincs elég múltbeli adat a mintakereséshez."
     
@@ -136,7 +161,6 @@ def pattern_matching_analysis(df, window_size=20):
     
     pattern_score = (bullish_count / len(top_matches)) * 4.0 - 2.0 
     
-    # ITT VOLT A HIBA (a zárójel rossz helyen volt):
     explanation = f"A múltbeli adatokból a leginkább hasonló 5 minta közül {bullish_count} esetben váltotta fel emelkedés (átlagos hozam: {avg_future_return*100:.2f}%)."
     return max(min(pattern_score, 2.0), -2.0), explanation
 
@@ -265,10 +289,11 @@ def label(score):
 
 @st.cache_data(ttl=15)
 def load_all(exc, sym):
-    return {tf: get_ohlcv(exc, sym, tf, 1000) for tf in TIMEFRAMES}
+    # Itt állíthatod be a gyertyák számát (pl. 5000 vagy akár 10000)
+    return {tf: get_ohlcv(exc, sym, tf, target_limit=5000) for tf in TIMEFRAMES}
 
 try:
-    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + Hír-elemzés + Történelmi mintakeresés..."):
+    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + Hír-elemzés + Mély múltbeli mintakeresés..."):
         frames = load_all(exchange_choice, symbol)
         deriv = get_derivatives_data(exchange_choice, symbol)
         news_items = get_crypto_news()
