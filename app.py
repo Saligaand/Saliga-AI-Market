@@ -7,10 +7,16 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import feedparser
 import ccxt
+from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
-st.title("SALIGA AI – Intézményi Market Intelligence + Élő Irányjelző")
-st.caption("Teljesen szinkronizált MVP • Likvidációs Zónák + Multi-Faktor Szignál + AI Mentor + ATR")
+
+# --- 15 MÁSODPERCES AUTOMATIKUS FRISSÍTÉS INICIALIZÁLása ---
+# 15000 milliszekundum = 15 másodperc
+st_autorefresh(interval=15000, key="saliga_auto_refresh")
+
+st.title("SALIGA AI – Intézményi Market Intelligence + Élő Auto-Frissülő Irányjelző")
+st.caption("15mp-es Auto-Refresh • Likvidációs Zónák + Multi-Faktor Szignál + AI Mentor + ATR")
 
 # --- Settings & API Keys ---
 with st.sidebar:
@@ -48,7 +54,7 @@ def get_timeframe_ms(tf):
     mapping = {"1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000, "4h": 14400000}
     return mapping.get(tf, 3600000)
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=15)
 def get_ohlcv(exchange_name, symbol, timeframe, target_limit=5000):
     if exchange_name == "OKX":
         ex = ccxt.okx({"enableRateLimits": True})
@@ -69,7 +75,7 @@ def get_ohlcv(exchange_name, symbol, timeframe, target_limit=5000):
             
             all_data = data + all_data
             since = data[0][0] - (batch_size * get_timeframe_ms(timeframe))
-            time.sleep(0.1)
+            time.sleep(0.05)
             
             if len(data) < batch_size:
                 break
@@ -219,7 +225,7 @@ def get_ai_trading_mentor(price, unified_direction, confidence, tech_score, oi_t
     except Exception as e:
         return f"Nem sikerült elérni az AI Mentort: {e}"
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=15)
 def get_derivatives_data(exchange_name, symbol):
     pair = symbol.replace("/", "")
     result = {"oi_change": None, "funding": None, "oi_trend": "Semleges"}
@@ -441,28 +447,28 @@ try:
                 st.sidebar.error("Auto riasztás elküldve!")
 
     # ==========================================
-    # --- NAGY, KIEGIELTÍTETT AKTUÁLIS JELZÉS ---
+    # --- 15 MÁSPERCENKÉNT FRISSÜLŐ JELZÉS ---
     # ==========================================
     st.markdown("---")
     if "LONG" in direction:
         st.markdown(f"""
             <div style="background-color: #d4edda; padding: 25px; border-radius: 10px; border: 2px solid #28a745; text-align: center;">
-                <h1 style="color: #155724; margin: 0; font-size: 38px;">🟢 AKTUÁLIS AJÁNLAT: {direction}</h1>
-                <p style="color: #155724; font-size: 18px; margin-top: 10px;">Konvergencia Erősség: <b>{confidence:.0f}%</b> | Piac: <b>{symbol}</b></p>
+                <h1 style="color: #155724; margin: 0; font-size: 38px;">🟢 ÉLŐ JELZÉS: {direction}</h1>
+                <p style="color: #155724; font-size: 18px; margin-top: 10px;">Konvergencia Erősség: <b>{confidence:.0f}%</b> | Piac: <b>{symbol}</b> <i>(15mp-enként frissül)</i></p>
             </div>
         """, unsafe_allow_html=True)
     elif "SHORT" in direction:
         st.markdown(f"""
             <div style="background-color: #f8d7da; padding: 25px; border-radius: 10px; border: 2px solid #dc3545; text-align: center;">
-                <h1 style="color: #721c24; margin: 0; font-size: 38px;">🔴 AKTUÁLIS AJÁNLAT: {direction}</h1>
-                <p style="color: #721c24; font-size: 18px; margin-top: 10px;">Konvergencia Erősség: <b>{confidence:.0f}%</b> | Piac: <b>{symbol}</b></p>
+                <h1 style="color: #721c24; margin: 0; font-size: 38px;">🔴 ÉLŐ JELZÉS: {direction}</h1>
+                <p style="color: #721c24; font-size: 18px; margin-top: 10px;">Konvergencia Erősség: <b>{confidence:.0f}%</b> | Piac: <b>{symbol}</b> <i>(15mp-enként frissül)</i></p>
             </div>
         """, unsafe_allow_html=True)
     else:
         st.markdown(f"""
             <div style="background-color: #fff3cd; padding: 25px; border-radius: 10px; border: 2px solid #ffc107; text-align: center;">
-                <h1 style="color: #856404; margin: 0; font-size: 38px;">🟡 AKTUÁLIS AJÁNLAT: {direction}</h1>
-                <p style="color: #856404; font-size: 18px; margin-top: 10px;">Konvergencia Erősség: <b>{confidence:.0f}%</b> | Piac: <b>{symbol}</b></p>
+                <h1 style="color: #856404; margin: 0; font-size: 38px;">🟡 ÉLŐ JELZÉS: {direction}</h1>
+                <p style="color: #856404; font-size: 18px; margin-top: 10px;">Konvergencia Erősség: <b>{confidence:.0f}%</b> | Piac: <b>{symbol}</b> <i>(15mp-enként frissül)</i></p>
             </div>
         """, unsafe_allow_html=True)
     st.markdown("---")
