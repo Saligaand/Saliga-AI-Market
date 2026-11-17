@@ -9,21 +9,25 @@ import feedparser
 import ccxt
 
 st.set_page_config(page_title="SALIGA AI Market Intelligence", layout="wide")
-st.title("SALIGA AI – Market Intelligence + AI Hírek + Mély Mintafelismerés")
-st.caption("Kriptopiaci elemző MVP • Technikai + Derivatív + AI Hír + Történelmi Minta")
+st.title("SALIGA AI – Intézményi Market Intelligence + OI + Telegram Riasztás")
+st.caption("Kriptopiaci elemző MVP • Technikai + Derivatív (OI) + AI Hír + Minta + Riasztás")
 
 # --- Settings & API Keys ---
 with st.sidebar:
     st.header("Beállítások")
     exchange_choice = st.selectbox("Adatforrás tőzsde", ["OKX", "Bybit"], index=0)
     symbol = st.selectbox("Piac", ["BTC/USDT", "SOL/USDT", "ETH/USDT"], index=0)
-    refresh = st.selectbox("Frissítés", ["Kézi", "30 mp", "60 mp", "5 perc"], index=0)
     show_chart = st.checkbox("Gyertyagrafikon", value=True)
     
     st.markdown("---")
     st.subheader("AI Hírhangulat Beállítás")
     groq_api_key = st.text_input("Groq API Kulcs", type="password", help="Ingyenesen igényelhető a console.groq.com oldalon.")
-    st.caption("A hírek hatása közvetlenül módosítja a végső pontszámot.")
+    
+    st.markdown("---")
+    st.subheader("Telegram Riasztás Beállítások")
+    telegram_token = st.text_input("Telegram Bot Token", type="password", help="BotFather-től kapott HTTP API token.")
+    telegram_chat_id = st.text_input("Telegram Chat ID", type="password", help="A cél chat vagy csatorna ID-ja.")
+    send_alert_btn = st.button("Riasztás küldése Telegramra most")
 
 TIMEFRAMES = {
     "1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h"
@@ -35,7 +39,6 @@ def get_timeframe_ms(tf):
 
 @st.cache_data(ttl=60)
 def get_ohlcv(exchange_name, symbol, timeframe, target_limit=5000):
-    """Biztonságos lapozásos adatgyűjtés, hogy akár több ezer/tízezer gyertyát is lehozzon a múltból"""
     if exchange_name == "OKX":
         ex = ccxt.okx({"enableRateLimits": True})
     else:
@@ -129,7 +132,6 @@ def analyze_news_ai(news_items, api_key):
         return analyze_news_sentiment_fallback(news_items), f"AI hiba ({e}), kulcsszavas módszerre váltva."
 
 def pattern_matching_analysis(df, window_size=20):
-    """Mély múltbeli minták keresése a gyertya adatokban (hasonlóság vizsgálat)"""
     if len(df) < window_size * 5:
         return 0.0, "Nincs elég múltbeli adat a mintakereséshez."
     
@@ -160,20 +162,19 @@ def pattern_matching_analysis(df, window_size=20):
     bullish_count = sum(1 for m in top_matches if m[1] > 0)
     
     pattern_score = (bullish_count / len(top_matches)) * 4.0 - 2.0 
-    
-    explanation = f"A múltbeli adatokból a leginkább hasonló 5 minta közül {bullish_count} esetben váltotta fel emelkedés (átlagos hozam: {avg_future_return*100:.2f}%)."
+    explanation = f"A leginkább hasonló 5 múltbeli minta közül {bullish_count} esetben váltotta fel emelkedés (átlagos hozam: {avg_future_return*100:.2f}%)."
     return max(min(pattern_score, 2.0), -2.0), explanation
 
 @st.cache_data(ttl=30)
 def get_derivatives_data(exchange_name, symbol):
     pair = symbol.replace("/", "")
-    result = {"oi_change": None, "funding": None, "oi_now": None}
+    result = {"oi_change": None, "funding": None, "oi_trend": "Semleges"}
     
     if exchange_name == "Bybit":
         try:
             r = requests.get(
                 "https://api.bybit.com/v5/market/open-interest",
-                params={"category": "linear", "symbol": pair, "intervalTime": "5min", "limit": 2},
+                params={"category": "linear", "symbol": pair, "intervalTime": "5min", "limit": 3},
                 timeout=8
             )
             j = r.json()
@@ -181,8 +182,12 @@ def get_derivatives_data(exchange_name, symbol):
             if len(rows) >= 2:
                 newest = float(rows[0]["openInterest"])
                 older = float(rows[1]["openInterest"])
-                result["oi_now"] = newest
-                result["oi_change"] = ((newest - older) / older * 100) if older else None
+                oi_diff = newest - older
+                result["oi_change"] = (oi_diff / older) * 100
+                if oi_diff > 0:
+                    result["oi_trend"] = "Új tőke áramlik be (Növekvő OI)"
+                else:
+                    result["oi_trend"] = "Pozíciók leépülése / Zárás (Csökkenő OI)"
         except Exception:
             pass
             
@@ -211,7 +216,7 @@ def get_derivatives_data(exchange_name, symbol):
             data = j.get("data", [])
             if data:
                 result["oi_now"] = float(data[0]["oi"])
-                result["oi_change"] = 0.0 
+                result["oi_trend"] = "OKX Aktuális OI adatok elérhetők"
         except Exception:
             pass
             
@@ -231,6 +236,21 @@ def get_derivatives_data(exchange_name, symbol):
             
     return result
 
+def send_telegram_message(token, chat_id, message):
+    """Segédfüggvény a Telegram riasztás elküldésére"""
+    if not token or not chat_id:
+        return False, "Hiányzó Telegram Token vagy Chat ID."
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+        response = requests.post(url, json=payload, timeout=5)
+        if response.status_code == 200:
+            return True, "Sikeres Telegram üzenetküldés!"
+        else:
+            return False, f"Telegram hiba: {response.text}"
+    except Exception as e:
+        return False, f"Hálózati hiba: {e}"
+
 def add_indicators(df):
     x = df.copy()
     x["sma20"] = x["close"].rolling(20).mean()
@@ -249,7 +269,6 @@ def add_indicators(df):
     x["atr"] = tr.rolling(14).mean()
     x["est_delta"] = np.where(x["close"] >= x["open"], x["volume"], -x["volume"])
     x["delta_sum"] = x["est_delta"].rolling(20).sum()
-    x["vol_avg"] = x["volume"].rolling(20).mean()
     return x
 
 def structure_score(df):
@@ -270,14 +289,6 @@ def structure_score(df):
     elif last.rsi <= 45: score -= 1
     if last.delta_sum > 0: score += 1
     elif last.delta_sum < 0: score -= 1
-    details.update({
-        "RSI": round(float(last.rsi), 1),
-        "SMA20": float(last.sma20),
-        "SMA50": float(last.sma50),
-        "Becsült delta": "Pozitív" if last.delta_sum > 0 else "Negatív",
-        "ATR": float(last.atr),
-        "score": score
-    })
     return score, details
 
 def label(score):
@@ -289,11 +300,10 @@ def label(score):
 
 @st.cache_data(ttl=15)
 def load_all(exc, sym):
-    # Itt állíthatod be a gyertyák számát (pl. 5000 vagy akár 10000)
     return {tf: get_ohlcv(exc, sym, tf, target_limit=5000) for tf in TIMEFRAMES}
 
 try:
-    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + Hír-elemzés + Mély múltbeli mintakeresés..."):
+    with st.spinner(f"Elemzés futtatása ({exchange_choice}) + OI adatok + Hír-elemzés + Mintakeresés..."):
         frames = load_all(exchange_choice, symbol)
         deriv = get_derivatives_data(exchange_choice, symbol)
         news_items = get_crypto_news()
@@ -308,9 +318,8 @@ try:
 
     analyzed = {tf: add_indicators(df) for tf, df in frames.items()}
     scores = {}
-    details = {}
     for tf, df in frames.items():
-        scores[tf], details[tf] = structure_score(df)
+        scores[tf], _ = structure_score(df)
 
     tech_weighted = (
         scores["4h"] * 0.30 +
@@ -320,9 +329,18 @@ try:
         scores["1m"] * 0.08
     )
     
-    weighted = tech_weighted * 0.50 + news_score * 0.25 + pattern_score * 0.25
+    weighted = tech_weighted * 0.45 + news_score * 0.25 + pattern_score * 0.30
 
+    oi_change = deriv.get("oi_change")
     funding = deriv.get("funding")
+    
+    if oi_change is not None:
+        price_direction = 1 if frames["1h"].iloc[-1]["close"] > frames["1h"].iloc[-2]["close"] else -1
+        if oi_change > 0:
+            weighted += 0.2 * price_direction
+        else:
+            weighted -= 0.1 * price_direction
+
     if funding is not None:
         if funding > 0.03: weighted -= 0.15
         elif funding < -0.03: weighted += 0.15
@@ -331,10 +349,21 @@ try:
     confidence = min(90, 50 + abs(weighted) * 8)
     price = float(frames["1m"].iloc[-1]["close"])
 
+    # Ha megnyomják a gombot, vagy automatikusan küldhetjük a Telegram üzenetet
+    alert_msg = f"🚨 *SALIGA AI Riasztás*\n\nPiac: `{symbol}` ({exchange_choice})\nIrány: *{direction}*\nKomplex Erősség: `{confidence:.0f}%`\nAktuális ár: `{price:,.4f} USDT`\n\n- Technikai pont: `{tech_weighted:+.2f}`\n- Hír-hangulat: `{news_score:+.2f}`\n- Múltbeli minta: `{pattern_score:+.2f}`"
+
+    if send_alert_btn:
+        success, msg = send_telegram_message(telegram_token, telegram_chat_id, alert_msg)
+        if success:
+            st.sidebar.success(msg)
+        else:
+            st.sidebar.error(msg)
+
+    # --- Kijelzés a felületen ---
     a, b, c, d = st.columns(4)
     a.metric("Aktuális ár", f"{price:,.4f} USDT")
     b.metric("Technikai pont", f"{tech_weighted:+.2f} / 5")
-    c.metric("Hír-hangulat pont", f"{news_score:+.2f} (-2 / +2)")
+    c.metric("OI Trend & Tőke", deriv.get("oi_trend", "N/A"))
     d.metric("Múltbeli Minta pont", f"{pattern_score:+.2f} (-2 / +2)")
 
     if status == "success": st.success(f"Irányjelzés: {direction} (Erősség: {confidence:.0f}%)")
@@ -352,12 +381,10 @@ try:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     with col_right:
-        st.subheader("AI Hírek & Múltbeli Minták")
-        st.info(f"**Hír-hangulat hatás:** {news_score:+.2f} (25% súly)")
+        st.subheader("Derivatív, Hírek & Minták")
+        st.info(f"**OI Változás:** {f'{oi_change:+.2f}%' if oi_change is not None else 'Nem elérhető'} | **Funding:** {f'{funding:+.4f}%' if funding is not None else 'N/A'}")
         st.write(f"**AI Hír Indoklás:** {news_explanation}")
-        
-        st.warning(f"**Múltbeli mintázat hatás:** {pattern_score:+.2f} (25% súly)")
-        st.write(f"**Mintafelismerés:** {pattern_explanation}")
+        st.warning(f"**Mintafelismerés:** {pattern_explanation}")
         
         with st.expander("Vizsgált hírek listája"):
             for item in news_items:
@@ -376,8 +403,3 @@ try:
 
 except Exception as e:
     st.error(f"Hiba történt: {e}")
-
-if refresh != "Kézi":
-    seconds = {"30 mp": 30, "60 mp": 60, "5 perc": 300}[refresh]
-    time.sleep(seconds)
-    st.rerun()
