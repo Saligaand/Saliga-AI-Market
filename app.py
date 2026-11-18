@@ -11,8 +11,8 @@ from datetime import datetime, timezone
 from openai import OpenAI
 
 # ============================================================
-# SALIGA AI PRO 16.1
-# OKX ONLY | MULTI-METHOD OPEN INTEREST | GROQ AI
+# SALIGA AI PRO 16.2
+# OKX ONLY | FIXED OPEN INTEREST | GROQ AI
 # ============================================================
 
 st.set_page_config(
@@ -21,7 +21,7 @@ st.set_page_config(
     layout="wide"
 )
 
-APP_VERSION = "SALIGA AI PRO 16.1"
+APP_VERSION = "SALIGA AI PRO 16.2"
 DB_PATH = "saliga_ai.db"
 
 SYMBOLS = {
@@ -111,9 +111,13 @@ def fmt(value, digits=2):
 
 def get_secret(name):
     try:
-        return st.secrets.get(name, "")
+        value = st.secrets.get(name, "")
+        if value:
+            return value
     except Exception:
-        return os.getenv(name, "")
+        pass
+
+    return os.getenv(name, "")
 
 
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
@@ -121,7 +125,6 @@ GROQ_API_KEY = get_secret("GROQ_API_KEY")
 
 # ============================================================
 # DATABASE
-# AUTOMATIKUS RÉGI ADATBÁZIS JAVÍTÁS
 # ============================================================
 
 def get_db():
@@ -283,9 +286,6 @@ exchange = get_exchange()
 # ============================================================
 
 def extract_oi_record(record):
-    """
-    OKX OI-adatok felismerése többféle formátumból.
-    """
 
     if not isinstance(record, dict):
         return None
@@ -312,14 +312,10 @@ def extract_oi_record(record):
 
 
 def extract_unified_oi(result):
-    """
-    CCXT egységesített OI-válasz feldolgozása.
-    """
 
     if not isinstance(result, dict):
         return None
 
-    # Először a nyers OKX információkat vizsgáljuk.
     info = result.get("info", {})
 
     if isinstance(info, dict):
@@ -340,7 +336,6 @@ def extract_unified_oi(result):
                 if extracted:
                     return extracted
 
-    # CCXT egységesített mezők.
     unified_fields = [
         ("openInterestValue", "USD"),
         ("openInterestAmount", "BASE")
@@ -363,15 +358,14 @@ def extract_unified_oi(result):
 
 # ============================================================
 # OKX OPEN INTEREST
-# ELSŐDLEGES: CCXT NATÍV OKX API
-# MÁSODLAGOS: CCXT UNIFIED API
-# HARMADLAGOS: KÖZVETLEN HTTP
+# 1. CCXT NATIVE SNAKE CASE
+# 2. CCXT UNIFIED
+# 3. DIRECT OKX HTTP
 # ============================================================
 
 def fetch_okx_oi(asset):
 
     symbol = SYMBOLS[asset]
-
     errors = []
 
     try:
@@ -392,20 +386,30 @@ def fetch_okx_oi(asset):
 
             method = getattr(
                 exchange,
-                "publicGetPublicOpenInterest",
+                "public_get_public_open_interest",
                 None
             )
 
+            # Más CCXT-verziók esetleges eltérő metódusneve
             if method is None:
+
+                method = getattr(
+                    exchange,
+                    "publicGetPublicOpenInterest",
+                    None
+                )
+
+            if method is None:
+
                 raise Exception(
-                    "A CCXT verzióban nem található "
-                    "a publicGetPublicOpenInterest metódus."
+                    "A CCXT natív OKX OI-metódusa nem érhető el. "
+                    "Frissítsd a ccxt csomagot."
                 )
 
             payload = method(params)
 
             if not isinstance(payload, dict):
-                raise Exception("Érvénytelen CCXT API-válasz.")
+                raise Exception("Érvénytelen OKX API-válasz.")
 
             if str(payload.get("code")) != "0":
 
@@ -433,7 +437,7 @@ def fetch_okx_oi(asset):
                         }
 
             raise Exception(
-                "A natív CCXT válaszban nincs használható OI-adat."
+                "A natív OKX válaszban nincs használható OI-adat."
             )
 
         except Exception as e:
@@ -483,7 +487,7 @@ def fetch_okx_oi(asset):
                 params=params,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "SALIGA-AI-PRO"
+                    "User-Agent": "SALIGA-AI-PRO/16.2"
                 },
                 timeout=15
             )
@@ -491,6 +495,9 @@ def fetch_okx_oi(asset):
             response.raise_for_status()
 
             payload = response.json()
+
+            if not isinstance(payload, dict):
+                raise Exception("Érvénytelen HTTP JSON-válasz.")
 
             if str(payload.get("code")) != "0":
 
@@ -549,7 +556,7 @@ def fetch_okx_oi(asset):
 
 def save_oi_history(asset, value, unit, price):
 
-    if value is None:
+    if value is None or unit == "N/A":
         return
 
     con = get_db()
@@ -600,7 +607,7 @@ def save_oi_history(asset, value, unit, price):
 
 def calculate_oi_change(asset, current_value, unit):
 
-    if current_value is None:
+    if current_value is None or unit == "N/A":
         return None
 
     con = get_db()
