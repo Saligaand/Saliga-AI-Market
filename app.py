@@ -11,8 +11,8 @@ from datetime import datetime, timezone
 from openai import OpenAI
 
 # ============================================================
-# SALIGA AI PRO 16.0
-# OKX ONLY | DIRECT OPEN INTEREST | GROQ AI
+# SALIGA AI PRO 16.1
+# OKX ONLY | MULTI-METHOD OPEN INTEREST | GROQ AI
 # ============================================================
 
 st.set_page_config(
@@ -21,7 +21,7 @@ st.set_page_config(
     layout="wide"
 )
 
-APP_VERSION = "SALIGA AI PRO 16.0"
+APP_VERSION = "SALIGA AI PRO 16.1"
 DB_PATH = "saliga_ai.db"
 
 SYMBOLS = {
@@ -135,6 +135,7 @@ def get_db():
 def ensure_columns(cur, table, required_columns):
 
     cur.execute(f"PRAGMA table_info({table})")
+
     existing = {
         row[1] for row in cur.fetchall()
     }
@@ -154,7 +155,6 @@ def init_db():
     con = get_db()
     cur = con.cursor()
 
-    # SIGNALS
     cur.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,7 +174,6 @@ def init_db():
         )
     """)
 
-    # SIGNAL EVENTS
     cur.execute("""
         CREATE TABLE IF NOT EXISTS signal_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,7 +184,6 @@ def init_db():
         )
     """)
 
-    # OPEN INTEREST HISTORY
     cur.execute("""
         CREATE TABLE IF NOT EXISTS oi_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -197,7 +195,6 @@ def init_db():
         )
     """)
 
-    # Régi adatbázisok automatikus bővítése
     ensure_columns(
         cur,
         "oi_history",
@@ -282,69 +279,257 @@ exchange = get_exchange()
 
 
 # ============================================================
+# OPEN INTEREST HELPERS
+# ============================================================
+
+def extract_oi_record(record):
+    """
+    OKX OI-adatok felismerése többféle formátumból.
+    """
+
+    if not isinstance(record, dict):
+        return None
+
+    fields = [
+        ("oiUsd", "USD"),
+        ("oiCcy", "BASE"),
+        ("oi", "CONTRACTS")
+    ]
+
+    for field, unit in fields:
+
+        value = safe_float(record.get(field))
+
+        if value is not None and value > 0:
+
+            return {
+                "value": value,
+                "unit": unit,
+                "raw": record
+            }
+
+    return None
+
+
+def extract_unified_oi(result):
+    """
+    CCXT egységesített OI-válasz feldolgozása.
+    """
+
+    if not isinstance(result, dict):
+        return None
+
+    # Először a nyers OKX információkat vizsgáljuk.
+    info = result.get("info", {})
+
+    if isinstance(info, dict):
+
+        direct = extract_oi_record(info)
+
+        if direct:
+            return direct
+
+        records = info.get("data", [])
+
+        if isinstance(records, list):
+
+            for record in records:
+
+                extracted = extract_oi_record(record)
+
+                if extracted:
+                    return extracted
+
+    # CCXT egységesített mezők.
+    unified_fields = [
+        ("openInterestValue", "USD"),
+        ("openInterestAmount", "BASE")
+    ]
+
+    for field, unit in unified_fields:
+
+        value = safe_float(result.get(field))
+
+        if value is not None and value > 0:
+
+            return {
+                "value": value,
+                "unit": unit,
+                "raw": result
+            }
+
+    return None
+
+
+# ============================================================
 # OKX OPEN INTEREST
+# ELSŐDLEGES: CCXT NATÍV OKX API
+# MÁSODLAGOS: CCXT UNIFIED API
+# HARMADLAGOS: KÖZVETLEN HTTP
 # ============================================================
 
 def fetch_okx_oi(asset):
 
+    symbol = SYMBOLS[asset]
+
+    errors = []
+
     try:
 
-        symbol = SYMBOLS[asset]
         market = exchange.market(symbol)
         inst_id = market["id"]
 
-        response = requests.get(
-            OKX_OI_URL,
-            params={
-                "instType": "SWAP",
-                "instId": inst_id
-            },
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "SALIGA-AI-PRO"
-            },
-            timeout=15
-        )
+        params = {
+            "instType": "SWAP",
+            "instId": inst_id
+        }
 
-        response.raise_for_status()
+        # ----------------------------------------------------
+        # 1. CCXT NATÍV OKX API
+        # ----------------------------------------------------
 
-        payload = response.json()
+        try:
 
-        if str(payload.get("code")) != "0":
-
-            raise Exception(
-                f"OKX API {payload.get('code')}: "
-                f"{payload.get('msg')}"
+            method = getattr(
+                exchange,
+                "publicGetPublicOpenInterest",
+                None
             )
 
-        records = payload.get("data", [])
+            if method is None:
+                raise Exception(
+                    "A CCXT verzióban nem található "
+                    "a publicGetPublicOpenInterest metódus."
+                )
 
-        if not records:
-            raise Exception("Az OKX nem adott vissza OI-adatot.")
+            payload = method(params)
 
-        record = records[0]
+            if not isinstance(payload, dict):
+                raise Exception("Érvénytelen CCXT API-válasz.")
 
-        fields = [
-            ("oiUsd", "USD"),
-            ("oiCcy", "BASE"),
-            ("oi", "CONTRACTS")
-        ]
+            if str(payload.get("code")) != "0":
 
-        for field, unit in fields:
+                raise Exception(
+                    f"OKX API {payload.get('code')}: "
+                    f"{payload.get('msg')}"
+                )
 
-            value = safe_float(record.get(field))
+            records = payload.get("data", [])
 
-            if value is not None and value > 0:
+            if isinstance(records, list):
+
+                for record in records:
+
+                    extracted = extract_oi_record(record)
+
+                    if extracted:
+
+                        return {
+                            "value": extracted["value"],
+                            "unit": extracted["unit"],
+                            "error": None,
+                            "source": "CCXT NATIVE OKX",
+                            "raw": extracted["raw"]
+                        }
+
+            raise Exception(
+                "A natív CCXT válaszban nincs használható OI-adat."
+            )
+
+        except Exception as e:
+
+            errors.append(
+                "CCXT natív API: " + str(e)
+            )
+
+        # ----------------------------------------------------
+        # 2. CCXT UNIFIED API
+        # ----------------------------------------------------
+
+        try:
+
+            result = exchange.fetch_open_interest(symbol)
+
+            extracted = extract_unified_oi(result)
+
+            if extracted:
 
                 return {
-                    "value": value,
-                    "unit": unit,
-                    "error": None
+                    "value": extracted["value"],
+                    "unit": extracted["unit"],
+                    "error": None,
+                    "source": "CCXT UNIFIED",
+                    "raw": extracted["raw"]
                 }
 
+            raise Exception(
+                "A CCXT unified válaszban nincs használható OI-adat."
+            )
+
+        except Exception as e:
+
+            errors.append(
+                "CCXT unified API: " + str(e)
+            )
+
+        # ----------------------------------------------------
+        # 3. KÖZVETLEN OKX HTTP API
+        # ----------------------------------------------------
+
+        try:
+
+            response = requests.get(
+                OKX_OI_URL,
+                params=params,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "SALIGA-AI-PRO"
+                },
+                timeout=15
+            )
+
+            response.raise_for_status()
+
+            payload = response.json()
+
+            if str(payload.get("code")) != "0":
+
+                raise Exception(
+                    f"OKX HTTP {payload.get('code')}: "
+                    f"{payload.get('msg')}"
+                )
+
+            records = payload.get("data", [])
+
+            if isinstance(records, list):
+
+                for record in records:
+
+                    extracted = extract_oi_record(record)
+
+                    if extracted:
+
+                        return {
+                            "value": extracted["value"],
+                            "unit": extracted["unit"],
+                            "error": None,
+                            "source": "DIRECT OKX HTTP",
+                            "raw": extracted["raw"]
+                        }
+
+            raise Exception(
+                "A közvetlen HTTP-válaszban nincs használható OI-adat."
+            )
+
+        except Exception as e:
+
+            errors.append(
+                "Közvetlen HTTP: " + str(e)
+            )
+
         raise Exception(
-            "Nem található használható OI-mező: "
-            + json.dumps(record, ensure_ascii=False)
+            "Mindhárom OI-lekérési módszer sikertelen:\n"
+            + "\n".join(errors)
         )
 
     except Exception as e:
@@ -352,7 +537,9 @@ def fetch_okx_oi(asset):
         return {
             "value": None,
             "unit": "N/A",
-            "error": str(e)
+            "error": str(e),
+            "source": "FAILED",
+            "raw": None
         }
 
 
@@ -640,7 +827,6 @@ def analyze_candles(raw):
         ]
     )
 
-    # Csak lezárt gyertyák
     df = df.iloc[:-1].copy()
 
     for col in [
@@ -973,8 +1159,6 @@ def build_analysis():
         oi_value = oi["value"]
         oi_unit = oi["unit"]
 
-        # Először a korábbi minta alapján számolunk,
-        # majd elmentjük az aktuális mintát.
         oi_change = calculate_oi_change(
             asset,
             oi_value,
@@ -1007,6 +1191,8 @@ def build_analysis():
             "oi": oi_value,
             "oi_unit": oi_unit,
             "oi_change": oi_change,
+            "oi_source": oi.get("source", "N/A"),
+            "oi_error": oi.get("error"),
             "delta": delta_data["delta"],
             "buy_volume": delta_data["buy"],
             "sell_volume": delta_data["sell"],
@@ -1242,7 +1428,6 @@ def get_ai_result(asset, data, force=False):
             previous.get("error")
         )
 
-    # A hívás időpontját előre rögzítjük.
     attempts[asset] = now
     st.session_state.last_ai_attempt = attempts
 
@@ -1588,7 +1773,7 @@ def dashboard():
 
     st.caption(
         APP_VERSION
-        + " | OKX DIRECT API | GROQ AI"
+        + " | OKX MULTI-METHOD OI | GROQ AI"
     )
 
     st.info(
@@ -1647,6 +1832,11 @@ def dashboard():
                 fmt(market["oi"], 2)
             )
 
+            st.caption(
+                "OI forrás: "
+                + str(market.get("oi_source", "N/A"))
+            )
+
             st.metric(
                 "OI változás",
                 (
@@ -1685,6 +1875,12 @@ def dashboard():
 
                     for error in data["errors"]:
                         st.write("⚠️ " + error)
+
+            if market.get("oi_error"):
+
+                with st.expander(asset + " OI részletes hiba"):
+
+                    st.error(market["oi_error"])
 
     # AI SUMMARY
 
