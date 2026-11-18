@@ -1911,7 +1911,7 @@ def call_groq(payload):
         separators=(",", ":")
     )
 
-    request_data = {
+        request_data = {
         "model": GROQ_MODEL,
         "temperature": 0.1,
         "max_tokens": 450,
@@ -1931,13 +1931,15 @@ def call_groq(payload):
     }
 
     response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json=request_data,
-            timeout=45
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json=request_data,
+        timeout=45
+    )
+
         )
 
     )
