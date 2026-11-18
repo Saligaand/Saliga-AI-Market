@@ -1,7 +1,6 @@
 # ============================================================
-# SALIGA AI PRO 17.8 (FULL PATTERN & DERIVATIVE INTELLIGENCE)
-# BTC-CENTRIC + PATTERN RECOGNITION (H&S, DOUBLE TOP, SIDEWAYS) 
-# + OI + FUNDING + DELTA + S/R + GROQ AI
+# SALIGA AI PRO 17.9 (NEWS, MACRO & PATTERN INTELLIGENCE)
+# BTC-CENTRIC + MACRO & NEWS SENTIMENT + PATTERNS + OI/FUNDING + GROQ AI
 # ============================================================
 
 import streamlit as st
@@ -23,12 +22,12 @@ from openai import OpenAI
 # ============================================================
 
 st.set_page_config(
-    page_title="SALIGA AI PRO 17.8 - PATTERN BTC",
+    page_title="SALIGA AI PRO 17.9 - MACRO & NEWS BTC",
     page_icon="⚡",
     layout="wide"
 )
 
-APP_VERSION = "SALIGA AI PRO 17.8"
+APP_VERSION = "SALIGA AI PRO 17.9"
 DB_PATH = "saliga_ai.db"
 
 ASSET = "BTC"
@@ -259,7 +258,7 @@ def fetch_btc_market_data():
 
 
 # ============================================================
-# 6. ADVANCED PATTERN RECOGNITION (ALAKZATOK & OLDALAZÁS)
+# 6. ADVANCED PATTERN RECOGNITION (ALAKZATOK)
 # ============================================================
 
 def fetch_btc_candles(timeframe):
@@ -277,93 +276,40 @@ def fetch_btc_candles(timeframe):
         return None
 
 def detect_chart_patterns(df):
-    """
-    Keresi a Dupla Csúcsot, Dupla Aljat, Fej-Vállat, Fordított Fej-Vállat 
-    és az Oldalazó / Konszolidációs fázisokat.
-    """
     if df is None or len(df) < 40:
-        return {
-            "pattern": "Nincs elegendő adat",
-            "type": "NEUTRAL",
-            "modifier": 0
-        }
+        return {"pattern": "Nincs elegendő adat", "type": "NEUTRAL", "modifier": 0}
 
     highs = df["high"].values
     lows = df["low"].values
     closes = df["close"].values
     
-    # 1. OLDALAZÁS / KONSZOLIDÁCIÓ VIZSGÁLAT
-    # Ha az utolsó 15 gyertya ártartománya (max - min) viszonylag szűk (< 2.5%)
     recent_high = highs[-15:].max()
     recent_low = lows[-15:].min()
     current_price = closes[-1]
     range_pct = ((recent_high - recent_low) / current_price) * 100
     
     if range_pct < 2.2:
-        return {
-            "pattern": "⚖️ OLDALAZÁS / KONSZOLIDÁCIÓ (Várj a kitörésre)",
-            "type": "SIDEWAYS",
-            "modifier": 0
-        }
+        return {"pattern": "⚖️ OLDALAZÁS / KONSZOLIDÁCIÓ", "type": "SIDEWAYS", "modifier": 0}
 
-    # Lokális csúcsok és völgyek keresése egyszerű ablakos módszerrel
     window = 5
     peaks = []
     troughs = []
     
     for i in range(window, len(df) - window):
-        if highs[i] == max(highs[i-window:i+window+1]):
-            peaks.append((i, highs[i]))
-        if lows[i] == min(lows[i-window:i+window+1]):
-            troughs.append((i, lows[i]))
+        if highs[i] == max(highs[i-window:i+window+1]): peaks.append((i, highs[i]))
+        if lows[i] == min(lows[i-window:i+window+1]): troughs.append((i, lows[i]))
 
-    # 2. DUPLA CSÚCS (DOUBLE TOP) ÉS DUPLA ALJ (DOUBLE BOTTOM)
     if len(peaks) >= 2:
         p1, p2 = peaks[-2], peaks[-1]
-        # Ha a két utolsó csúcs ára nagyon közel van egymáshoz (0.8%-on belül)
         if abs(p1[1] - p2[1]) / p1[1] <= 0.008:
-            return {
-                "pattern": "🔴 DUPLA CSÚCS (Double Top - Medve alakzat)",
-                "type": "BEARISH",
-                "modifier": -30
-            }
+            return {"pattern": "🔴 DUPLA CSÚCS (Medve)", "type": "BEARISH", "modifier": -30}
 
     if len(troughs) >= 2:
         t1, t2 = troughs[-2], troughs[-1]
-        # Ha a két utolsó alj ára nagyon közel van egymáshoz (0.8%-on belül)
         if abs(t1[1] - t2[1]) / t1[1] <= 0.008:
-            return {
-                "pattern": "🟢 DUPLA ALJ (Double Bottom - Bika alakzat)",
-                "type": "BULLISH",
-                "modifier": +30
-            }
+            return {"pattern": "🟢 DUPLA ALJ (Bika)", "type": "BULLISH", "modifier": +30}
 
-    # 3. FEJ ÉS VÁLL (HEAD AND SHOULDERS) & FORDÍTOTT FEJ ÉS VÁLL
-    if len(peaks) >= 3:
-        s1, head, s2 = peaks[-3], peaks[-2], peaks[-1]
-        # Fej magasabb a vállaknál, és a két váll nagyjából azonos magasságú
-        if head[1] > s1[1] and head[1] > s2[1] and abs(s1[1] - s2[1]) / s1[1] <= 0.012:
-            return {
-                "pattern": "⚠️ FEJ ÉS VÁLL (Head & Shoulders - Fordulós medve)",
-                "type": "BEARISH",
-                "modifier": -35
-            }
-
-    if len(troughs) >= 3:
-        ts1, thead, ts2 = troughs[-3], troughs[-2], troughs[-1]
-        # Fej mélyebb a vállaknál, és a két váll nagyjából azonos szinten van
-        if thead[1] < ts1[1] and thead[1] < ts2[1] and abs(ts1[1] - ts2[1]) / ts1[1] <= 0.012:
-            return {
-                "pattern": "🚀 FORDÍTOTT FEJ ÉS VÁLL (Inverse H&S - Fordulós bika)",
-                "type": "BULLISH",
-                "modifier": +35
-            }
-
-    return {
-        "pattern": "Normál Trend / Nincs specifikus alakzat",
-        "type": "NEUTRAL",
-        "modifier": 0
-    }
+    return {"pattern": "Normál Trend / Alakzat mentes", "type": "NEUTRAL", "modifier": 0}
 
 def analyze_btc_structure(df):
     if df is None or len(df) < 30:
@@ -376,20 +322,12 @@ def analyze_btc_structure(df):
     
     status = "Normál S/R sáv"
     modifier = 0
-
     if last_close >= resistance:
-        status = "🚀 ELLENÁLLÁS ÁTTÖRÉS (Breakout)"
-        modifier = +20
+        status, modifier = "🚀 ELLENÁLLÁS ÁTTÖRÉS", +20
     elif last_close <= support:
-        status = "⚠️ TÁMASZ ÁTTÖRÉS (Breakdown)"
-        modifier = -20
+        status, modifier = "⚠️ TÁMASZ ÁTTÖRÉS", -20
 
-    return {
-        "support": support,
-        "resistance": resistance,
-        "status": status,
-        "modifier": modifier
-    }
+    return {"support": support, "resistance": resistance, "status": status, "modifier": modifier}
 
 def analyze_btc_timeframe(timeframe):
     df = fetch_btc_candles(timeframe)
@@ -402,29 +340,15 @@ def analyze_btc_timeframe(timeframe):
 
     score = 0
     trend_desc = "Semleges"
+    if last_close > ema_20 and ema_20 > ema_50: score, trend_desc = 30, "Erős Bika Trend"
+    elif last_close < ema_20 and ema_20 < ema_50: score, trend_desc = -30, "Erős Medve Trend"
 
-    if last_close > ema_20 and ema_20 > ema_50:
-        score += 30
-        trend_desc = "Erős Bika Trend"
-    elif last_close < ema_20 and ema_20 < ema_50:
-        score -= 30
-        trend_desc = "Erős Medve Trend"
-    elif last_close > ema_20:
-        score += 15
-        trend_desc = "Mérsékelt Bika"
-    else:
-        score -= 15
-        trend_desc = "Mérsékelt Medve"
-
-    # Alakzat felismerés integrálása a pontszámba
     pattern_info = detect_chart_patterns(df)
     score += pattern_info["modifier"]
 
-    # S/R szintek integrálása
     sr = analyze_btc_structure(df)
     score += sr["modifier"]
 
-    # RSI
     delta = df["close"].diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14).mean()
@@ -447,10 +371,10 @@ def analyze_btc_timeframe(timeframe):
 
 
 # ============================================================
-# 7. GROQ AI INTEGRÁCIÓ (ALAKZATOKKAL KIEGÉSZÍTVE)
+# 7. GROQ AI INTEGRÁCIÓ (HÍREK ÉS MAKRO ELEMZÉSSEL KIEGÉSZÍTVE)
 # ============================================================
 
-def run_groq_btc_analysis(market_data, tf_data):
+def run_groq_btc_analysis(market_data, tf_data, user_news_input):
     key = get_secret("GROQ_API_KEY")
     if not key:
         return None, "GROQ_API_KEY hiányzik a Secrets-ből!"
@@ -459,22 +383,23 @@ def run_groq_btc_analysis(market_data, tf_data):
 
     payload = {
         "derivatives_market": market_data,
-        "technical_timeframes": tf_data
+        "technical_timeframes": tf_data,
+        "macro_and_news_input": user_news_input if user_news_input else "Nincs megadva egyedi hír, értékeld a jelenlegi makro piaci hangulatot (pl. kamatdöntések, infláció, ETF beáramlások)."
     }
 
     system_prompt = """
-You are SALIGA AI PRO, an elite Bitcoin (BTC) market intelligence and chart pattern analyst.
-Analyze OKX derivatives (OI, funding rate, delta), S/R levels, and detected chart patterns 
-(Head and Shoulders, Double Top/Bottom, Sideways/Consolidation).
-Provide a concise, professional trading report in valid JSON format only.
+You are SALIGA AI PRO, an elite Bitcoin (BTC) market intelligence, macroeconomics, and news sentiment analyst.
+Analyze OKX derivatives (OI, funding rate, delta), S/R levels, chart patterns, AND the provided macro/news inputs.
+Determine whether the macroeconomic and news environment is BULLISH, BEARISH, or NEUTRAL for Bitcoin.
+Provide a concise, professional trading intelligence report in valid JSON format only.
 
 Required JSON structure:
 {
   "bias": "BULLISH / BEARISH / NEUTRAL",
   "confidence_score": 85,
-  "executive_summary": "Professional summary focusing on pattern recognition and derivative flow.",
-  "pattern_interpretation": "What does the current chart pattern (or sideways range) mean for upcoming price action?",
-  "actionable_insight": "Specific recommendation on long/short positioning or waiting for breakout.",
+  "executive_summary": "Professional summary combining technicals, patterns, and news/macro sentiment.",
+  "news_and_macro_impact": "Detailed breakdown of how current macroeconomic data or news affect BTC price action.",
+  "actionable_insight": "Specific recommendation on long/short positioning or waiting.",
   "risks": ["Risk 1", "Risk 2"]
 }
 """
@@ -487,7 +412,7 @@ Required JSON structure:
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}
             ],
             temperature=0.2,
-            max_tokens=1500,
+            max_tokens=1800,
             response_format={"type": "json_object"}
         )
         content = response.choices[0].message.content
@@ -509,14 +434,21 @@ def run_full_cycle():
 
 
 # ============================================================
-# 8. STREAMLIT UI (TELJES ALAKZAT & DERIVATÍV MONITOR)
+# 8. STREAMLIT UI (MAKRO HÍREK + ALAKZATOK + DERIVATÍV)
 # ============================================================
 
-st.title("⚡ SALIGA AI PRO — BITCOIN (BTC) ALAKZAT & DERIVATÍV MONITOR")
-st.caption("OKX OI + FUNDING + DELTA + ALAKZATOK (FEJ-VÁLL, DUPLA CSÚCS, OLDALAZÁS) + GROQ AI")
+st.title("⚡ SALIGA AI PRO — BITCOIN (BTC) MAKRO & HÍR ELEMZŐ")
+st.caption("OKX OI + FUNDING + ALAKZATOK + MAKROGAZDASÁGI HÍREK & SENTIMENT + GROQ AI")
 
 if exchange_error:
     st.error(f"OKX Hiba: {exchange_error}")
+
+# Hírbeviteli mező a felhasználónak (ahová beírhatja az aktuális nap híreit / makro adatait)
+st.markdown("### 📰 Napi Makro & Hír Bevitele (Opcionális)")
+user_news_input = st.text_area(
+    "Írd be ide a mai legfontosabb híreket, makro adatokat (pl. 'CPI alacsonyabb lett mint várták', 'Fed kamatvágás lesz', 'ETF kiáramlás van'):",
+    placeholder="Pl.: Ma érkezik az US CPI adat, a várakozás 3.1%, a piacon feszültség van..."
+)
 
 # Vezérlők
 c1, c2, c3, c4 = st.columns(4)
@@ -525,12 +457,13 @@ with c1:
         st.session_state["btc_analysis"] = run_full_cycle()
         st.session_state["last_refresh"] = time.time()
 with c2:
-    if st.button("🧠 GROQ AI JELENTÉS KÉRÉSE", use_container_width=True):
+    if st.button("🧠 GROQ AI MAKRO & HÍR ELEMZÉS", use_container_width=True):
         if st.session_state["btc_analysis"]:
-            with st.spinner("Groq AI elemzi az alakzatokat és a derivatív áramlást..."):
+            with st.spinner("Groq AI elemzi a híreket, makro adatokat és a technikai szintet..."):
                 res, err = run_groq_btc_analysis(
                     st.session_state["btc_analysis"]["market"],
-                    st.session_state["btc_analysis"]["timeframes"]
+                    st.session_state["btc_analysis"]["timeframes"],
+                    user_news_input
                 )
                 st.session_state["ai_result"] = res
                 st.session_state["ai_error"] = err
@@ -606,7 +539,7 @@ with col_a:
 
 with col_b:
     st.info(
-        f"🔍 **Felismerett Alakzat / Fázis:**\n**{pattern.get('pattern', 'N/A')}**\n\n"
+        f"🔍 **Felismerett Alakzat:**\n**{pattern.get('pattern', 'N/A')}**\n\n"
         f"🧱 **H1 Ellenállás:** `{fmt(sr.get('resistance'), 2)}`\n\n"
         f"🛡️ **H1 Támasz:** `{fmt(sr.get('support'), 2)}`\n\n"
         f"📈 **RSI (14):** `{fmt(h1_info.get('rsi'), 1)}`"
@@ -616,10 +549,10 @@ st.markdown("---")
 
 
 # ============================================================
-# 11. GROQ AI JELENTÉS
+# 11. GROQ AI MAKRO & HÍR ELEMZÉS EREDMÉNYE
 # ============================================================
 
-st.header("🧠 GROQ AI ALAKZAT & PIACI JELENTÉS")
+st.header("🧠 GROQ AI MAKRO & HÍR JELENTÉS")
 
 ai_res = st.session_state["ai_result"]
 ai_err = st.session_state["ai_error"]
@@ -630,18 +563,18 @@ if ai_err:
 if ai_res:
     st.subheader(f"AI Piaci Irány: {ai_res.get('bias', 'N/A')} (Bizalom: {ai_res.get('confidence_score', 'N/A')}%)")
     st.write(f"**Összegzés:** {ai_res.get('executive_summary', '')}")
-    st.write(f"**Alakzat Értelmezés:** {ai_res.get('pattern_interpretation', '')}")
+    st.info(f"**Makro & Hír Hatás Értékelés:** {ai_res.get('news_and_macro_impact', '')}")
     st.success(f"**Ajánlott Művelet:** {ai_res.get('actionable_insight', '')}")
     
     with st.expander("⚠️ Kockázatok"):
         for risk in ai_res.get("risks", []):
             st.write(f"• {risk}")
 else:
-    st.info("Kattints a **'GROQ AI JELENTÉS KÉRÉSE'** gombra az alakzatok és az AI elemzéséhez.")
+    st.info("Írd be fent a híreket (vagy hagyd üresen az általános makro helyzethez), majd kattints a **'GROQ AI MAKRO & HÍR ELEMZÉS'** gombra.")
 
 
 # ============================================================
-# 12. MULTI-TIMEFRAME TÁBLÁZAT ALAKZATOKKAL
+# 12. MULTI-TIMEFRAME TÁBLÁZAT
 # ============================================================
 
 st.markdown("---")
@@ -655,7 +588,7 @@ for tf_name in TIMEFRAMES.keys():
         "Időkeret": tf_name,
         "Irány": res.get("direction", "WAIT"),
         "Pontszám": res.get("score", 0),
-        "Felismerett Alakzat / Állapot": p_data.get("pattern", "N/A"),
+        "Felismerett Alakzat": p_data.get("pattern", "N/A"),
         "Trend": res.get("trend_desc", "N/A"),
         "RSI": fmt(res.get("rsi"), 1)
     })
