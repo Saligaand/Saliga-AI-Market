@@ -1914,7 +1914,7 @@ def call_groq(payload):
     request_data = {
         "model": GROQ_MODEL,
         "temperature": 0.1,
-        "max_tokens": 450,
+        "max_tokens": 1200,
         "response_format": {
             "type": "json_object"
         },
