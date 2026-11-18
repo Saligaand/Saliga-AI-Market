@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
-import time
 import json
+import time
 import sqlite3
 import logging
-from datetime import datetime, timezone
-from typing import Any
+import hashlib
+
+from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 import ccxt
 import numpy as np
@@ -16,21 +18,16 @@ import streamlit as st
 import plotly.graph_objects as go
 import feedparser
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-    AUTOREFRESH_AVAILABLE = True
-except ImportError:
-    AUTOREFRESH_AVAILABLE = False
-
 
 # ============================================================
-# CONFIGURATION
+# SALIGA AI v5.0
+# OKX ONLY
 # ============================================================
 
-APP_NAME = "SALIGA AI – MARKET INTELLIGENCE PRO"
-APP_VERSION = "4.0.0"
+APP_NAME = "SALIGA AI – INSTITUTIONAL PRO"
+VERSION = "5.0.0"
 
-DB_FILE = "saliga_ai_journal.db"
+DB_FILE = "saliga_institutional.db"
 
 SYMBOLS = {
     "BTC": "BTC/USDT:USDT",
@@ -55,16 +52,14 @@ TF_WEIGHTS = {
     "4h": 0.35,
 }
 
-OHLCV_LIMIT = 300
-
-REQUEST_TIMEOUT = 15000
+OHLCV_LIMIT = 500
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("SALIGA_AI")
+logger = logging.getLogger("SALIGA")
 
 
 # ============================================================
-# PAGE
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -75,8 +70,8 @@ st.set_page_config(
 
 st.title("⚡ SALIGA AI")
 st.caption(
-    "INSTITUTIONAL MARKET INTELLIGENCE | "
-    "MULTI-ASSET POSITION FLOW | OKX ONLY"
+    "INSTITUTIONAL CRYPTO MARKET INTELLIGENCE | "
+    "POSITION FLOW | OKX ONLY"
 )
 
 
@@ -84,27 +79,79 @@ st.caption(
 # DATABASE
 # ============================================================
 
-def get_db():
+def db_connection():
 
     conn = sqlite3.connect(
         DB_FILE,
-        check_same_thread=False
+        check_same_thread=False,
+        timeout=20,
     )
+
+    conn.execute("PRAGMA journal_mode=WAL")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            symbol TEXT,
-            signal TEXT,
-            price REAL,
-            confidence REAL,
+            created_at TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            signal TEXT NOT NULL,
+            price REAL NOT NULL,
             score REAL,
+            confidence REAL,
+            coverage REAL,
             stop_loss REAL,
             take_profit REAL,
             status TEXT DEFAULT 'OPEN',
             close_price REAL,
-            result_percent REAL
+            result_percent REAL,
+            close_time TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oi_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            timestamp INTEGER,
+            oi REAL,
+            price REAL,
+            UNIQUE(symbol, timestamp)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS orderbook_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            timestamp INTEGER,
+            imbalance REAL,
+            bid_volume REAL,
+            ask_volume REAL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trade_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            trade_id TEXT,
+            timestamp INTEGER,
+            side TEXT,
+            amount REAL,
+            price REAL,
+            UNIQUE(symbol, trade_id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS analysis_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            timestamp INTEGER,
+            price REAL,
+            score REAL,
+            signal TEXT,
+            coverage REAL
         )
     """)
 
@@ -113,7 +160,20 @@ def get_db():
     return conn
 
 
-DB = get_db()
+DB = db_connection()
+
+
+def db_execute(query, params=()):
+
+    with sqlite3.connect(
+        DB_FILE,
+        timeout=20,
+    ) as conn:
+
+        return conn.execute(
+            query,
+            params,
+        )
 
 
 # ============================================================
@@ -125,7 +185,7 @@ def get_exchange():
 
     exchange = ccxt.okx({
         "enableRateLimit": True,
-        "timeout": REQUEST_TIMEOUT,
+        "timeout": 20000,
         "options": {
             "defaultType": "swap",
         },
@@ -136,34 +196,48 @@ def get_exchange():
     return exchange
 
 
-def get_market_symbol(symbol):
+def resolve_symbol(symbol):
 
     exchange = get_exchange()
 
-    if symbol in exchange.markets:
-        return symbol
+    if symbol not in exchange.markets:
 
-    raise ValueError(
-        f"Az OKX-en nem található ez a piac: {symbol}"
-    )
+        raise ValueError(
+            f"OKX market not found: {symbol}"
+        )
+
+    market = exchange.market(symbol)
+
+    if not market.get("swap"):
+
+        raise ValueError(
+            "A kiválasztott piac nem perpetual swap."
+        )
+
+    return symbol
 
 
 # ============================================================
-# DATA FETCHING
+# MARKET DATA
 # ============================================================
 
-@st.cache_data(ttl=15)
 def fetch_ohlcv(symbol, timeframe):
 
     exchange = get_exchange()
 
-    market_symbol = get_market_symbol(symbol)
+    symbol = resolve_symbol(symbol)
 
     data = exchange.fetch_ohlcv(
-        market_symbol,
+        symbol,
         timeframe=timeframe,
         limit=OHLCV_LIMIT,
     )
+
+    if not data:
+
+        raise RuntimeError(
+            f"No OHLCV data for {symbol} {timeframe}"
+        )
 
     df = pd.DataFrame(
         data,
@@ -183,70 +257,114 @@ def fetch_ohlcv(symbol, timeframe):
         utc=True,
     )
 
+    numeric = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]
+
+    for col in numeric:
+
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce",
+        )
+
+    df = df.dropna(
+        subset=numeric
+    )
+
+    df = df.sort_values(
+        "timestamp"
+    ).drop_duplicates(
+        "timestamp"
+    ).reset_index(
+        drop=True
+    )
+
     return df
 
 
-@st.cache_data(ttl=10)
 def fetch_ticker(symbol):
 
-    exchange = get_exchange()
-
-    return exchange.fetch_ticker(
-        get_market_symbol(symbol)
+    return get_exchange().fetch_ticker(
+        resolve_symbol(symbol)
     )
 
 
-@st.cache_data(ttl=15)
 def fetch_orderbook(symbol):
 
-    exchange = get_exchange()
-
-    return exchange.fetch_order_book(
-        get_market_symbol(symbol),
-        limit=50,
+    return get_exchange().fetch_order_book(
+        resolve_symbol(symbol),
+        limit=100,
     )
 
 
-@st.cache_data(ttl=30)
-def fetch_open_interest(symbol):
-
-    exchange = get_exchange()
-
-    try:
-        return exchange.fetch_open_interest(
-            get_market_symbol(symbol)
-        )
-    except Exception as e:
-        logger.warning("OI error: %s", e)
-        return None
-
-
-@st.cache_data(ttl=30)
-def fetch_funding(symbol):
-
-    exchange = get_exchange()
-
-    try:
-        return exchange.fetch_funding_rate(
-            get_market_symbol(symbol)
-        )
-    except Exception as e:
-        logger.warning("Funding error: %s", e)
-        return None
-
-
-@st.cache_data(ttl=15)
 def fetch_trades(symbol):
 
-    exchange = get_exchange()
+    return get_exchange().fetch_trades(
+        resolve_symbol(symbol),
+        limit=500,
+    )
+
+
+def fetch_funding(symbol):
 
     try:
-        return exchange.fetch_trades(
-            get_market_symbol(symbol),
-            limit=500,
+
+        return get_exchange().fetch_funding_rate(
+            resolve_symbol(symbol)
         )
-    except Exception as e:
-        logger.warning("Trade error: %s", e)
+
+    except Exception as exc:
+
+        logger.warning(
+            "Funding unavailable: %s",
+            exc,
+        )
+
+        return None
+
+
+def fetch_open_interest(symbol):
+
+    try:
+
+        return get_exchange().fetch_open_interest(
+            resolve_symbol(symbol)
+        )
+
+    except Exception as exc:
+
+        logger.warning(
+            "Open interest unavailable: %s",
+            exc,
+        )
+
+        return None
+
+
+def fetch_oi_history(symbol):
+
+    try:
+
+        exchange = get_exchange()
+
+        return exchange.fetch_open_interest_history(
+            resolve_symbol(symbol),
+            timeframe="5m",
+            limit=100,
+        )
+
+    except Exception as exc:
+
+        logger.warning(
+            "OI history unavailable: %s",
+            exc,
+        )
+
         return []
 
 
@@ -258,47 +376,128 @@ def calculate_rsi(series, period=14):
 
     delta = series.diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
 
     avg_gain = gain.ewm(
         alpha=1 / period,
+        adjust=False,
         min_periods=period,
-        adjust=False
     ).mean()
 
     avg_loss = loss.ewm(
         alpha=1 / period,
+        adjust=False,
         min_periods=period,
-        adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan,
+    )
 
-    return 100 - (100 / (1 + rs))
+    return 100 - (
+        100 / (1 + rs)
+    )
 
 
 def calculate_atr(df, period=14):
 
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-
-    previous_close = close.shift(1)
+    previous = df["close"].shift(1)
 
     tr = pd.concat(
         [
-            high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs(),
+            df["high"] - df["low"],
+            (df["high"] - previous).abs(),
+            (df["low"] - previous).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    return tr.rolling(period).mean()
+    return tr.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
 
 
-def calculate_indicators(df):
+def calculate_adx(df, period=14):
+
+    up = df["high"].diff()
+
+    down = -df["low"].diff()
+
+    plus_dm = np.where(
+        (up > down) & (up > 0),
+        up,
+        0,
+    )
+
+    minus_dm = np.where(
+        (down > up) & (down > 0),
+        down,
+        0,
+    )
+
+    previous = df["close"].shift(1)
+
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - previous).abs(),
+            (df["low"] - previous).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    atr = tr.ewm(
+        alpha=1 / period,
+        adjust=False,
+    ).mean()
+
+    plus = pd.Series(
+        plus_dm,
+        index=df.index,
+    ).ewm(
+        alpha=1 / period,
+        adjust=False,
+    ).mean()
+
+    minus = pd.Series(
+        minus_dm,
+        index=df.index,
+    ).ewm(
+        alpha=1 / period,
+        adjust=False,
+    ).mean()
+
+    plus_di = 100 * plus / atr.replace(
+        0,
+        np.nan,
+    )
+
+    minus_di = 100 * minus / atr.replace(
+        0,
+        np.nan,
+    )
+
+    dx = (
+        (plus_di - minus_di).abs() /
+        (plus_di + minus_di).replace(0, np.nan)
+    ) * 100
+
+    return dx.ewm(
+        alpha=1 / period,
+        adjust=False,
+    ).mean()
+
+
+def add_indicators(df):
 
     df = df.copy()
 
@@ -310,25 +509,45 @@ def calculate_indicators(df):
         df
     )
 
-    df["SMA20"] = df["close"].rolling(20).mean()
+    df["ADX"] = calculate_adx(
+        df
+    )
 
-    df["SMA50"] = df["close"].rolling(50).mean()
+    df["SMA20"] = df["close"].rolling(
+        20
+    ).mean()
 
-    df["VOL_MA"] = df["volume"].rolling(20).mean()
+    df["SMA50"] = df["close"].rolling(
+        50
+    ).mean()
+
+    df["VOL_MA"] = df["volume"].rolling(
+        20
+    ).mean()
 
     df["VOL_RATIO"] = (
         df["volume"] /
         df["VOL_MA"].replace(0, np.nan)
     )
 
-    df["CANDLE_DELTA"] = np.where(
-        df["close"] > df["open"],
-        df["volume"],
-        np.where(
-            df["close"] < df["open"],
-            -df["volume"],
-            0,
-        ),
+    # Candle-based estimated delta.
+    # It is NOT exchange-reported aggressor delta.
+
+    candle_range = (
+        df["high"] - df["low"]
+    ).replace(
+        0,
+        np.nan,
+    )
+
+    close_location = (
+        (df["close"] - df["low"]) -
+        (df["high"] - df["close"])
+    ) / candle_range
+
+    df["EST_DELTA"] = (
+        close_location.fillna(0) *
+        df["volume"]
     )
 
     return df
@@ -338,109 +557,162 @@ def calculate_indicators(df):
 # MARKET STRUCTURE
 # ============================================================
 
-def market_structure(df):
+def find_pivots(df, left=3, right=3):
 
-    if len(df) < 30:
+    high = df["high"]
+    low = df["low"]
+
+    pivot_high = pd.Series(
+        np.nan,
+        index=df.index,
+    )
+
+    pivot_low = pd.Series(
+        np.nan,
+        index=df.index,
+    )
+
+    for i in range(
+        left,
+        len(df) - right,
+    ):
+
+        h = high.iloc[i]
+
+        l = low.iloc[i]
+
+        if h == high.iloc[
+            i-left:i+right+1
+        ].max():
+
+            pivot_high.iloc[i] = h
+
+        if l == low.iloc[
+            i-left:i+right+1
+        ].min():
+
+            pivot_low.iloc[i] = l
+
+    return pivot_high, pivot_low
+
+
+def analyze_structure(df):
+
+    if len(df) < 40:
+
         return {
             "trend": "UNKNOWN",
             "bos": "NONE",
+            "choch": "NONE",
             "score": 0,
         }
 
-    recent = df.tail(100)
+    ph, pl = find_pivots(
+        df.tail(150).reset_index(drop=True)
+    )
 
-    highs = recent["high"]
-    lows = recent["low"]
+    highs = ph.dropna()
 
-    high_points = highs[
-        (highs.shift(1) < highs) &
-        (highs.shift(-1) < highs)
-    ]
+    lows = pl.dropna()
 
-    low_points = lows[
-        (lows.shift(1) > lows) &
-        (lows.shift(-1) > lows)
-    ]
-
-    if len(high_points) < 2 or len(low_points) < 2:
+    if len(highs) < 2 or len(lows) < 2:
 
         return {
             "trend": "UNKNOWN",
             "bos": "NONE",
+            "choch": "NONE",
             "score": 0,
         }
 
-    last_high = high_points.iloc[-1]
-    previous_high = high_points.iloc[-2]
+    h1, h2 = highs.iloc[-2:]
 
-    last_low = low_points.iloc[-1]
-    previous_low = low_points.iloc[-2]
+    l1, l2 = lows.iloc[-2:]
 
-    price = df["close"].iloc[-1]
-
-    bullish_structure = (
-        last_high > previous_high and
-        last_low > previous_low
+    bullish = (
+        h2 > h1 and
+        l2 > l1
     )
 
-    bearish_structure = (
-        last_high < previous_high and
-        last_low < previous_low
+    bearish = (
+        h2 < h1 and
+        l2 < l1
     )
 
-    if bullish_structure:
+    if bullish:
 
         trend = "BULLISH"
-        score = 1
 
-    elif bearish_structure:
+    elif bearish:
 
         trend = "BEARISH"
-        score = -1
 
     else:
 
         trend = "RANGE"
-        score = 0
 
-    if price > last_high:
+    close = float(
+        df["close"].iloc[-1]
+    )
+
+    last_high = float(
+        highs.iloc[-1]
+    )
+
+    last_low = float(
+        lows.iloc[-1]
+    )
+
+    bos = "NONE"
+
+    choch = "NONE"
+
+    if close > last_high:
+
         bos = "BULLISH BOS"
-        score = 1
 
-    elif price < last_low:
+    elif close < last_low:
+
         bos = "BEARISH BOS"
-        score = -1
 
-    else:
-        bos = "NONE"
+    if trend == "BEARISH" and bos == "BULLISH BOS":
+
+        choch = "BULLISH CHoCH"
+
+    elif trend == "BULLISH" and bos == "BEARISH BOS":
+
+        choch = "BEARISH CHoCH"
+
+    score = (
+        1 if bullish else
+        -1 if bearish else
+        0
+    )
 
     return {
         "trend": trend,
         "bos": bos,
+        "choch": choch,
         "score": score,
-        "last_high": float(last_high),
-        "last_low": float(last_low),
+        "last_high": last_high,
+        "last_low": last_low,
     }
 
 
 # ============================================================
-# LIQUIDITY ANALYSIS
+# LIQUIDITY
 # ============================================================
 
-def liquidity_analysis(df):
+def analyze_liquidity(df):
 
-    recent = df.tail(50)
-
-    high = recent["high"]
-    low = recent["low"]
-
-    resistance = high.max()
-    support = low.min()
+    recent = df.tail(60)
 
     current = recent.iloc[-1]
 
-    previous_high = high.iloc[:-1].max()
-    previous_low = low.iloc[:-1].min()
+    previous = recent.iloc[:-1]
+
+    previous_high = previous["high"].max()
+
+    previous_low = previous["low"].min()
 
     sweep_high = (
         current["high"] > previous_high and
@@ -454,25 +726,27 @@ def liquidity_analysis(df):
 
     if sweep_high:
 
-        sweep = "BUY-SIDE LIQUIDITY SWEPT"
+        status = "BUY-SIDE LIQUIDITY SWEPT"
+
+        score = -1
 
     elif sweep_low:
 
-        sweep = "SELL-SIDE LIQUIDITY SWEPT"
+        status = "SELL-SIDE LIQUIDITY SWEPT"
+
+        score = 1
 
     else:
 
-        sweep = "NO SWEEP"
+        status = "NO LIQUIDITY SWEEP"
+
+        score = 0
 
     return {
-        "support": float(support),
-        "resistance": float(resistance),
-        "sweep": sweep,
-        "sweep_score": (
-            -1 if sweep_high else
-            1 if sweep_low else
-            0
-        ),
+        "status": status,
+        "score": score,
+        "support": float(previous_low),
+        "resistance": float(previous_high),
     }
 
 
@@ -480,228 +754,716 @@ def liquidity_analysis(df):
 # VOLUME PROFILE
 # ============================================================
 
-def volume_profile(df, bins=32):
+def calculate_volume_profile(df, bins=50):
 
-    recent = df.tail(200)
+    data = df.tail(300)
 
-    prices = (
-        recent["high"] +
-        recent["low"] +
-        recent["close"]
+    typical = (
+        data["high"] +
+        data["low"] +
+        data["close"]
     ) / 3
 
-    volumes = recent["volume"]
+    volumes = data["volume"].to_numpy()
+
+    if len(typical) < 20:
+
+        return None
 
     hist, edges = np.histogram(
-        prices,
+        typical,
         bins=bins,
         weights=volumes,
     )
 
-    poc_index = np.argmax(hist)
+    if hist.sum() <= 0:
+
+        return None
+
+    poc_index = int(
+        np.argmax(hist)
+    )
 
     poc = (
         edges[poc_index] +
         edges[poc_index + 1]
     ) / 2
 
-    total_volume = hist.sum()
+    # Value Area: expand from POC until 70% volume.
 
-    if total_volume <= 0:
-        return None
+    left = poc_index
 
-    order = np.argsort(hist)[::-1]
+    right = poc_index
 
-    selected = []
-    accumulated = 0
+    accumulated = hist[poc_index]
 
-    for index in order:
+    target = hist.sum() * 0.70
 
-        selected.append(index)
-        accumulated += hist[index]
+    while accumulated < target:
 
-        if accumulated >= total_volume * 0.70:
+        left_volume = (
+            hist[left - 1]
+            if left > 0
+            else -1
+        )
+
+        right_volume = (
+            hist[right + 1]
+            if right < len(hist) - 1
+            else -1
+        )
+
+        if left_volume < 0 and right_volume < 0:
             break
 
-    vah = edges[max(selected) + 1]
-    val = edges[min(selected)]
+        if right_volume > left_volume:
+
+            right += 1
+
+            accumulated += hist[right]
+
+        else:
+
+            left -= 1
+
+            accumulated += hist[left]
 
     return {
         "POC": float(poc),
-        "VAH": float(vah),
-        "VAL": float(val),
+        "VAH": float(edges[right + 1]),
+        "VAL": float(edges[left]),
     }
 
 
 # ============================================================
-# OPEN INTEREST INTERPRETATION
+# MARKET REGIME
 # ============================================================
 
-def interpret_open_interest(
-    price_change,
-    oi_change
-):
+def detect_market_regime(df):
 
-    if oi_change is None or price_change is None:
-        return "OI DATA UNAVAILABLE", 0
+    last = df.iloc[-1]
 
-    if price_change > 0 and oi_change > 0:
+    adx = last["ADX"]
 
-        return "LONG BUILD-UP ESTIMATE", 1
+    atr = last["ATR"]
 
-    if price_change < 0 and oi_change > 0:
+    close = last["close"]
 
-        return "SHORT BUILD-UP ESTIMATE", -1
+    atr_percent = (
+        atr / close * 100
+        if close
+        else 0
+    )
 
-    if price_change > 0 and oi_change < 0:
-
-        return "SHORT COVERING ESTIMATE", 1
-
-    if price_change < 0 and oi_change < 0:
-
-        return "LONG CLOSING ESTIMATE", -1
-
-    return "NO CLEAR POSITION FLOW", 0
-
-
-# ============================================================
-# TAKER FLOW / CVD
-# ============================================================
-
-def analyze_taker_flow(trades):
-
-    if not trades:
+    if pd.isna(adx):
 
         return {
-            "buy": 0,
-            "sell": 0,
-            "delta": 0,
-            "ratio": 0,
-            "signal": "UNAVAILABLE",
+            "regime": "UNKNOWN",
+            "volatility": atr_percent,
         }
 
-    buy = 0
-    sell = 0
+    if adx >= 25:
+
+        regime = "TRENDING"
+
+    elif adx <= 18:
+
+        regime = "RANGING"
+
+    else:
+
+        regime = "TRANSITION"
+
+    if atr_percent >= 2:
+
+        volatility = "HIGH"
+
+    elif atr_percent <= 0.4:
+
+        volatility = "LOW"
+
+    else:
+
+        volatility = "NORMAL"
+
+    return {
+        "regime": regime,
+        "volatility": volatility,
+        "adx": float(adx),
+        "atr_percent": float(atr_percent),
+    }
+
+
+# ============================================================
+# POSITION FLOW – OPEN INTEREST
+# ============================================================
+
+def save_oi_snapshot(symbol, timestamp, oi, price):
+
+    if oi is None:
+        return
+
+    db_execute(
+        """
+        INSERT OR IGNORE INTO oi_history
+        (symbol, timestamp, oi, price)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            symbol,
+            int(timestamp),
+            float(oi),
+            float(price),
+        ),
+    )
+
+
+def read_oi_history(symbol):
+
+    return pd.read_sql_query(
+        """
+        SELECT timestamp, oi, price
+        FROM oi_history
+        WHERE symbol = ?
+        ORDER BY timestamp
+        """,
+        sqlite3.connect(DB_FILE),
+        params=(symbol,),
+    )
+
+
+def extract_oi_value(data):
+
+    if not data:
+        return None
+
+    for key in (
+        "openInterestAmount",
+        "openInterestValue",
+        "openInterest",
+    ):
+
+        value = data.get(key)
+
+        if value is not None:
+
+            try:
+
+                value = float(value)
+
+                if value > 0:
+                    return value
+
+            except (TypeError, ValueError):
+                continue
+
+    return None
+
+
+def interpret_position_flow(
+    price_change,
+    oi_change,
+):
+
+    if price_change is None or oi_change is None:
+
+        return {
+            "state": "POSITION FLOW DATA INSUFFICIENT",
+            "score": 0,
+        }
+
+    if price_change > 0.15 and oi_change > 0.5:
+
+        state = "LONG BUILD-UP ESTIMATE"
+
+        score = 1
+
+    elif price_change < -0.15 and oi_change > 0.5:
+
+        state = "SHORT BUILD-UP ESTIMATE"
+
+        score = -1
+
+    elif price_change > 0.15 and oi_change < -0.5:
+
+        state = "SHORT COVERING ESTIMATE"
+
+        score = 0.5
+
+    elif price_change < -0.15 and oi_change < -0.5:
+
+        state = "LONG CLOSING / LIQUIDATION ESTIMATE"
+
+        score = -0.5
+
+    else:
+
+        state = "NO CLEAR POSITION FLOW"
+
+        score = 0
+
+    return {
+        "state": state,
+        "score": score,
+    }
+
+
+def analyze_open_interest(
+    symbol,
+    current_price,
+    current_oi,
+):
+
+    if current_oi is None:
+
+        return {
+            "available": False,
+            "state": "OI UNAVAILABLE",
+            "score": 0,
+        }
+
+    now = int(
+        time.time() * 1000
+    )
+
+    save_oi_snapshot(
+        symbol,
+        now,
+        current_oi,
+        current_price,
+    )
+
+    history = read_oi_history(
+        symbol
+    )
+
+    if len(history) < 2:
+
+        return {
+            "available": False,
+            "state": "COLLECTING OI HISTORY",
+            "score": 0,
+        }
+
+    history["datetime"] = pd.to_datetime(
+        history["timestamp"],
+        unit="ms",
+        utc=True,
+    )
+
+    cutoff = pd.Timestamp.now(
+        tz="UTC"
+    ) - pd.Timedelta(
+        minutes=30
+    )
+
+    old = history[
+        history["datetime"] <= cutoff
+    ]
+
+    if old.empty:
+
+        return {
+            "available": False,
+            "state": "WAITING FOR 30-MINUTE OI HISTORY",
+            "score": 0,
+        }
+
+    baseline = old.iloc[-1]
+
+    price_change = (
+        current_price - baseline["price"]
+    ) / baseline["price"] * 100
+
+    oi_change = (
+        current_oi - baseline["oi"]
+    ) / baseline["oi"] * 100
+
+    flow = interpret_position_flow(
+        price_change,
+        oi_change,
+    )
+
+    return {
+        "available": True,
+        "price_change": price_change,
+        "oi_change": oi_change,
+        "state": flow["state"],
+        "score": flow["score"],
+        "current_oi": current_oi,
+    }
+
+
+# ============================================================
+# TRADE STORAGE AND TRUE TAKER DELTA
+# ============================================================
+
+def store_trades(symbol, trades):
+
+    if not trades:
+        return
 
     for trade in trades:
 
-        amount = float(
-            trade.get("amount") or 0
+        trade_id = str(
+            trade.get("id")
+            or hashlib.sha256(
+                json.dumps(
+                    trade,
+                    sort_keys=True,
+                    default=str,
+                ).encode()
+            ).hexdigest()
         )
+
+        timestamp = trade.get("timestamp")
 
         side = trade.get("side")
 
-        if side == "buy":
-            buy += amount
+        amount = trade.get("amount")
 
-        elif side == "sell":
-            sell += amount
+        price = trade.get("price")
 
-    total = buy + sell
+        if not all(
+            x is not None
+            for x in (
+                timestamp,
+                side,
+                amount,
+                price,
+            )
+        ):
 
-    delta = buy - sell
+            continue
+
+        db_execute(
+            """
+            INSERT OR IGNORE INTO trade_history
+            (symbol, trade_id, timestamp, side, amount, price)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                symbol,
+                trade_id,
+                int(timestamp),
+                side,
+                float(amount),
+                float(price),
+            ),
+        )
+
+
+def analyze_cvd(symbol):
+
+    history = pd.read_sql_query(
+        """
+        SELECT timestamp, side, amount, price
+        FROM trade_history
+        WHERE symbol = ?
+        ORDER BY timestamp
+        """,
+        sqlite3.connect(DB_FILE),
+        params=(symbol,),
+    )
+
+    if history.empty:
+
+        return {
+            "available": False,
+            "cvd": 0,
+            "delta": 0,
+            "ratio": 0.5,
+            "signal": "COLLECTING TRADE HISTORY",
+        }
+
+    history["signed_amount"] = np.where(
+        history["side"] == "buy",
+        history["amount"],
+        np.where(
+            history["side"] == "sell",
+            -history["amount"],
+            0,
+        ),
+    )
+
+    now = int(
+        time.time() * 1000
+    )
+
+    cutoff = now - 15 * 60 * 1000
+
+    recent = history[
+        history["timestamp"] >= cutoff
+    ]
+
+    if recent.empty:
+
+        return {
+            "available": False,
+            "cvd": 0,
+            "delta": 0,
+            "ratio": 0.5,
+            "signal": "NO RECENT TRADE DATA",
+        }
+
+    buy_volume = recent.loc[
+        recent["side"] == "buy",
+        "amount",
+    ].sum()
+
+    sell_volume = recent.loc[
+        recent["side"] == "sell",
+        "amount",
+    ].sum()
+
+    delta = buy_volume - sell_volume
+
+    total = buy_volume + sell_volume
 
     ratio = (
-        buy / total
+        buy_volume / total
         if total > 0
         else 0.5
     )
 
+    cvd = history["signed_amount"].sum()
+
     if ratio > 0.58:
-        signal = "BUYERS DOMINANT"
+
+        signal = "AGGRESSIVE BUYERS"
+
+        score = 1
 
     elif ratio < 0.42:
-        signal = "SELLERS DOMINANT"
+
+        signal = "AGGRESSIVE SELLERS"
+
+        score = -1
 
     else:
-        signal = "BALANCED FLOW"
+
+        signal = "BALANCED TAKER FLOW"
+
+        score = 0
 
     return {
-        "buy": buy,
-        "sell": sell,
-        "delta": delta,
-        "ratio": ratio,
+        "available": True,
+        "cvd": float(cvd),
+        "delta": float(delta),
+        "buy_volume": float(buy_volume),
+        "sell_volume": float(sell_volume),
+        "ratio": float(ratio),
         "signal": signal,
+        "score": score,
+        "sample_size": len(recent),
     }
 
 
 # ============================================================
-# ORDER BOOK
+# ORDER BOOK LIQUIDITY
 # ============================================================
 
-def analyze_orderbook(orderbook):
+def analyze_orderbook(symbol, orderbook):
 
     if not orderbook:
-        return None
+
+        return {
+            "available": False,
+        }
 
     bids = orderbook.get("bids", [])
+
     asks = orderbook.get("asks", [])
 
     if not bids or not asks:
-        return None
+
+        return {
+            "available": False,
+        }
 
     bid_volume = sum(
-        float(x[1]) for x in bids[:20]
+        float(level[1])
+        for level in bids[:20]
     )
 
     ask_volume = sum(
-        float(x[1]) for x in asks[:20]
+        float(level[1])
+        for level in asks[:20]
     )
 
     total = bid_volume + ask_volume
 
     if total <= 0:
-        return None
+
+        return {
+            "available": False,
+        }
 
     imbalance = (
         bid_volume - ask_volume
     ) / total
 
-    if imbalance > 0.15:
-        signal = "BUY SIDE DOMINANT"
+    bid_wall = max(
+        bids[:20],
+        key=lambda x: float(x[1]),
+    )
 
-    elif imbalance < -0.15:
-        signal = "SELL SIDE DOMINANT"
+    ask_wall = max(
+        asks[:20],
+        key=lambda x: float(x[1]),
+    )
 
-    else:
-        signal = "BALANCED ORDER BOOK"
+    score = (
+        1 if imbalance > 0.15
+        else -1 if imbalance < -0.15
+        else 0
+    )
+
+    timestamp = int(
+        time.time() * 1000
+    )
+
+    db_execute(
+        """
+        INSERT INTO orderbook_history
+        (symbol, timestamp, imbalance, bid_volume, ask_volume)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            symbol,
+            timestamp,
+            imbalance,
+            bid_volume,
+            ask_volume,
+        ),
+    )
 
     return {
+        "available": True,
+        "imbalance": float(imbalance),
         "bid_volume": bid_volume,
         "ask_volume": ask_volume,
-        "imbalance": imbalance,
-        "signal": signal,
+        "bid_wall_price": float(bid_wall[0]),
+        "bid_wall_size": float(bid_wall[1]),
+        "ask_wall_price": float(ask_wall[0]),
+        "ask_wall_size": float(ask_wall[1]),
+        "score": score,
     }
 
 
 # ============================================================
-# FUNDING RATE
+# ORDER BOOK HISTORY
+# ============================================================
+
+def analyze_book_history(symbol):
+
+    history = pd.read_sql_query(
+        """
+        SELECT timestamp, imbalance
+        FROM orderbook_history
+        WHERE symbol = ?
+        ORDER BY timestamp DESC
+        LIMIT 100
+        """,
+        sqlite3.connect(DB_FILE),
+        params=(symbol,),
+    )
+
+    if len(history) < 3:
+
+        return {
+            "available": False,
+            "trend": "COLLECTING HISTORY",
+        }
+
+    history = history.sort_values(
+        "timestamp"
+    )
+
+    first = history["imbalance"].iloc[0]
+
+    last = history["imbalance"].iloc[-1]
+
+    change = last - first
+
+    if change > 0.15:
+
+        trend = "BUY LIQUIDITY INCREASING"
+
+    elif change < -0.15:
+
+        trend = "SELL LIQUIDITY INCREASING"
+
+    else:
+
+        trend = "BOOK IMBALANCE STABLE"
+
+    return {
+        "available": True,
+        "change": float(change),
+        "trend": trend,
+    }
+
+
+# ============================================================
+# FUNDING
 # ============================================================
 
 def analyze_funding(funding):
 
     if not funding:
-        return None
 
-    rate = funding.get("fundingRate")
+        return {
+            "available": False,
+        }
+
+    rate = funding.get(
+        "fundingRate"
+    )
 
     if rate is None:
-        return None
+
+        return {
+            "available": False,
+        }
 
     rate = float(rate)
 
-    if rate > 0.0005:
-        signal = "LONGS PAYING HIGH FUNDING"
+    if rate > 0.001:
+
+        state = "EXTREME POSITIVE FUNDING"
+
+        score = -1
+
+    elif rate > 0.0005:
+
+        state = "POSITIVE FUNDING"
+
+        score = -0.5
+
+    elif rate < -0.001:
+
+        state = "EXTREME NEGATIVE FUNDING"
+
+        score = 1
 
     elif rate < -0.0005:
-        signal = "SHORTS PAYING HIGH FUNDING"
+
+        state = "NEGATIVE FUNDING"
+
+        score = 0.5
 
     else:
-        signal = "FUNDING NEUTRAL"
+
+        state = "NEUTRAL FUNDING"
+
+        score = 0
 
     return {
+        "available": True,
         "rate": rate,
-        "signal": signal,
+        "state": state,
+        "score": score,
     }
 
 
@@ -720,7 +1482,7 @@ def fetch_macro():
         "SP500": "^GSPC",
     }
 
-    result = {}
+    output = {}
 
     for name, ticker in tickers.items():
 
@@ -734,7 +1496,7 @@ def fetch_macro():
 
             response = requests.get(
                 url,
-                timeout=8,
+                timeout=10,
                 headers={
                     "User-Agent": "Mozilla/5.0"
                 },
@@ -744,72 +1506,103 @@ def fetch_macro():
 
             data = response.json()
 
-            values = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+            result = data[
+                "chart"
+            ]["result"][0]
+
+            values = result[
+                "indicators"
+            ]["quote"][0]["close"]
 
             values = [
                 x for x in values
                 if x is not None
             ]
 
-            if len(values) >= 2:
+            if len(values) < 2:
+                continue
 
-                change = (
-                    values[-1] - values[-2]
-                ) / values[-2] * 100
+            change = (
+                values[-1] - values[-2]
+            ) / values[-2] * 100
 
-                result[name] = {
-                    "value": values[-1],
-                    "change": change,
-                }
+            output[name] = {
+                "value": float(values[-1]),
+                "change": float(change),
+            }
 
-        except Exception as e:
+        except Exception as exc:
 
             logger.warning(
-                "Macro error %s: %s",
+                "Macro %s unavailable: %s",
                 name,
-                e
+                exc,
             )
 
-    return result
+    return output
 
 
-def macro_score(macro):
+def calculate_macro_score(macro):
 
-    score = 0
+    values = []
 
     if "DXY" in macro:
 
-        if macro["DXY"]["change"] > 0.15:
-            score -= 1
+        change = macro["DXY"]["change"]
 
-        elif macro["DXY"]["change"] < -0.15:
-            score += 1
+        values.append(
+            -1 if change > 0.15
+            else 1 if change < -0.15
+            else 0
+        )
 
     if "NASDAQ" in macro:
 
-        if macro["NASDAQ"]["change"] > 0.3:
-            score += 1
+        change = macro["NASDAQ"]["change"]
 
-        elif macro["NASDAQ"]["change"] < -0.3:
-            score -= 1
+        values.append(
+            1 if change > 0.3
+            else -1 if change < -0.3
+            else 0
+        )
 
     if "SP500" in macro:
 
-        if macro["SP500"]["change"] > 0.3:
-            score += 1
+        change = macro["SP500"]["change"]
 
-        elif macro["SP500"]["change"] < -0.3:
-            score -= 1
+        values.append(
+            1 if change > 0.3
+            else -1 if change < -0.3
+            else 0
+        )
 
     if "VIX" in macro:
 
-        if macro["VIX"]["change"] > 5:
-            score -= 1
+        change = macro["VIX"]["change"]
 
-        elif macro["VIX"]["change"] < -5:
-            score += 1
+        values.append(
+            -1 if change > 5
+            else 1 if change < -5
+            else 0
+        )
 
-    return score
+    if "US10Y" in macro:
+
+        change = macro["US10Y"]["change"]
+
+        values.append(
+            -1 if change > 1
+            else 1 if change < -1
+            else 0
+        )
+
+    if not values:
+
+        return None
+
+    return float(
+        np.mean(values)
+    )
 
 
 # ============================================================
@@ -832,96 +1625,636 @@ def fetch_news():
 
             feed = feedparser.parse(url)
 
-            for entry in feed.entries[:8]:
+            for item in feed.entries[:8]:
 
                 news.append({
-                    "title": entry.get(
+                    "title": item.get(
                         "title",
-                        "Untitled"
+                        "Untitled",
                     ),
-                    "link": entry.get(
+                    "link": item.get(
                         "link",
-                        ""
+                        "",
                     ),
                 })
 
         except Exception:
+
             continue
 
     return news[:15]
 
 
 # ============================================================
-# MULTI TIMEFRAME ANALYSIS
+# MULTI TIMEFRAME
 # ============================================================
 
-def analyze_timeframe(df, timeframe):
+def analyze_timeframe(df):
 
-    df = calculate_indicators(df)
+    df = add_indicators(df)
 
     last = df.iloc[-1]
 
     score = 0
 
+    components = {}
+
     close = float(last["close"])
 
-    rsi = float(last["RSI"]) if pd.notna(last["RSI"]) else 50
+    rsi = last["RSI"]
+
+    atr = last["ATR"]
+
+    adx = last["ADX"]
+
+    if pd.notna(rsi):
+
+        if rsi > 55:
+
+            components["RSI"] = 1
+
+        elif rsi < 45:
+
+            components["RSI"] = -1
+
+        else:
+
+            components["RSI"] = 0
+
+    else:
+
+        components["RSI"] = 0
 
     if close > last["SMA20"]:
-        score += 1
+
+        components["SMA20"] = 1
 
     else:
-        score -= 1
+
+        components["SMA20"] = -1
 
     if close > last["SMA50"]:
-        score += 1
+
+        components["SMA50"] = 1
 
     else:
-        score -= 1
 
-    if rsi > 55:
-        score += 1
+        components["SMA50"] = -1
 
-    elif rsi < 45:
-        score -= 1
+    structure = analyze_structure(
+        df
+    )
 
-    structure = market_structure(df)
+    components["STRUCTURE"] = structure["score"]
 
-    score += structure["score"] * 2
+    liquidity = analyze_liquidity(
+        df
+    )
 
-    liquidity = liquidity_analysis(df)
+    components["LIQUIDITY"] = liquidity["score"]
 
-    score += liquidity["sweep_score"]
+    if (
+        pd.notna(last["VOL_RATIO"])
+        and last["VOL_RATIO"] > 1.5
+    ):
 
-    if last["VOL_RATIO"] > 1.5:
+        components["VOLUME"] = (
+            1 if close > last["open"]
+            else -1 if close < last["open"]
+            else 0
+        )
 
-        if last["close"] > last["open"]:
-            score += 1
+    else:
 
-        elif last["close"] < last["open"]:
-            score -= 1
+        components["VOLUME"] = 0
+
+    score = sum(
+        components.values()
+    )
+
+    regime = detect_market_regime(
+        df
+    )
 
     return {
-        "score": score,
         "price": close,
-        "RSI": rsi,
-        "ATR": float(last["ATR"]),
-        "volume_ratio": float(
-            last["VOL_RATIO"]
-        ) if pd.notna(last["VOL_RATIO"]) else 0,
+        "RSI": float(rsi) if pd.notna(rsi) else None,
+        "ATR": float(atr) if pd.notna(atr) else None,
+        "ADX": float(adx) if pd.notna(adx) else None,
+        "score": score,
+        "components": components,
         "structure": structure,
         "liquidity": liquidity,
+        "regime": regime,
         "df": df,
     }
 
 
 # ============================================================
-# MASTER ANALYSIS
+# DECISION ENGINE
 # ============================================================
 
-def analyze_market(symbol):
+def weighted_decision(
+    mtf,
+    oi,
+    cvd,
+    book,
+    book_history,
+    funding,
+    macro_score,
+):
 
-    results = {}
+    sources = {}
+
+    # Each source is normalized to [-1, 1].
+
+    mtf_value = 0
+
+    total_tf_weight = 0
+
+    for tf, weight in TF_WEIGHTS.items():
+
+        if tf not in mtf:
+            continue
+
+        score = mtf[tf]["score"]
+
+        normalized = np.clip(
+            score / 7,
+            -1,
+            1,
+        )
+
+        mtf_value += normalized * weight
+
+        total_tf_weight += weight
+
+    if total_tf_weight:
+
+        mtf_value /= total_tf_weight
+
+        sources["MTF"] = (
+            mtf_value,
+            35,
+        )
+
+    if oi and oi.get("available"):
+
+        sources["OI"] = (
+            oi["score"],
+            20,
+        )
+
+    if cvd and cvd.get("available"):
+
+        sources["CVD"] = (
+            cvd["score"],
+            15,
+        )
+
+    if book and book.get("available"):
+
+        sources["ORDERBOOK"] = (
+            book["score"],
+            10,
+        )
+
+    if funding and funding.get("available"):
+
+        sources["FUNDING"] = (
+            funding["score"],
+            5,
+        )
+
+    if macro_score is not None:
+
+        sources["MACRO"] = (
+            macro_score,
+            10,
+        )
+
+    if (
+        book_history
+        and book_history.get("available")
+    ):
+
+        sources["BOOK HISTORY"] = (
+            np.clip(
+                book_history["change"] * 3,
+                -1,
+                1,
+            ),
+            5,
+        )
+
+    total_weight = sum(
+        weight
+        for _, weight in sources.values()
+    )
+
+    if total_weight <= 0:
+
+        return {
+            "signal": "KIVÁRÁS",
+            "score": 0,
+            "coverage": 0,
+            "confidence": 0,
+            "sources": sources,
+        }
+
+    score = sum(
+        value * weight
+        for value, weight in sources.values()
+    ) / total_weight
+
+    positive = sum(
+        weight
+        for value, weight in sources.values()
+        if value > 0.35
+    )
+
+    negative = sum(
+        weight
+        for value, weight in sources.values()
+        if value < -0.35
+    )
+
+    # Conflict detection.
+
+    conflict = (
+        positive >= total_weight * 0.35
+        and negative >= total_weight * 0.35
+    )
+
+    coverage = total_weight
+
+    if coverage < 65:
+
+        signal = "KIVÁRÁS"
+
+    elif conflict:
+
+        signal = "KIVÁRÁS"
+
+    elif score >= 0.40:
+
+        signal = "LONG"
+
+    elif score <= -0.40:
+
+        signal = "SHORT"
+
+    else:
+
+        signal = "KIVÁRÁS"
+
+    confidence = min(
+        100,
+        abs(score) * 100,
+    )
+
+    return {
+        "signal": signal,
+        "score": float(score),
+        "coverage": float(coverage),
+        "confidence": float(confidence),
+        "conflict": conflict,
+        "sources": sources,
+    }
+
+
+# ============================================================
+# LIQUIDATION RISK ZONES – ESTIMATE ONLY
+# ============================================================
+
+def estimate_liquidation_zones(
+    price,
+    atr,
+):
+
+    if not atr or atr <= 0:
+
+        return None
+
+    return {
+        "upper_risk_zone": price + atr * 3,
+        "lower_risk_zone": price - atr * 3,
+        "upper_extended_zone": price + atr * 5,
+        "lower_extended_zone": price - atr * 5,
+        "method": "ATR-based volatility estimate",
+    }
+
+
+# ============================================================
+# RISK MANAGEMENT
+# ============================================================
+
+def risk_plan(
+    signal,
+    price,
+    atr,
+    capital,
+    risk_percent,
+    leverage,
+):
+
+    if signal not in (
+        "LONG",
+        "SHORT",
+    ):
+
+        return None
+
+    if (
+        atr is None
+        or not np.isfinite(atr)
+        or atr <= 0
+    ):
+
+        return None
+
+    risk_amount = (
+        capital *
+        risk_percent / 100
+    )
+
+    stop_distance = atr * 1.5
+
+    target_distance = atr * 3
+
+    quantity = (
+        risk_amount /
+        stop_distance
+    )
+
+    max_notional = (
+        capital * leverage
+    )
+
+    quantity = min(
+        quantity,
+        max_notional / price,
+    )
+
+    actual_notional = quantity * price
+
+    actual_risk = (
+        quantity * stop_distance
+    )
+
+    if signal == "LONG":
+
+        sl = price - stop_distance
+
+        tp = price + target_distance
+
+    else:
+
+        sl = price + stop_distance
+
+        tp = price - target_distance
+
+    return {
+        "entry": price,
+        "stop_loss": sl,
+        "take_profit": tp,
+        "quantity": quantity,
+        "notional": actual_notional,
+        "risk_amount": actual_risk,
+        "risk_reward": 2.0,
+    }
+
+
+# ============================================================
+# SIGNAL JOURNAL
+# ============================================================
+
+def save_signal(
+    symbol,
+    signal,
+    price,
+    score,
+    confidence,
+    coverage,
+    plan,
+):
+
+    sl = (
+        plan["stop_loss"]
+        if plan
+        else None
+    )
+
+    tp = (
+        plan["take_profit"]
+        if plan
+        else None
+    )
+
+    DB.execute(
+        """
+        INSERT INTO signals (
+            created_at,
+            symbol,
+            signal,
+            price,
+            score,
+            confidence,
+            coverage,
+            stop_loss,
+            take_profit,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+        """,
+        (
+            datetime.now(timezone.utc).isoformat(),
+            symbol,
+            signal,
+            price,
+            score,
+            confidence,
+            coverage,
+            sl,
+            tp,
+        ),
+    )
+
+    DB.commit()
+
+
+def update_signal_results(symbol):
+
+    df = fetch_ohlcv(
+        symbol,
+        "1m",
+    )
+
+    if df.empty:
+        return
+
+    rows = DB.execute(
+        """
+        SELECT id, created_at, signal,
+               price, stop_loss, take_profit
+        FROM signals
+        WHERE symbol = ?
+        AND status = 'OPEN'
+        AND signal IN ('LONG', 'SHORT')
+        """,
+        (symbol,),
+    ).fetchall()
+
+    for row in rows:
+
+        sid, created, signal, entry, sl, tp = row
+
+        if sl is None or tp is None:
+            continue
+
+        created_dt = pd.to_datetime(
+            created,
+            utc=True,
+        )
+
+        candles = df[
+            df["datetime"] >= created_dt
+        ]
+
+        if candles.empty:
+            continue
+
+        exit_price = None
+
+        for _, candle in candles.iterrows():
+
+            if signal == "LONG":
+
+                hit_sl = (
+                    candle["low"] <= sl
+                )
+
+                hit_tp = (
+                    candle["high"] >= tp
+                )
+
+            else:
+
+                hit_sl = (
+                    candle["high"] >= sl
+                )
+
+                hit_tp = (
+                    candle["low"] <= tp
+                )
+
+            # Conservative assumption:
+            # SL first if both are touched in one candle.
+
+            if hit_sl:
+
+                exit_price = sl
+
+                break
+
+            if hit_tp:
+
+                exit_price = tp
+
+                break
+
+        if exit_price is None:
+            continue
+
+        if signal == "LONG":
+
+            result = (
+                exit_price - entry
+            ) / entry * 100
+
+        else:
+
+            result = (
+                entry - exit_price
+            ) / entry * 100
+
+        DB.execute(
+            """
+            UPDATE signals
+            SET status = 'CLOSED',
+                close_price = ?,
+                result_percent = ?,
+                close_time = ?
+            WHERE id = ?
+            """,
+            (
+                exit_price,
+                result,
+                datetime.now(timezone.utc).isoformat(),
+                sid,
+            ),
+        )
+
+    DB.commit()
+
+
+def load_journal():
+
+    return pd.read_sql_query(
+        """
+        SELECT *
+        FROM signals
+        ORDER BY id DESC
+        LIMIT 1000
+        """,
+        sqlite3.connect(DB_FILE),
+    )
+
+
+# ============================================================
+# ANALYSIS LOGGER
+# ============================================================
+
+def save_analysis(
+    symbol,
+    price,
+    score,
+    signal,
+    coverage,
+):
+
+    DB.execute(
+        """
+        INSERT INTO analysis_history (
+            symbol,
+            timestamp,
+            price,
+            score,
+            signal,
+            coverage
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            symbol,
+            int(time.time() * 1000),
+            price,
+            score,
+            signal,
+            coverage,
+        ),
+    )
+
+    DB.commit()
+
+
+# ============================================================
+# COMPLETE ANALYSIS
+# ============================================================
+
+def run_analysis(symbol):
+
+    mtf = {}
 
     errors = []
 
@@ -931,538 +2264,150 @@ def analyze_market(symbol):
 
             df = fetch_ohlcv(
                 symbol,
-                tf
+                tf,
             )
 
             if len(df) < 60:
                 continue
 
-            results[tf] = analyze_timeframe(
-                df,
-                tf
+            mtf[tf] = analyze_timeframe(
+                df
             )
 
-        except Exception as e:
+        except Exception as exc:
 
             errors.append(
-                f"{tf}: {str(e)}"
+                f"{tf}: {exc}"
             )
 
-    if not results:
+    if not mtf:
 
         raise RuntimeError(
-            "Nem sikerült idősík-adatokat lekérni az OKX-ről."
+            "No valid timeframe data from OKX."
         )
 
-    current_price = results[
-        "1m"
-    ]["price"] if "1m" in results else list(
-        results.values()
-    )[-1]["price"]
-
-    # --------------------------------------------------------
-    # MTF SCORE
-    # --------------------------------------------------------
-
-    mtf_score = 0
-    mtf_weight = 0
-
-    for tf, weight in TF_WEIGHTS.items():
-
-        if tf in results:
-
-            mtf_score += (
-                results[tf]["score"] * weight
-            )
-
-            mtf_weight += weight
-
-    if mtf_weight > 0:
-        mtf_score /= mtf_weight
-
-    # --------------------------------------------------------
-    # OPEN INTEREST
-    # --------------------------------------------------------
-
-    oi_data = fetch_open_interest(symbol)
-
-    oi_value = None
-
-    if oi_data:
-
-        oi_value = (
-            oi_data.get("openInterestAmount")
-            or oi_data.get("openInterestValue")
-            or oi_data.get("openInterest")
-        )
-
-    oi_change = None
-    price_change = None
-
-    # --------------------------------------------------------
-    # PRICE CHANGE AND OI CHANGE
-    # --------------------------------------------------------
-
-    try:
-
-        exchange = get_exchange()
-
-        oi_history = exchange.fetch_open_interest_history(
-            get_market_symbol(symbol),
-            timeframe="5m",
-            limit=20,
-        )
-
-        if len(oi_history) >= 2:
-
-            old_oi = oi_history[0].get(
-                "openInterestAmount"
-            )
-
-            new_oi = oi_history[-1].get(
-                "openInterestAmount"
-            )
-
-            if old_oi and new_oi:
-
-                oi_change = (
-                    float(new_oi) - float(old_oi)
-                ) / float(old_oi) * 100
-
-                price_change = (
-                    results["5m"]["price"] -
-                    results["15m"]["price"]
-                ) / results["15m"]["price"] * 100
-
-    except Exception as e:
-
-        logger.warning(
-            "OI history unavailable: %s",
-            e
-        )
-
-    oi_interpretation, oi_score = interpret_open_interest(
-        price_change,
-        oi_change
+    main_tf = (
+        mtf.get("1h")
+        or mtf.get("15m")
+        or next(iter(mtf.values()))
     )
 
-    # --------------------------------------------------------
-    # TAKER FLOW
-    # --------------------------------------------------------
+    price = main_tf["price"]
 
-    trades = fetch_trades(symbol)
+    ticker = fetch_ticker(
+        symbol
+    )
 
-    taker = analyze_taker_flow(trades)
+    if ticker.get("last"):
 
-    if taker["signal"] == "BUYERS DOMINANT":
-        taker_score = 1
-
-    elif taker["signal"] == "SELLERS DOMINANT":
-        taker_score = -1
-
-    else:
-        taker_score = 0
-
-    # --------------------------------------------------------
-    # ORDER BOOK
-    # --------------------------------------------------------
-
-    orderbook = fetch_orderbook(symbol)
-
-    book = analyze_orderbook(orderbook)
-
-    book_score = 0
-
-    if book:
-
-        book_score = (
-            1 if book["imbalance"] > 0.15
-            else -1 if book["imbalance"] < -0.15
-            else 0
+        price = float(
+            ticker["last"]
         )
 
-    # --------------------------------------------------------
-    # FUNDING
-    # --------------------------------------------------------
+    oi_raw = fetch_open_interest(
+        symbol
+    )
 
-    funding_raw = fetch_funding(symbol)
+    oi_value = extract_oi_value(
+        oi_raw
+    )
+
+    oi = analyze_open_interest(
+        symbol,
+        price,
+        oi_value,
+    )
+
+    trades = fetch_trades(
+        symbol
+    )
+
+    store_trades(
+        symbol,
+        trades,
+    )
+
+    cvd = analyze_cvd(
+        symbol
+    )
+
+    orderbook = fetch_orderbook(
+        symbol
+    )
+
+    book = analyze_orderbook(
+        symbol,
+        orderbook,
+    )
+
+    book_history = analyze_book_history(
+        symbol
+    )
+
+    funding_raw = fetch_funding(
+        symbol
+    )
 
     funding = analyze_funding(
         funding_raw
     )
 
-    funding_score = 0
-
-    if funding:
-
-        if funding["rate"] > 0.001:
-            funding_score = -1
-
-        elif funding["rate"] < -0.001:
-            funding_score = 1
-
-    # --------------------------------------------------------
-    # MACRO
-    # --------------------------------------------------------
-
     macro = fetch_macro()
 
-    m_score = macro_score(macro)
-
-    # --------------------------------------------------------
-    # VOLUME PROFILE
-    # --------------------------------------------------------
-
-    vp = volume_profile(
-        results["1h"]["df"]
-        if "1h" in results
-        else list(results.values())[-1]["df"]
+    m_score = calculate_macro_score(
+        macro
     )
 
-    # --------------------------------------------------------
-    # WEIGHTED DECISION ENGINE
-    # --------------------------------------------------------
+    decision = weighted_decision(
+        mtf,
+        oi,
+        cvd,
+        book,
+        book_history,
+        funding,
+        m_score,
+    )
 
-    components = {
-        "MTF": (mtf_score, 35),
-        "OI": (oi_score, 20),
-        "TAKER": (taker_score, 15),
-        "ORDERBOOK": (book_score, 10),
-        "FUNDING": (funding_score, 5),
-        "MACRO": (m_score / 4, 15),
-    }
+    vp = calculate_volume_profile(
+        main_tf["df"]
+    )
 
-    total_weight = 0
-    weighted_score = 0
+    liquidation = estimate_liquidation_zones(
+        price,
+        main_tf["ATR"],
+    )
 
-    for name, (value, weight) in components.items():
-
-        available = True
-
-        if name == "OI" and oi_change is None:
-            available = False
-
-        if name == "ORDERBOOK" and book is None:
-            available = False
-
-        if name == "FUNDING" and funding is None:
-            available = False
-
-        if name == "MACRO" and not macro:
-            available = False
-
-        if name == "TAKER" and not trades:
-            available = False
-
-        if available:
-
-            weighted_score += value * weight
-
-            total_weight += weight
-
-    if total_weight:
-
-        normalized_score = (
-            weighted_score / total_weight
-        )
-
-    else:
-
-        normalized_score = 0
-
-    coverage = total_weight
-
-    # --------------------------------------------------------
-    # DECISION
-    # --------------------------------------------------------
-
-    if coverage < 55:
-
-        signal = "KIVÁRÁS"
-
-    elif normalized_score >= 0.45:
-
-        signal = "LONG"
-
-    elif normalized_score <= -0.45:
-
-        signal = "SHORT"
-
-    else:
-
-        signal = "KIVÁRÁS"
-
-    # Confidence is a score-strength indicator,
-    # NOT a statistical probability of winning.
-
-    confidence = min(
-        95,
-        abs(normalized_score) * 100
+    save_analysis(
+        symbol,
+        price,
+        decision["score"],
+        decision["signal"],
+        decision["coverage"],
     )
 
     return {
         "symbol": symbol,
-        "price": current_price,
-        "signal": signal,
-        "score": normalized_score,
-        "confidence": confidence,
-        "coverage": coverage,
-        "mtf": results,
-        "oi": oi_data,
-        "oi_change": oi_change,
-        "oi_interpretation": oi_interpretation,
-        "taker": taker,
+        "price": price,
+        "mtf": mtf,
+        "oi": oi,
+        "cvd": cvd,
         "book": book,
+        "book_history": book_history,
         "funding": funding,
         "macro": macro,
+        "macro_score": m_score,
+        "decision": decision,
         "volume_profile": vp,
-        "components": components,
+        "liquidation": liquidation,
         "errors": errors,
     }
-
-
-# ============================================================
-# RISK MANAGEMENT
-# ============================================================
-
-def calculate_risk_plan(
-    signal,
-    price,
-    atr,
-    capital,
-    risk_percent,
-    leverage
-):
-
-    if signal not in ("LONG", "SHORT"):
-
-        return None
-
-    if atr is None or not np.isfinite(atr) or atr <= 0:
-        return None
-
-    risk_amount = (
-        capital * risk_percent / 100
-    )
-
-    stop_distance = atr * 1.5
-
-    target_distance = atr * 3
-
-    if signal == "LONG":
-
-        stop_loss = price - stop_distance
-
-        take_profit = price + target_distance
-
-    else:
-
-        stop_loss = price + stop_distance
-
-        take_profit = price - target_distance
-
-    quantity = risk_amount / stop_distance
-
-    max_notional = capital * leverage
-
-    quantity = min(
-        quantity,
-        max_notional / price
-    )
-
-    return {
-        "entry": price,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "quantity": quantity,
-        "notional": quantity * price,
-        "risk_amount": risk_amount,
-        "risk_reward": 2.0,
-    }
-
-
-# ============================================================
-# JOURNAL
-# ============================================================
-
-def save_signal(
-    symbol,
-    signal,
-    price,
-    confidence,
-    score,
-    sl,
-    tp
-):
-
-    DB.execute(
-        """
-        INSERT INTO signals (
-            timestamp,
-            symbol,
-            signal,
-            price,
-            confidence,
-            score,
-            stop_loss,
-            take_profit,
-            status
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
-        """,
-        (
-            datetime.now(timezone.utc).isoformat(),
-            symbol,
-            signal,
-            price,
-            confidence,
-            score,
-            sl,
-            tp,
-        ),
-    )
-
-    DB.commit()
-
-
-def get_journal():
-
-    return pd.read_sql_query(
-        """
-        SELECT *
-        FROM signals
-        ORDER BY id DESC
-        LIMIT 500
-        """,
-        DB,
-    )
-
-
-def update_journal_outcomes(symbol):
-
-    try:
-
-        df = fetch_ohlcv(
-            symbol,
-            "1m"
-        )
-
-        if df.empty:
-            return
-
-        rows = DB.execute(
-            """
-            SELECT id, timestamp, signal,
-                   stop_loss, take_profit
-            FROM signals
-            WHERE symbol = ?
-              AND status = 'OPEN'
-            """,
-            (symbol,),
-        ).fetchall()
-
-        for row in rows:
-
-            signal_id = row[0]
-            created = row[1]
-            signal = row[2]
-            sl = row[3]
-            tp = row[4]
-
-            if not sl or not tp:
-                continue
-
-            created_dt = pd.to_datetime(
-                created,
-                utc=True
-            )
-
-            candles = df[
-                df["datetime"] >= created_dt
-            ]
-
-            if candles.empty:
-                continue
-
-            exit_price = None
-
-            for _, candle in candles.iterrows():
-
-                if signal == "LONG":
-
-                    hit_sl = candle["low"] <= sl
-
-                    hit_tp = candle["high"] >= tp
-
-                else:
-
-                    hit_sl = candle["high"] >= sl
-
-                    hit_tp = candle["low"] <= tp
-
-                # Conservative rule:
-                # if SL and TP occur in the same candle,
-                # assume SL was hit first.
-
-                if hit_sl:
-
-                    exit_price = sl
-                    break
-
-                if hit_tp:
-
-                    exit_price = tp
-                    break
-
-            if exit_price is not None:
-
-                entry = DB.execute(
-                    "SELECT price FROM signals WHERE id = ?",
-                    (signal_id,),
-                ).fetchone()[0]
-
-                if signal == "LONG":
-
-                    result = (
-                        exit_price - entry
-                    ) / entry * 100
-
-                else:
-
-                    result = (
-                        entry - exit_price
-                    ) / entry * 100
-
-                DB.execute(
-                    """
-                    UPDATE signals
-                    SET status = 'CLOSED',
-                        close_price = ?,
-                        result_percent = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        exit_price,
-                        result,
-                        signal_id,
-                    ),
-                )
-
-        DB.commit()
-
-    except Exception as e:
-
-        logger.warning(
-            "Journal update error: %s",
-            e
-        )
 
 
 # ============================================================
 # CHART
 # ============================================================
 
-def create_chart(df, symbol):
+def build_chart(df, symbol):
 
     fig = go.Figure()
 
@@ -1496,70 +2441,95 @@ def create_chart(df, symbol):
     )
 
     fig.update_layout(
+        template="plotly_dark",
         height=550,
         xaxis_rangeslider_visible=False,
-        template="plotly_dark",
-        title=f"{symbol} – OKX",
     )
 
     return fig
 
 
 # ============================================================
-# AI EXPLANATION
+# GROQ AI
 # ============================================================
 
-def groq_explanation(result):
+def ai_report(result):
 
-    api_key = st.secrets.get(
-        "GROQ_API_KEY",
-        os.getenv("GROQ_API_KEY")
-    )
+    try:
+
+        api_key = st.secrets.get(
+            "GROQ_API_KEY",
+            os.getenv("GROQ_API_KEY"),
+        )
+
+    except Exception:
+
+        api_key = os.getenv(
+            "GROQ_API_KEY"
+        )
 
     if not api_key:
-        return "Groq API kulcs nincs beállítva."
+
+        return (
+            "A GROQ_API_KEY nincs beállítva. "
+            "Az elemzőrendszer ettől még működik."
+        )
 
     prompt = f"""
-You are SALIGA AI, an institutional crypto market analyst.
+You are SALIGA AI Institutional Crypto Analyst.
 
-Analyze the following market data in Hungarian.
+Write a detailed Hungarian market analysis.
 
-Symbol: {result['symbol']}
-Price: {result['price']}
-Signal: {result['signal']}
-Score: {result['score']}
-Confidence score: {result['confidence']}
-Data coverage: {result['coverage']}%
+MARKET:
+{result['symbol']}
 
-Open Interest interpretation:
-{result['oi_interpretation']}
+PRICE:
+{result['price']}
 
-Taker flow:
-{result['taker']}
+DECISION:
+{result['decision']}
 
-Order book:
+OPEN INTEREST:
+{result['oi']}
+
+CVD:
+{result['cvd']}
+
+ORDER BOOK:
 {result['book']}
 
-Funding:
+ORDER BOOK HISTORY:
+{result['book_history']}
+
+FUNDING:
 {result['funding']}
 
-Macro:
+MACRO:
 {result['macro']}
 
-Volume profile:
+VOLUME PROFILE:
 {result['volume_profile']}
 
-Explain:
-1. Market direction.
-2. Long and short positioning estimates.
-3. Buyer and seller activity.
-4. Liquidity situation.
-5. Main risks.
-6. What would invalidate the current bias.
+MARKET STRUCTURE:
+{{
+    tf: data['structure']
+    for tf, data in result['mtf'].items()
+}}
 
-Never invent missing data.
-Never describe confidence as win probability.
-Do not give guaranteed predictions.
+Explain:
+
+1. Current market direction.
+2. Position building and closing estimates.
+3. Aggressive buyer/seller activity.
+4. Liquidity conditions.
+5. Important support and resistance.
+6. Macro environment.
+7. Risks and invalidation levels.
+8. Whether waiting is preferable.
+
+Do not invent unavailable data.
+Do not claim guaranteed accuracy.
+Do not describe a score as a win probability.
 """
 
     try:
@@ -1576,8 +2546,8 @@ Do not give guaranteed predictions.
                     {
                         "role": "system",
                         "content": (
-                            "You are a professional crypto market analyst. "
-                            "Answer in Hungarian."
+                            "You are a professional crypto analyst. "
+                            "Respond in Hungarian."
                         ),
                     },
                     {
@@ -1585,10 +2555,10 @@ Do not give guaranteed predictions.
                         "content": prompt,
                     },
                 ],
-                "temperature": 0.25,
-                "max_tokens": 1200,
+                "temperature": 0.2,
+                "max_tokens": 1800,
             },
-            timeout=30,
+            timeout=40,
         )
 
         response.raise_for_status()
@@ -1597,26 +2567,30 @@ Do not give guaranteed predictions.
             "choices"
         ][0]["message"]["content"]
 
-    except Exception as e:
+    except Exception as exc:
 
-        return f"AI elemzési hiba: {e}"
+        return (
+            f"Groq AI error: {exc}"
+        )
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-st.sidebar.header("⚙️ SALIGA AI SETTINGS")
+st.sidebar.title(
+    "SALIGA AI CONTROL"
+)
 
-selected_symbol = st.sidebar.selectbox(
+asset = st.sidebar.selectbox(
     "Market",
     list(SYMBOLS.keys()),
 )
 
-symbol = SYMBOLS[selected_symbol]
+symbol = SYMBOLS[asset]
 
 capital = st.sidebar.number_input(
-    "Capital (USDT)",
+    "Account capital (USDT)",
     min_value=10.0,
     value=1000.0,
     step=100.0,
@@ -1625,7 +2599,7 @@ capital = st.sidebar.number_input(
 risk_percent = st.sidebar.slider(
     "Risk per trade (%)",
     0.25,
-    5.0,
+    3.0,
     1.0,
     0.25,
 )
@@ -1637,78 +2611,96 @@ leverage = st.sidebar.slider(
     5,
 )
 
-refresh_seconds = st.sidebar.selectbox(
-    "Auto refresh",
-    [0, 15, 30, 60],
-    index=2,
+st.sidebar.caption(
+    "Data source: OKX only."
 )
 
-if refresh_seconds > 0 and AUTOREFRESH_AVAILABLE:
-
-    st_autorefresh(
-        interval=refresh_seconds * 1000,
-        key="saliga_refresh",
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-if st.button(
-    "⚡ RUN FULL MARKET ANALYSIS",
+run_button = st.sidebar.button(
+    "⚡ RUN FULL ANALYSIS",
     type="primary",
-    use_container_width=True,
-):
+)
+
+
+# ============================================================
+# SESSION
+# ============================================================
+
+if "last_result" not in st.session_state:
+
+    st.session_state.last_result = None
+
+if run_button:
 
     st.cache_data.clear()
 
-    st.rerun()
-
-
-try:
-
     with st.spinner(
-        "SALIGA AI – OKX market intelligence running..."
+        "SALIGA AI is analyzing OKX markets..."
     ):
 
-        result = analyze_market(
-            symbol
-        )
+        try:
 
-        update_journal_outcomes(
-            symbol
-        )
+            st.session_state.last_result = run_analysis(
+                symbol
+            )
 
-    # --------------------------------------------------------
-    # HEADER CARDS
-    # --------------------------------------------------------
+            update_signal_results(
+                symbol
+            )
+
+        except Exception as exc:
+
+            st.error(
+                f"Analysis failed: {exc}"
+            )
+
+
+# ============================================================
+# MAIN DASHBOARD
+# ============================================================
+
+result = st.session_state.last_result
+
+if result is None:
+
+    st.info(
+        "Nyomd meg a RUN FULL ANALYSIS gombot "
+        "az első elemzés elindításához."
+    )
+
+else:
+
+    decision = result["decision"]
+
+    st.subheader(
+        "MARKET OVERVIEW"
+    )
 
     c1, c2, c3, c4 = st.columns(4)
 
     c1.metric(
-        "CURRENT PRICE",
-        f"${result['price']:,.4f}",
+        "PRICE",
+        f"{result['price']:,.4f}",
     )
 
     c2.metric(
-        "MARKET DECISION",
-        result["signal"],
+        "DECISION",
+        decision["signal"],
     )
 
     c3.metric(
-        "CONFIDENCE SCORE",
-        f"{result['confidence']:.1f}%",
+        "SCORE",
+        f"{decision['score']:.3f}",
     )
 
     c4.metric(
         "DATA COVERAGE",
-        f"{result['coverage']:.0f}%",
+        f"{decision['coverage']:.0f}%",
     )
 
     st.caption(
-        "A confidence score indicates the strength of the available "
-        "signals, not the probability of a profitable trade."
+        "A confidence/score nem nyerési valószínűség. "
+        "Az adatlefedettség azt mutatja, hogy a döntési "
+        "modell súlyainak mekkora része állt rendelkezésre."
     )
 
     # --------------------------------------------------------
@@ -1716,58 +2708,93 @@ try:
     # --------------------------------------------------------
 
     st.subheader(
-        "📊 POSITION FLOW INTELLIGENCE"
+        "POSITION FLOW INTELLIGENCE"
     )
 
-    p1, p2, p3 = st.columns(3)
+    a, b, c = st.columns(3)
 
-    p1.metric(
+    a.metric(
         "OPEN INTEREST",
-        result["oi_interpretation"],
+        result["oi"]["state"],
     )
 
-    p2.metric(
-        "TAKER FLOW",
-        result["taker"]["signal"],
+    b.metric(
+        "CVD",
+        result["cvd"]["signal"],
     )
 
-    p3.metric(
+    c.metric(
         "ORDER BOOK",
-        result["book"]["signal"]
-        if result["book"]
-        else "UNAVAILABLE",
+        (
+            f"{result['book']['imbalance']:.3f}"
+            if result["book"].get("available")
+            else "UNAVAILABLE"
+        ),
+    )
+
+    st.write(
+        "OI change:",
+        result["oi"].get(
+            "oi_change",
+            "N/A",
+        ),
+    )
+
+    st.write(
+        "CVD delta:",
+        result["cvd"].get(
+            "delta",
+            "N/A",
+        ),
+    )
+
+    st.write(
+        "Order Book history:",
+        result["book_history"]["trend"],
     )
 
     # --------------------------------------------------------
-    # COMPONENTS
+    # DECISION COMPONENTS
     # --------------------------------------------------------
 
     st.subheader(
-        "🧠 DECISION ENGINE"
+        "DECISION ENGINE"
     )
 
-    component_data = []
+    rows = []
 
-    for name, (value, weight) in result["components"].items():
+    for name, values in decision["sources"].items():
 
-        component_data.append({
-            "Component": name,
-            "Score": round(value, 3),
+        value, weight = values
+
+        rows.append({
+            "Module": name,
+            "Score": round(
+                float(value),
+                3,
+            ),
             "Weight": weight,
         })
 
     st.dataframe(
-        pd.DataFrame(component_data),
+        pd.DataFrame(rows),
         use_container_width=True,
         hide_index=True,
     )
+
+    if decision.get("conflict"):
+
+        st.warning(
+            "A fő adatforrások egymásnak ellentmondanak. "
+            "A rendszer ezért KIVÁRÁS döntést alkalmaz."
+        )
 
     # --------------------------------------------------------
     # MULTI TIMEFRAME
     # --------------------------------------------------------
 
     st.subheader(
-        "⏱️ MULTI-TIMEFRAME ANALYSIS"
+        "MULTI-TIMEFRAME ANALYSIS"
     )
 
     tf_rows = []
@@ -1778,11 +2805,13 @@ try:
             "Timeframe": tf,
             "Price": data["price"],
             "Score": data["score"],
-            "RSI": round(data["RSI"], 2),
-            "ATR": data["ATR"],
+            "RSI": data["RSI"],
+            "ADX": data["ADX"],
             "Structure": data["structure"]["trend"],
             "BOS": data["structure"]["bos"],
-            "Liquidity": data["liquidity"]["sweep"],
+            "CHoCH": data["structure"]["choch"],
+            "Regime": data["regime"]["regime"],
+            "Volatility": data["regime"]["volatility"],
         })
 
     st.dataframe(
@@ -1792,61 +2821,38 @@ try:
     )
 
     # --------------------------------------------------------
-    # CHART
-    # --------------------------------------------------------
-
-    st.subheader(
-        "📈 MARKET CHART"
-    )
-
-    chart_tf = st.selectbox(
-        "Chart timeframe",
-        TIMEFRAMES,
-        index=3,
-    )
-
-    chart_df = calculate_indicators(
-        fetch_ohlcv(
-            symbol,
-            chart_tf
-        )
-    )
-
-    st.plotly_chart(
-        create_chart(
-            chart_df,
-            symbol,
-        ),
-        use_container_width=True,
-    )
-
-    # --------------------------------------------------------
     # VOLUME PROFILE
     # --------------------------------------------------------
 
     st.subheader(
-        "📦 VOLUME PROFILE"
+        "VOLUME PROFILE"
     )
 
     vp = result["volume_profile"]
 
     if vp:
 
-        a, b, c = st.columns(3)
+        x1, x2, x3 = st.columns(3)
 
-        a.metric(
+        x1.metric(
             "POC",
             f"{vp['POC']:,.4f}",
         )
 
-        b.metric(
+        x2.metric(
             "VAH",
             f"{vp['VAH']:,.4f}",
         )
 
-        c.metric(
+        x3.metric(
             "VAL",
             f"{vp['VAL']:,.4f}",
+        )
+
+    else:
+
+        st.warning(
+            "Volume Profile nem számítható."
         )
 
     # --------------------------------------------------------
@@ -1854,24 +2860,53 @@ try:
     # --------------------------------------------------------
 
     st.subheader(
-        "💰 FUNDING RATE"
+        "FUNDING INTELLIGENCE"
     )
 
-    if result["funding"]:
+    if result["funding"].get("available"):
 
         st.metric(
-            "Funding",
+            "Funding rate",
             f"{result['funding']['rate'] * 100:.5f}%",
         )
 
         st.write(
-            result["funding"]["signal"]
+            result["funding"]["state"]
         )
 
     else:
 
         st.warning(
-            "Funding adat nem érhető el."
+            "Funding adat nem elérhető."
+        )
+
+    # --------------------------------------------------------
+    # LIQUIDATION RISK ZONES
+    # --------------------------------------------------------
+
+    st.subheader(
+        "LIQUIDATION RISK ZONES – ESTIMATE"
+    )
+
+    zones = result["liquidation"]
+
+    if zones:
+
+        z1, z2 = st.columns(2)
+
+        z1.metric(
+            "Upper volatility zone",
+            f"{zones['upper_risk_zone']:,.4f}",
+        )
+
+        z2.metric(
+            "Lower volatility zone",
+            f"{zones['lower_risk_zone']:,.4f}",
+        )
+
+        st.caption(
+            "ATR-alapú volatilitási becslés, "
+            "nem tényleges likvidációs heatmap."
         )
 
     # --------------------------------------------------------
@@ -1879,7 +2914,7 @@ try:
     # --------------------------------------------------------
 
     st.subheader(
-        "🌍 MACRO INTELLIGENCE"
+        "MACRO INTELLIGENCE"
     )
 
     if result["macro"]:
@@ -1891,7 +2926,7 @@ try:
             macro_rows.append({
                 "Asset": name,
                 "Value": data["value"],
-                "Daily change (%)": round(
+                "Change (%)": round(
                     data["change"],
                     3,
                 ),
@@ -1906,110 +2941,102 @@ try:
     else:
 
         st.warning(
-            "A makroadatok jelenleg nem érhetők el."
+            "Makroadatok nem érhetők el."
         )
 
     # --------------------------------------------------------
-    # RISK PLAN
+    # CHART
     # --------------------------------------------------------
 
     st.subheader(
-        "🛡️ RISK MANAGEMENT"
+        "PRICE CHART"
     )
 
-    atr = (
-        result["mtf"]["1m"]["ATR"]
-        if "1m" in result["mtf"]
-        else result["mtf"]["5m"]["ATR"]
+    chart_tf = st.selectbox(
+        "Timeframe",
+        TIMEFRAMES,
+        index=3,
     )
 
-    risk_plan = calculate_risk_plan(
-        result["signal"],
+    chart_data = add_indicators(
+        fetch_ohlcv(
+            symbol,
+            chart_tf,
+        )
+    )
+
+    st.plotly_chart(
+        build_chart(
+            chart_data,
+            symbol,
+        ),
+        use_container_width=True,
+    )
+
+    # --------------------------------------------------------
+    # RISK MANAGEMENT
+    # --------------------------------------------------------
+
+    st.subheader(
+        "RISK MANAGEMENT"
+    )
+
+    risk_source = (
+        result["mtf"].get("1h")
+        or result["mtf"].get("15m")
+        or next(iter(result["mtf"].values()))
+    )
+
+    plan = risk_plan(
+        decision["signal"],
         result["price"],
-        atr,
+        risk_source["ATR"],
         capital,
         risk_percent,
         leverage,
     )
 
-    if risk_plan:
+    if plan:
 
         r1, r2, r3 = st.columns(3)
 
         r1.metric(
             "STOP LOSS",
-            f"{risk_plan['stop_loss']:,.4f}",
+            f"{plan['stop_loss']:,.4f}",
         )
 
         r2.metric(
             "TAKE PROFIT",
-            f"{risk_plan['take_profit']:,.4f}",
+            f"{plan['take_profit']:,.4f}",
         )
 
         r3.metric(
             "POSITION SIZE",
-            f"{risk_plan['quantity']:.5f}",
+            f"{plan['quantity']:.5f}",
         )
 
         st.write(
-            f"Notional: {risk_plan['notional']:.2f} USDT"
+            f"Notional: {plan['notional']:.2f} USDT"
         )
 
         st.write(
-            f"Planned risk: {risk_plan['risk_amount']:.2f} USDT"
+            f"Planned risk: {plan['risk_amount']:.2f} USDT"
         )
 
         st.write(
-            f"Risk/Reward: 1:{risk_plan['risk_reward']:.1f}"
+            f"Risk/Reward: 1:{plan['risk_reward']:.2f}"
+        )
+
+        st.caption(
+            "A pozícióméret becslés. A tényleges kötésnél "
+            "figyelembe kell venni a contract size-t, "
+            "a minimum mennyiséget, díjakat és csúszást."
         )
 
     else:
 
         st.info(
-            "Nincs megfelelő LONG vagy SHORT jelzés. "
-            "A rendszer KIVÁRÁS állapotban van, ezért nem készít "
-            "automatikus irányú kockázati tervet."
-        )
-
-    # --------------------------------------------------------
-    # AI ANALYST
-    # --------------------------------------------------------
-
-    st.subheader(
-        "🤖 SALIGA AI ANALYST"
-    )
-
-    if st.button(
-        "Generate AI market report",
-        use_container_width=True,
-    ):
-
-        with st.spinner(
-            "AI market interpretation..."
-        ):
-
-            explanation = groq_explanation(
-                result
-            )
-
-        st.markdown(
-            explanation
-        )
-
-    # --------------------------------------------------------
-    # NEWS
-    # --------------------------------------------------------
-
-    st.subheader(
-        "📰 CRYPTO NEWS"
-    )
-
-    news = fetch_news()
-
-    for item in news:
-
-        st.markdown(
-            f"- [{item['title']}]({item['link']})"
+            "KIVÁRÁS: nincs irányított pozícióterv."
         )
 
     # --------------------------------------------------------
@@ -2017,7 +3044,7 @@ try:
     # --------------------------------------------------------
 
     st.subheader(
-        "💾 SIGNAL JOURNAL"
+        "SIGNAL JOURNAL"
     )
 
     if st.button(
@@ -2025,33 +3052,68 @@ try:
         use_container_width=True,
     ):
 
-        sl = (
-            risk_plan["stop_loss"]
-            if risk_plan
-            else None
-        )
-
-        tp = (
-            risk_plan["take_profit"]
-            if risk_plan
-            else None
-        )
-
         save_signal(
             symbol,
-            result["signal"],
+            decision["signal"],
             result["price"],
-            result["confidence"],
-            result["score"],
-            sl,
-            tp,
+            decision["score"],
+            decision["confidence"],
+            decision["coverage"],
+            plan,
         )
 
         st.success(
-            "Signal successfully saved."
+            "Signal saved."
         )
 
-    journal = get_journal()
+    # --------------------------------------------------------
+    # AI REPORT
+    # --------------------------------------------------------
+
+    st.subheader(
+        "SALIGA AI ANALYST"
+    )
+
+    if st.button(
+        "GENERATE AI REPORT",
+        use_container_width=True,
+    ):
+
+        with st.spinner(
+            "AI analysis..."
+        ):
+
+            report = ai_report(
+                result
+            )
+
+        st.markdown(
+            report
+        )
+
+    # --------------------------------------------------------
+    # NEWS
+    # --------------------------------------------------------
+
+    st.subheader(
+        "CRYPTO NEWS"
+    )
+
+    for item in fetch_news():
+
+        st.markdown(
+            f"- [{item['title']}]({item['link']})"
+        )
+
+    # --------------------------------------------------------
+    # JOURNAL
+    # --------------------------------------------------------
+
+    update_signal_results(
+        symbol
+    )
+
+    journal = load_journal()
 
     if not journal.empty:
 
@@ -2059,17 +3121,6 @@ try:
             journal,
             use_container_width=True,
             hide_index=True,
-        )
-
-        csv = journal.to_csv(
-            index=False
-        ).encode("utf-8")
-
-        st.download_button(
-            "DOWNLOAD JOURNAL CSV",
-            data=csv,
-            file_name="saliga_ai_journal.csv",
-            mime="text/csv",
         )
 
         closed = journal[
@@ -2082,22 +3133,43 @@ try:
                 closed["result_percent"] > 0
             ).sum()
 
-            losses = (
-                closed["result_percent"] <= 0
-            ).sum()
-
-            total = wins + losses
+            total = len(closed)
 
             winrate = (
                 wins / total * 100
-                if total > 0
-                else 0
             )
 
-            st.metric(
-                "JOURNAL WIN RATE",
+            avg_result = (
+                closed["result_percent"].mean()
+            )
+
+            a, b, c = st.columns(3)
+
+            a.metric(
+                "WIN RATE",
                 f"{winrate:.1f}%",
             )
+
+            b.metric(
+                "CLOSED SIGNALS",
+                total,
+            )
+
+            c.metric(
+                "AVERAGE RESULT",
+                f"{avg_result:.3f}%",
+            )
+
+        csv = journal.to_csv(
+            index=False
+        ).encode("utf-8")
+
+        st.download_button(
+            "DOWNLOAD JOURNAL CSV",
+            csv,
+            "saliga_ai_journal.csv",
+            "text/csv",
+        )
 
     # --------------------------------------------------------
     # ERRORS
@@ -2106,23 +3178,12 @@ try:
     if result["errors"]:
 
         with st.expander(
-            "Data warnings"
+            "DATA WARNINGS"
         ):
 
             for error in result["errors"]:
 
                 st.warning(error)
-
-except Exception as e:
-
-    st.error(
-        f"MARKET ANALYSIS ERROR: {str(e)}"
-    )
-
-    st.info(
-        "Ellenőrizd az OKX elérhetőségét, "
-        "a piac nevét és az API-kapcsolatot."
-    )
 
 
 # ============================================================
@@ -2132,7 +3193,7 @@ except Exception as e:
 st.divider()
 
 st.caption(
-    f"{APP_NAME} | Version {APP_VERSION} | "
-    "OKX DATA SOURCE ONLY | "
-    "Analytical software – not financial advice."
+    f"{APP_NAME} | v{VERSION} | "
+    "OKX ONLY | NO EMA | "
+    "Analytical system – not financial advice."
 )
