@@ -1,8 +1,7 @@
 # ============================================================
-# SALIGA AI PRO 17.1
-# OKX MULTI-ASSET MARKET INTELLIGENCE
-# BTC / ETH / SOL
-# M5 / M15 / H1 / H4 / D1
+# SALIGA AI PRO 17.2
+# MULTI-ASSET MARKET INTELLIGENCE
+# OKX DATA + GROQ AI + POSITION FLOW
 # ============================================================
 
 import streamlit as st
@@ -24,12 +23,12 @@ from openai import OpenAI
 # ============================================================
 
 st.set_page_config(
-    page_title="SALIGA AI PRO 17.1",
+    page_title="SALIGA AI PRO 17.2",
     page_icon="⚡",
     layout="wide"
 )
 
-APP_VERSION = "SALIGA AI PRO 17.1"
+APP_VERSION = "SALIGA AI PRO 17.2"
 DB_PATH = "saliga_ai.db"
 
 SYMBOLS = {
@@ -53,7 +52,6 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 MARKET_REFRESH = 60
 OI_HISTORY_INTERVAL = 300
 MIN_SIGNAL_SCORE = 65
-
 HTTP_TIMEOUT = 15
 
 
@@ -65,11 +63,11 @@ DEFAULT_STATE = {
     "last_refresh": 0,
     "analysis_data": {},
     "ai_result": None,
-    "ai_error": None,
-    "chat_answer": None
+    "ai_error": None
 }
 
 for key, value in DEFAULT_STATE.items():
+
     if key not in st.session_state:
         st.session_state[key] = value
 
@@ -120,12 +118,15 @@ def pct_change(current, previous):
     if previous == 0:
         return None
 
-    return ((current - previous) / previous) * 100
+    return (
+        (current - previous) / previous
+    ) * 100
 
 
 def get_secret(name):
 
     try:
+
         value = st.secrets.get(name)
 
         if value:
@@ -137,6 +138,15 @@ def get_secret(name):
     return os.getenv(name)
 
 
+def db_connection():
+
+    return sqlite3.connect(
+        DB_PATH,
+        check_same_thread=False,
+        timeout=30
+    )
+
+
 def safe_close(conn):
 
     try:
@@ -146,16 +156,36 @@ def safe_close(conn):
 
 
 # ============================================================
-# 4. DATABASE
+# 4. DATABASE MIGRATION
 # ============================================================
 
-def db_connection():
+def get_table_columns(cur, table_name):
 
-    return sqlite3.connect(
-        DB_PATH,
-        check_same_thread=False,
-        timeout=20
+    cur.execute(
+        f'PRAGMA table_info("{table_name}")'
     )
+
+    return {
+        row[1]
+        for row in cur.fetchall()
+    }
+
+
+def ensure_columns(cur, table_name, definitions):
+
+    existing = get_table_columns(
+        cur,
+        table_name
+    )
+
+    for column, definition in definitions.items():
+
+        if column not in existing:
+
+            cur.execute(
+                f'ALTER TABLE "{table_name}" '
+                f'ADD COLUMN "{column}" {definition}'
+            )
 
 
 def init_db():
@@ -165,6 +195,10 @@ def init_db():
     try:
 
         cur = conn.cursor()
+
+        # ----------------------------------------------------
+        # CREATE TABLES IF THEY DO NOT EXIST
+        # ----------------------------------------------------
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS oi_history (
@@ -203,6 +237,160 @@ def init_db():
             )
         """)
 
+        # ----------------------------------------------------
+        # MIGRATE OLD OI HISTORY TABLE
+        # ----------------------------------------------------
+
+        ensure_columns(
+            cur,
+            "oi_history",
+            {
+                "asset": "TEXT",
+                "value": "REAL",
+                "unit": "TEXT",
+                "created_at": "TEXT"
+            }
+        )
+
+        oi_columns = get_table_columns(
+            cur,
+            "oi_history"
+        )
+
+        # Copy values from legacy column names.
+
+        legacy_value_columns = [
+            "oi_value",
+            "open_interest",
+            "openInterest",
+            "oi",
+            "amount"
+        ]
+
+        for old_column in legacy_value_columns:
+
+            if old_column in oi_columns:
+
+                cur.execute(
+                    f'''
+                    UPDATE oi_history
+                    SET value = "{old_column}"
+                    WHERE value IS NULL
+                    '''
+                )
+
+                break
+
+        # Migrate old timestamp column if necessary.
+
+        for old_column in [
+            "timestamp",
+            "time",
+            "date"
+        ]:
+
+            if old_column in oi_columns:
+
+                cur.execute(
+                    f'''
+                    UPDATE oi_history
+                    SET created_at = CAST("{old_column}" AS TEXT)
+                    WHERE created_at IS NULL
+                    '''
+                )
+
+                break
+
+        # Migrate possible legacy asset names.
+
+        for old_column in [
+            "symbol",
+            "coin",
+            "instrument"
+        ]:
+
+            if old_column in oi_columns:
+
+                cur.execute(
+                    f'''
+                    UPDATE oi_history
+                    SET asset = "{old_column}"
+                    WHERE asset IS NULL
+                    '''
+                )
+
+                break
+
+        cur.execute("""
+            UPDATE oi_history
+            SET unit = 'UNKNOWN'
+            WHERE unit IS NULL
+        """)
+
+        # ----------------------------------------------------
+        # MIGRATE SIGNAL TABLE
+        # ----------------------------------------------------
+
+        ensure_columns(
+            cur,
+            "signals",
+            {
+                "asset": "TEXT",
+                "timeframe": "TEXT",
+                "direction": "TEXT",
+                "score": "REAL",
+                "entry": "REAL",
+                "stop_loss": "REAL",
+                "tp1": "REAL",
+                "tp2": "REAL",
+                "tp3": "REAL",
+                "status": "TEXT",
+                "created_at": "TEXT"
+            }
+        )
+
+        signal_columns = get_table_columns(
+            cur,
+            "signals"
+        )
+
+        for old_column, new_column in [
+            ("symbol", "asset"),
+            ("tf", "timeframe"),
+            ("side", "direction"),
+            ("sl", "stop_loss"),
+            ("timestamp", "created_at")
+        ]:
+
+            if old_column in signal_columns:
+
+                cur.execute(
+                    f'''
+                    UPDATE signals
+                    SET "{new_column}" = "{old_column}"
+                    WHERE "{new_column}" IS NULL
+                    '''
+                )
+
+        # ----------------------------------------------------
+        # MIGRATE SIGNAL EVENTS TABLE
+        # ----------------------------------------------------
+
+        ensure_columns(
+            cur,
+            "signal_events",
+            {
+                "signal_id": "INTEGER",
+                "event": "TEXT",
+                "price": "REAL",
+                "created_at": "TEXT"
+            }
+        )
+
+        # ----------------------------------------------------
+        # INDEXES
+        # ----------------------------------------------------
+
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_oi_asset
             ON oi_history(asset, id)
@@ -213,9 +401,20 @@ def init_db():
             ON signals(status)
         """)
 
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_signal
+            ON signal_events(signal_id)
+        """)
+
         conn.commit()
 
+    except Exception:
+
+        conn.rollback()
+        raise
+
     finally:
+
         safe_close(conn)
 
 
@@ -273,14 +472,15 @@ def extract_oi_record(record):
 
     for field, unit in fields:
 
-        value = safe_float(record.get(field))
+        value = safe_float(
+            record.get(field)
+        )
 
         if value is not None and value > 0:
 
             return {
                 "value": value,
-                "unit": unit,
-                "raw": record
+                "unit": unit
             }
 
     return None
@@ -304,10 +504,10 @@ def parse_oi_payload(payload):
 
     for record in records:
 
-        extracted = extract_oi_record(record)
+        result = extract_oi_record(record)
 
-        if extracted:
-            return extracted
+        if result:
+            return result
 
     return None
 
@@ -324,7 +524,7 @@ def fetch_okx_oi(asset):
             "value": None,
             "unit": "N/A",
             "source": "FAILED",
-            "error": exchange_error or "OKX unavailable"
+            "error": exchange_error
         }
 
     symbol = SYMBOLS[asset]
@@ -341,7 +541,7 @@ def fetch_okx_oi(asset):
             "value": None,
             "unit": "N/A",
             "source": "FAILED",
-            "error": "Market lookup: " + str(e)
+            "error": str(e)
         }
 
     params = {
@@ -371,7 +571,9 @@ def fetch_okx_oi(asset):
 
             payload = method(params)
 
-            result = parse_oi_payload(payload)
+            result = parse_oi_payload(
+                payload
+            )
 
             if result:
 
@@ -381,16 +583,6 @@ def fetch_okx_oi(asset):
                     "source": "OKX CCXT NATIVE",
                     "error": None
                 }
-
-            errors.append(
-                "CCXT native: no usable OI"
-            )
-
-        else:
-
-            errors.append(
-                "CCXT native method unavailable"
-            )
 
     except Exception as e:
 
@@ -402,11 +594,15 @@ def fetch_okx_oi(asset):
 
     try:
 
-        result = exchange.fetch_open_interest(symbol)
+        result = exchange.fetch_open_interest(
+            symbol
+        )
 
         if isinstance(result, dict):
 
-            extracted = extract_oi_record(result)
+            extracted = extract_oi_record(
+                result
+            )
 
             if extracted:
 
@@ -430,25 +626,6 @@ def fetch_okx_oi(asset):
                     "error": None
                 }
 
-            if isinstance(info, dict):
-
-                for record in info.get("data", []):
-
-                    extracted = extract_oi_record(record)
-
-                    if extracted:
-
-                        return {
-                            "value": extracted["value"],
-                            "unit": extracted["unit"],
-                            "source": "OKX CCXT UNIFIED",
-                            "error": None
-                        }
-
-        errors.append(
-            "CCXT unified: no usable OI"
-        )
-
     except Exception as e:
 
         errors.append(
@@ -462,18 +639,20 @@ def fetch_okx_oi(asset):
         response = requests.get(
             OI_URL,
             params=params,
+            timeout=HTTP_TIMEOUT,
             headers={
                 "Accept": "application/json",
                 "User-Agent": "SALIGA-AI-PRO"
-            },
-            timeout=HTTP_TIMEOUT
+            }
         )
 
         response.raise_for_status()
 
         payload = response.json()
 
-        result = parse_oi_payload(payload)
+        result = parse_oi_payload(
+            payload
+        )
 
         if result:
 
@@ -486,9 +665,7 @@ def fetch_okx_oi(asset):
 
         errors.append(
             "Direct HTTP: "
-            + str(payload.get("code"))
-            + " "
-            + str(payload.get("msg"))
+            + str(payload.get("msg", "No usable data"))
         )
 
     except Exception as e:
@@ -521,8 +698,12 @@ def save_oi_history(asset, value, unit):
         cur = conn.cursor()
 
         cur.execute("""
-            INSERT INTO oi_history
-            (asset, value, unit, created_at)
+            INSERT INTO oi_history (
+                asset,
+                value,
+                unit,
+                created_at
+            )
             VALUES (?, ?, ?, ?)
         """, (
             asset,
@@ -538,7 +719,7 @@ def save_oi_history(asset, value, unit):
         safe_close(conn)
 
 
-def calculate_oi_change(asset, current_value):
+def calculate_oi_change(asset, current_value, unit):
 
     if current_value is None:
         return None
@@ -550,9 +731,10 @@ def calculate_oi_change(asset, current_value):
         cur = conn.cursor()
 
         cur.execute("""
-            SELECT value, created_at
+            SELECT value, unit, created_at
             FROM oi_history
             WHERE asset = ?
+              AND value IS NOT NULL
             ORDER BY id DESC
             LIMIT 100
         """, (asset,))
@@ -568,9 +750,12 @@ def calculate_oi_change(asset, current_value):
 
     current_time = now_utc()
 
-    for value, created_at in rows:
+    for old_value, old_unit, created_at in rows:
 
         try:
+
+            if old_unit != unit:
+                continue
 
             old_time = datetime.fromisoformat(
                 created_at
@@ -590,7 +775,7 @@ def calculate_oi_change(asset, current_value):
 
                 return pct_change(
                     current_value,
-                    float(value)
+                    float(old_value)
                 )
 
         except Exception:
@@ -613,7 +798,6 @@ def fetch_market_data(asset):
             "error": exchange_error or "OKX unavailable",
             "price": None,
             "oi": None,
-            "oi_unit": "N/A",
             "oi_change": None,
             "funding": None,
             "orderbook_imbalance": None
@@ -631,7 +815,9 @@ def fetch_market_data(asset):
 
     try:
 
-        ticker = exchange.fetch_ticker(symbol)
+        ticker = exchange.fetch_ticker(
+            symbol
+        )
 
         result["price"] = safe_float(
             ticker.get("last")
@@ -663,9 +849,8 @@ def fetch_market_data(asset):
 
     except Exception as e:
 
-        result["error"] = "Ticker: " + str(e)
-
         result["price"] = None
+        result["error"] = "Ticker: " + str(e)
 
     # ORDER BOOK
 
@@ -680,13 +865,13 @@ def fetch_market_data(asset):
         asks = orderbook.get("asks", [])
 
         bid_volume = sum(
-            float(item[0]) * float(item[1])
-            for item in bids
+            float(x[0]) * float(x[1])
+            for x in bids
         )
 
         ask_volume = sum(
-            float(item[0]) * float(item[1])
-            for item in asks
+            float(x[0]) * float(x[1])
+            for x in asks
         )
 
         total = bid_volume + ask_volume
@@ -713,7 +898,9 @@ def fetch_market_data(asset):
 
     try:
 
-        funding = exchange.fetch_funding_rate(symbol)
+        funding = exchange.fetch_funding_rate(
+            symbol
+        )
 
         result["funding"] = safe_float(
             funding.get("fundingRate")
@@ -733,11 +920,10 @@ def fetch_market_data(asset):
     result["oi_source"] = oi["source"]
     result["oi_error"] = oi["error"]
 
-    # Calculate change before saving new sample.
-
     result["oi_change"] = calculate_oi_change(
         asset,
-        result["oi"]
+        result["oi"],
+        result["oi_unit"]
     )
 
     if result["oi"] is not None:
@@ -789,22 +975,20 @@ def fetch_candles(asset, timeframe):
             utc=True
         )
 
-        numeric_columns = [
+        for column in [
             "open",
             "high",
             "low",
             "close",
             "volume"
-        ]
+        ]:
 
-        for col in numeric_columns:
-
-            df[col] = pd.to_numeric(
-                df[col],
+            df[column] = pd.to_numeric(
+                df[column],
                 errors="coerce"
             )
 
-        # Exclude currently forming candle.
+        # Exclude the currently forming candle.
 
         if len(df) > 2:
             df = df.iloc[:-1].copy()
@@ -845,23 +1029,19 @@ def calculate_rsi(series, period=14):
         np.nan
     )
 
-    rsi = 100 - (100 / (1 + rs))
-
-    return rsi.fillna(50)
+    return (
+        100 - (100 / (1 + rs))
+    ).fillna(50)
 
 
 def calculate_atr(df, period=14):
 
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-
-    previous_close = close.shift(1)
+    previous_close = df["close"].shift(1)
 
     tr = pd.concat([
-        high - low,
-        (high - previous_close).abs(),
-        (low - previous_close).abs()
+        df["high"] - df["low"],
+        (df["high"] - previous_close).abs(),
+        (df["low"] - previous_close).abs()
     ], axis=1).max(axis=1)
 
     return tr.ewm(
@@ -880,14 +1060,12 @@ def calculate_vwap(df):
 
     volume = df["volume"]
 
-    total_volume = volume.rolling(50).sum()
+    volume_sum = volume.rolling(50).sum()
 
-    vwap = (
+    return (
         (typical * volume).rolling(50).sum()
-        / total_volume.replace(0, np.nan)
+        / volume_sum.replace(0, np.nan)
     )
-
-    return vwap
 
 
 # ============================================================
@@ -907,7 +1085,6 @@ def analyze_structure(df):
         }
 
     last = df.iloc[-1]
-
     previous = df.iloc[-21:-1]
 
     resistance = float(
@@ -918,15 +1095,19 @@ def analyze_structure(df):
         previous["low"].min()
     )
 
-    trend = "NEUTRAL"
+    average_close = previous["close"].mean()
 
-    if last["close"] > previous["close"].mean():
+    if last["close"] > average_close:
 
         trend = "BULLISH"
 
-    elif last["close"] < previous["close"].mean():
+    elif last["close"] < average_close:
 
         trend = "BEARISH"
+
+    else:
+
+        trend = "NEUTRAL"
 
     breakout = "NONE"
 
@@ -972,12 +1153,10 @@ def calculate_estimated_delta(asset):
     if exchange is None:
         return None
 
-    symbol = SYMBOLS[asset]
-
     try:
 
         trades = exchange.fetch_trades(
-            symbol,
+            SYMBOLS[asset],
             limit=300
         )
 
@@ -1065,15 +1244,15 @@ def analyze_timeframe(asset, timeframe):
     score = 0
     reasons = []
 
-    # MOMENTUM
-
     momentum_5 = (
-        (last["close"] / df.iloc[-6]["close"]) - 1
+        last["close"] / df.iloc[-6]["close"] - 1
     ) * 100
 
     momentum_20 = (
-        (last["close"] / df.iloc[-21]["close"]) - 1
+        last["close"] / df.iloc[-21]["close"] - 1
     ) * 100
+
+    # MOMENTUM
 
     if momentum_5 > 0:
 
@@ -1121,7 +1300,9 @@ def analyze_timeframe(asset, timeframe):
 
     # VWAP
 
-    vwap = safe_float(last["vwap"])
+    vwap = safe_float(
+        last["vwap"]
+    )
 
     if vwap is not None:
 
@@ -1146,7 +1327,7 @@ def analyze_timeframe(asset, timeframe):
     if volume_avg is not None and volume_avg > 0:
 
         volume_ratio = (
-            float(last["volume"]) / volume_avg
+            last["volume"] / volume_avg
         )
 
         if volume_ratio > 1.5:
@@ -1161,7 +1342,7 @@ def analyze_timeframe(asset, timeframe):
                 score -= 10
                 reasons.append("Strong bearish volume")
 
-    # MARKET STRUCTURE
+    # STRUCTURE
 
     if structure["breakout"] == "BULLISH BREAKOUT":
 
@@ -1241,8 +1422,8 @@ def determine_position_flow(market, delta):
         return {
             "state": "INSUFFICIENT DATA",
             "description": (
-                "Az OI változás és a becsült delta "
-                "együttes értelmezéséhez nincs elegendő adat."
+                "Nincs elegendő adat az OI és a delta "
+                "együttes értelmezéséhez."
             )
         }
 
@@ -1251,7 +1432,7 @@ def determine_position_flow(market, delta):
         return {
             "state": "LONG BUILDUP",
             "description": (
-                "Növekvő Open Interest és pozitív becsült delta. "
+                "Növekvő OI és pozitív becsült delta. "
                 "Long irányú aktivitásra utalhat."
             )
         }
@@ -1261,7 +1442,7 @@ def determine_position_flow(market, delta):
         return {
             "state": "SHORT BUILDUP",
             "description": (
-                "Növekvő Open Interest és negatív becsült delta. "
+                "Növekvő OI és negatív becsült delta. "
                 "Short irányú aktivitásra utalhat."
             )
         }
@@ -1271,7 +1452,7 @@ def determine_position_flow(market, delta):
         return {
             "state": "SHORT CLOSING / BUYING",
             "description": (
-                "Csökkenő Open Interest és pozitív delta. "
+                "Csökkenő OI és pozitív delta. "
                 "Short zárások is történhetnek."
             )
         }
@@ -1281,7 +1462,7 @@ def determine_position_flow(market, delta):
         return {
             "state": "LONG CLOSING / SELLING",
             "description": (
-                "Csökkenő Open Interest és negatív delta. "
+                "Csökkenő OI és negatív delta. "
                 "Long zárások is történhetnek."
             )
         }
@@ -1317,16 +1498,18 @@ def calculate_market_score(market, delta):
 
     if delta:
 
-        d = delta.get("delta_percent")
+        delta_percent = delta.get(
+            "delta_percent"
+        )
 
-        if d is not None:
+        if delta_percent is not None:
 
-            if d > 5:
+            if delta_percent > 5:
 
                 score += 15
                 factors.append("Positive estimated delta")
 
-            elif d < -5:
+            elif delta_percent < -5:
 
                 score -= 15
                 factors.append("Negative estimated delta")
@@ -1431,18 +1614,17 @@ def run_groq_analysis(data):
         return None, "GROQ_API_KEY is missing"
 
     system_prompt = """
-You are SALIGA AI PRO, a cryptocurrency market
-intelligence analyst.
+You are SALIGA AI PRO, a cryptocurrency
+market intelligence analyst.
 
 Analyze only the supplied OKX market data.
 
 Do not invent missing data.
-Do not treat rising Open Interest alone as proof
-of long or short buildup.
+Do not claim that Open Interest alone proves
+long or short buildup.
 
-Use estimated delta with appropriate caution.
-Order book imbalance is a snapshot, not persistent flow.
-Funding is contextual information, not a standalone signal.
+Estimated delta is not true full-session CVD.
+Order book imbalance is only a snapshot.
 
 Return valid JSON only.
 
@@ -1504,11 +1686,9 @@ Never claim an order was executed.
 
         if not content:
 
-            return None, "Groq returned an empty response"
+            return None, "Groq returned empty response"
 
-        result = json.loads(content)
-
-        return result, None
+        return json.loads(content), None
 
     except Exception as e:
 
@@ -1533,7 +1713,9 @@ def run_analysis_cycle():
 
         market_results[asset] = market
 
-        delta = calculate_estimated_delta(asset)
+        delta = calculate_estimated_delta(
+            asset
+        )
 
         delta_results[asset] = delta
 
@@ -1698,6 +1880,9 @@ def update_signal_status():
 
             try:
 
+                if asset not in SYMBOLS:
+                    continue
+
                 ticker = exchange.fetch_ticker(
                     SYMBOLS[asset]
                 )
@@ -1734,7 +1919,7 @@ def update_signal_status():
                         event = "TP1"
                         new_status = "TP1 HIT"
 
-                else:
+                elif direction == "SHORT":
 
                     if price >= stop:
 
@@ -1758,20 +1943,37 @@ def update_signal_status():
 
                 if event:
 
+                    # Prevent duplicate events.
+
                     cur.execute("""
-                        INSERT INTO signal_events (
+                        SELECT id
+                        FROM signal_events
+                        WHERE signal_id = ?
+                          AND event = ?
+                        LIMIT 1
+                    """, (
+                        signal_id,
+                        event
+                    ))
+
+                    already_exists = cur.fetchone()
+
+                    if not already_exists:
+
+                        cur.execute("""
+                            INSERT INTO signal_events (
+                                signal_id,
+                                event,
+                                price,
+                                created_at
+                            )
+                            VALUES (?, ?, ?, ?)
+                        """, (
                             signal_id,
                             event,
                             price,
-                            created_at
-                        )
-                        VALUES (?, ?, ?, ?)
-                    """, (
-                        signal_id,
-                        event,
-                        price,
-                        timestamp()
-                    ))
+                            timestamp()
+                        ))
 
                     cur.execute("""
                         UPDATE signals
@@ -1826,8 +2028,7 @@ st.caption(
 )
 
 st.caption(
-    f"Version: {APP_VERSION} | "
-    f"UTC: {timestamp()}"
+    f"Version: {APP_VERSION} | UTC: {timestamp()}"
 )
 
 if exchange_error:
@@ -1867,7 +2068,7 @@ with col3:
 
 
 # ============================================================
-# 25. MARKET ANALYSIS REFRESH
+# 25. MARKET REFRESH
 # ============================================================
 
 should_refresh = (
@@ -1883,7 +2084,7 @@ should_refresh = (
 if should_refresh:
 
     with st.spinner(
-        "Downloading OKX data and analyzing BTC, ETH, SOL..."
+        "Analyzing BTC, ETH and SOL using OKX..."
     ):
 
         try:
@@ -1914,13 +2115,19 @@ st.header("📊 MARKET OVERVIEW")
 
 if data:
 
-    market_data = data.get("market", {})
+    market_data = data.get(
+        "market",
+        {}
+    )
 
     cols = st.columns(3)
 
     for index, asset in enumerate(SYMBOLS):
 
-        market = market_data.get(asset, {})
+        market = market_data.get(
+            asset,
+            {}
+        )
 
         with cols[index]:
 
@@ -1931,7 +2138,9 @@ if data:
                 fmt(market.get("price"), 4)
             )
 
-            percentage = market.get("percentage")
+            percentage = market.get(
+                "percentage"
+            )
 
             st.metric(
                 "24h change",
@@ -1943,12 +2152,13 @@ if data:
             )
 
             st.metric(
-                "Open Interest "
-                + str(market.get("oi_unit", "N/A")),
+                "Open Interest",
                 fmt(market.get("oi"), 2)
             )
 
-            oi_change = market.get("oi_change")
+            oi_change = market.get(
+                "oi_change"
+            )
 
             st.metric(
                 "OI change",
@@ -1960,6 +2170,11 @@ if data:
             )
 
             st.caption(
+                "OI unit: "
+                + str(market.get("oi_unit", "N/A"))
+            )
+
+            st.caption(
                 "OI source: "
                 + str(market.get("oi_source", "N/A"))
             )
@@ -1967,7 +2182,7 @@ if data:
             if market.get("oi_error"):
 
                 with st.expander(
-                    "Open Interest diagnostics"
+                    "OI diagnostics"
                 ):
 
                     st.error(
@@ -2081,7 +2296,7 @@ if data:
 
 
 # ============================================================
-# 28. MARKET SCORE
+# 28. MARKET INTELLIGENCE SCORE
 # ============================================================
 
 st.header("📈 MARKET INTELLIGENCE SCORE")
@@ -2227,7 +2442,7 @@ if data:
 
             st.metric(
                 "RSI",
-                fmt(detail["rsi"])
+                fmt(detail.get("rsi"))
             )
 
         st.write(
@@ -2377,8 +2592,8 @@ if st.session_state["ai_result"]:
 else:
 
     st.info(
-        "Press RUN GROQ AI ANALYSIS to generate "
-        "the market intelligence report."
+        "Press RUN GROQ AI ANALYSIS "
+        "to generate the market intelligence report."
     )
 
 
@@ -2471,6 +2686,6 @@ st.caption(
 )
 
 st.caption(
-    "SALIGA AI PRO 17.1 | "
+    "SALIGA AI PRO 17.2 | "
     "Market intelligence, not financial advice."
 )
