@@ -2070,5 +2070,5 @@ st.caption(
 
 st.caption(
     "Az elemzés becsléseket és technikai feltételeket használ. "
-    Nem garantálja a piaci irányt, és nem pénzügyi tanács."
+    "Nem garantálja a piaci irányt, és nem pénzügyi tanács."
 )
