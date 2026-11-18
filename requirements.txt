@@ -1,8 +1,6 @@
-streamlit
-streamlit-autorefresh
-ccxt
-pandas
-numpy
-requests
-plotly
-feedparser
+streamlit>=1.40
+streamlit-autorefresh>=1.0.1
+ccxt>=4.4
+pandas>=2.2
+numpy>=1.26
+openai>=1.50
