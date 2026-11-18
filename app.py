@@ -1,6 +1,6 @@
 # ============================================================
-# SALIGA AI PRO 18.0 (AUTO-REFRESH SIGNAL EDITION)
-# BTC-CENTRIC + AUTO-REFRESH (5 MINS) + MACRO & NEWS + PATTERNS + OI/FUNDING + GROQ AI
+# SALIGA AI PRO 18.1 (PURE PATTERN & HISTORICAL MATCH EDITION)
+# BTC-CENTRIC + AUTO-REFRESH + HISTORICAL PATTERN MATCHING + GROQ AI
 # ============================================================
 
 import streamlit as st
@@ -22,12 +22,12 @@ from openai import OpenAI
 # ============================================================
 
 st.set_page_config(
-    page_title="SALIGA AI PRO 18.0 - AUTO BTC",
+    page_title="SALIGA AI PRO 18.1 - PATTERN MATCH",
     page_icon="⚡",
     layout="wide"
 )
 
-APP_VERSION = "SALIGA AI PRO 18.0"
+APP_VERSION = "SALIGA AI PRO 18.1"
 DB_PATH = "saliga_ai.db"
 
 ASSET = "BTC"
@@ -43,15 +43,12 @@ TIMEFRAMES = {
 OI_URL = "https://www.okx.com/api/v5/public/open-interest"
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-# Alapértelmezett automatikus frissítési időköz (másodpercben). 
-# 300 mp = 5 perc, de a vezérlőpulton átállíthatod.
 DEFAULT_REFRESH_INTERVAL = 300 
-MIN_SIGNAL_SCORE = 65
 HTTP_TIMEOUT = 15
 
 
 # ============================================================
-# 2. SESSION STATE (IDŐZÍTÉS ÉS ÁLLAPOTOK)
+# 2. SESSION STATE
 # ============================================================
 
 DEFAULT_STATE = {
@@ -60,7 +57,8 @@ DEFAULT_STATE = {
     "ai_result": None,
     "ai_error": None,
     "auto_refresh_active": True,
-    "refresh_interval": DEFAULT_REFRESH_INTERVAL
+    "refresh_interval": DEFAULT_REFRESH_INTERVAL,
+    "lookback_candles": 2000  # Hány gyertyát nézzen vissza a történetből
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -261,15 +259,16 @@ def fetch_btc_market_data():
 
 
 # ============================================================
-# 6. ADVANCED PATTERN RECOGNITION (ALAKZATOK)
+# 6. HISTORICAL PATTERN MATCHING ENGINE (TÖBB EZER GYERTYA VISSZANEZÉSE)
 # ============================================================
 
-def fetch_btc_candles(timeframe):
+def fetch_deep_btc_candles(timeframe, limit=2000):
     if exchange is None:
         return None
     try:
-        data = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAMES[timeframe], limit=120)
-        if not data or len(data) < 40:
+        # Az OKX legfeljebb egyszerre 300-1000 gyertyát ad, így lapozással vagy nagyobb limiten kérjük le
+        data = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAMES[timeframe], limit=min(limit, 1500))
+        if not data or len(data) < 50:
             return None
         df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
         for col in ["open", "high", "low", "close", "volume"]:
@@ -278,41 +277,63 @@ def fetch_btc_candles(timeframe):
     except:
         return None
 
-def detect_chart_patterns(df):
-    if df is None or len(df) < 40:
-        return {"pattern": "Nincs elegendő adat", "type": "NEUTRAL", "modifier": 0}
+def find_similar_historical_patterns(df, window_size=15):
+    """
+    Összehasonlítja a legfrissebb mintát a múltbeli gyertyákkal (akár ezer gyertya visszamenőleg),
+    hogy találjon hasonló ármozgási struktúrákat, és kiszámolja a történelmi utókövetési irányt.
+    """
+    if df is None or len(df) < window_size * 3:
+        return {"matched_pattern_desc": "Nincs elegendő adat", "score_modifier": 0, "similarity": 0}
 
-    highs = df["high"].values
-    lows = df["low"].values
     closes = df["close"].values
     
-    recent_high = highs[-15:].max()
-    recent_low = lows[-15:].min()
-    current_price = closes[-1]
-    range_pct = ((recent_high - recent_low) / current_price) * 100
+    # A legutolsó minta (aktuális mozgás) normalize-álva (százalékos elmozdulás a kezdőponthoz képest)
+    recent_window = closes[-window_size:]
+    recent_normalized = (recent_window - recent_window[0]) / recent_window[0]
+
+    best_correlation = -1.0
+    subsequent_movements = []
+
+    # Végigmegyünk a múltbeli gyertyákon (több ezer gyertya visszamenőleg)
+    for i in range(window_size, len(df) - window_size - 5):
+        historical_window = closes[i : i + window_size]
+        hist_normalized = (historical_window - historical_window[0]) / historical_window[0]
+
+        # Korreláció számítása a jelenlegi minta és a múltbeli minta között
+        correlation = np.corrcoef(recent_normalized, hist_normalized)[0, 1]
+        
+        if np.isnan(correlation):
+            continue
+
+        if correlation > best_correlation:
+            best_correlation = correlation
+            # Megnézzük, mi történt a múltban *a minta után* (következő 5 gyertya)
+            future_price_after_pattern = closes[i + window_size + 5]
+            pattern_end_price = historical_window[-1]
+            move_pct = ((future_price_after_pattern - pattern_end_price) / pattern_end_price) * 100
+            subsequent_movements.append(move_pct)
+
+    score_modifier = 0
+    desc = "Gyenge mintaegyezés"
     
-    if range_pct < 2.2:
-        return {"pattern": "⚖️ OLDALAZÁS / KONSZOLIDÁCIÓ", "type": "SIDEWAYS", "modifier": 0}
+    if best_correlation > 0.75 and subsequent_movements:
+        avg_future_move = np.mean(subsequent_movements)
+        if avg_future_move > 0.5:
+            score_modifier = 25
+            desc = f"🟢 Múltbeli minták alapján BIKA folytatás várható (Hasonlóság: {best_correlation*100:.1f}%)"
+        elif avg_future_move < -0.5:
+            score_modifier = -25
+            desc = f"🔴 Múltbeli minták alapján MEDVE esés várható (Hasonlóság: {best_correlation*100:.1f}%)"
+        else:
+            desc = f"⚖️ Oldalazó múltbeli minta (Hasonlóság: {best_correlation*100:.1f}%)"
+    else:
+        desc = f"Nincs erős történelmi egyezés (Legjobb korreláció: {best_correlation*100:.1f}%)"
 
-    window = 5
-    peaks = []
-    troughs = []
-    
-    for i in range(window, len(df) - window):
-        if highs[i] == max(highs[i-window:i+window+1]): peaks.append((i, highs[i]))
-        if lows[i] == min(lows[i-window:i+window+1]): troughs.append((i, lows[i]))
-
-    if len(peaks) >= 2:
-        p1, p2 = peaks[-2], peaks[-1]
-        if abs(p1[1] - p2[1]) / p1[1] <= 0.008:
-            return {"pattern": "🔴 DUPLA CSÚCS (Medve)", "type": "BEARISH", "modifier": -30}
-
-    if len(troughs) >= 2:
-        t1, t2 = troughs[-2], troughs[-1]
-        if abs(t1[1] - t2[1]) / t1[1] <= 0.008:
-            return {"pattern": "🟢 DUPLA ALJ (Bika)", "type": "BULLISH", "modifier": +30}
-
-    return {"pattern": "Normál Trend / Alakzat mentes", "type": "NEUTRAL", "modifier": 0}
+    return {
+        "matched_pattern_desc": desc,
+        "score_modifier": score_modifier,
+        "similarity": float(best_correlation) if not np.isnan(best_correlation) else 0.0
+    }
 
 def analyze_btc_structure(df):
     if df is None or len(df) < 30:
@@ -332,33 +353,21 @@ def analyze_btc_structure(df):
 
     return {"support": support, "resistance": resistance, "status": status, "modifier": modifier}
 
-def analyze_btc_timeframe(timeframe):
-    df = fetch_btc_candles(timeframe)
+def analyze_btc_timeframe(timeframe, lookback_limit):
+    df = fetch_deep_btc_candles(timeframe, limit=lookback_limit)
     if df is None:
         return {"direction": "WAIT", "score": 0, "trend_desc": "Adat hiba"}
 
     last_close = df["close"].iloc[-1]
-    ema_20 = df["close"].ewm(span=20).mean().iloc[-1]
-    ema_50 = df["close"].ewm(span=50).mean().iloc[-1]
-
     score = 0
-    trend_desc = "Semleges"
-    if last_close > ema_20 and ema_20 > ema_50: score, trend_desc = 30, "Erős Bika Trend"
-    elif last_close < ema_20 and ema_20 < ema_50: score, trend_desc = -30, "Erős Medve Trend"
 
-    pattern_info = detect_chart_patterns(df)
-    score += pattern_info["modifier"]
+    # Történelmi minta-összehasonlítás meghívása (több ezer gyertya visszamenőleg)
+    pattern_match = find_similar_historical_patterns(df, window_size=15)
+    score += pattern_match["score_modifier"]
 
+    # Támasz / Ellenállás vizsgálat
     sr = analyze_btc_structure(df)
     score += sr["modifier"]
-
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14).mean()
-    rsi = float(100 - (100 / (1 + (gain / loss.replace(0, np.nan)))).iloc[-1])
-
-    if rsi > 70: score -= 10
-    elif rsi < 30: score += 10
 
     direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "WAIT")
 
@@ -366,10 +375,8 @@ def analyze_btc_timeframe(timeframe):
         "direction": direction,
         "score": score,
         "price": last_close,
-        "rsi": rsi,
-        "trend_desc": trend_desc,
         "sr": sr,
-        "pattern": pattern_info
+        "pattern_match": pattern_match
     }
 
 
@@ -386,20 +393,20 @@ def run_groq_btc_analysis(market_data, tf_data, user_news_input):
 
     payload = {
         "derivatives_market": market_data,
-        "technical_timeframes": tf_data,
+        "historical_pattern_matching": tf_data,
         "macro_and_news_input": user_news_input if user_news_input else "Nincs megadva egyedi hír, értékeld a jelenlegi makro piaci hangulatot."
     }
 
     system_prompt = """
-You are SALIGA AI PRO, an elite Bitcoin (BTC) market intelligence and news sentiment analyst.
-Analyze OKX derivatives (OI, funding rate, delta), S/R levels, chart patterns, and macro inputs.
+You are SALIGA AI PRO, an elite Bitcoin (BTC) historical pattern and news sentiment analyst.
+Analyze OKX derivatives (OI, funding rate, delta), support/resistance levels, historical pattern matching results across thousands of candles, and macro inputs.
 Provide a concise, professional trading intelligence report in valid JSON format only.
 
 Required JSON structure:
 {
   "bias": "BULLISH / BEARISH / NEUTRAL",
   "confidence_score": 85,
-  "executive_summary": "Professional summary combining technicals, patterns, and news/macro sentiment.",
+  "executive_summary": "Professional summary combining historical patterns, S/R, and news/macro sentiment.",
   "news_and_macro_impact": "Detailed breakdown of how current macroeconomic data or news affect BTC price action.",
   "actionable_insight": "Specific recommendation on long/short positioning or waiting.",
   "risks": ["Risk 1", "Risk 2"]
@@ -422,11 +429,11 @@ Required JSON structure:
     except Exception as e:
         return None, str(e)
 
-def run_full_cycle():
+def run_full_cycle(lookback_candles):
     market = fetch_btc_market_data()
     tf_results = {}
     for tf_key in TIMEFRAMES.keys():
-        tf_results[tf_key] = analyze_btc_timeframe(tf_key)
+        tf_results[tf_key] = analyze_btc_timeframe(tf_key, lookback_candles)
     
     return {
         "timestamp": timestamp(),
@@ -439,23 +446,25 @@ def run_full_cycle():
 # 8. STREAMLIT UI (AUTOMATIKUS HÁTTÉRFISSÍTÉSSEL)
 # ============================================================
 
-st.title("⚡ SALIGA AI PRO — BITCOIN (BTC) AUTO-REFRESH RADAR")
-st.caption("OKX OI + FUNDING + ALAKZATOK + MAKRO HÍREK + GROQ AI | AUTOMATIKUS 5 PERCES FRISSÍTÉS")
+st.title("⚡ SALIGA AI PRO 18.1 — HISTORICAL PATTERN BTC RADAR")
+st.caption("OKX OI + FUNDING + VISSZAMENŐLEGES MINTAKERESÉS (TÖBB EZER GYERTYA) + MAKRO HÍREK + GROQ AI")
 
 if exchange_error:
     st.error(f"OKX Hiba: {exchange_error}")
 
-# Vezérlő sáv az automatikus frissítéshez
+# Beállítások a visszamenőleges gyertyák számához
+lookback_candles = st.sidebar.slider("Visszamenőleges gyertyák száma a mintákhoz", min_value=500, max_value=5000, value=st.session_state["lookback_candles"], step=500)
+st.session_state["lookback_candles"] = lookback_candles
+
 c_ctrl1, c_ctrl2, c_ctrl3, c_ctrl4 = st.columns(4)
 with c_ctrl1:
     if st.button("🔄 AZONNALI FRISSÍTÉS", use_container_width=True):
-        st.session_state["btc_analysis"] = run_full_cycle()
+        st.session_state["btc_analysis"] = run_full_cycle(lookback_candles)
         st.session_state["last_refresh"] = time.time()
 with c_ctrl2:
     auto_refresh_active = st.checkbox("🟢 Automatikus Háttérfrissítés", value=st.session_state["auto_refresh_active"])
     st.session_state["auto_refresh_active"] = auto_refresh_active
 with c_ctrl3:
-    # Kiválaszthatod, hogy hány percenként frissítsen (alapból 5 perc = 300 mp)
     refresh_mins = st.selectbox("Frissítési Időköz", [1, 3, 5, 10, 15], index=2)
     st.session_state["refresh_interval"] = refresh_mins * 60
 with c_ctrl4:
@@ -468,10 +477,9 @@ user_news_input = st.text_area(
     placeholder="Pl.: CPI adatok érkeznek ma, a piaci hangulat feszült..."
 )
 
-# Gomb az AI elemzéshez
-if st.button("🧠 GROQ AI MAKRO & HÍR ELEMZÉS Futtatása", use_container_width=True):
+if st.button("🧠 GROQ AI MAKRO & MINTAELEMZÉS Futtatása", use_container_width=True):
     if st.session_state["btc_analysis"]:
-        with st.spinner("Groq AI elemzi a legfrissebb adatokat..."):
+        with st.spinner("Groq AI elemzi a múltbeli mintákat és a friss adatokat..."):
             res, err = run_groq_btc_analysis(
                 st.session_state["btc_analysis"]["market"],
                 st.session_state["btc_analysis"]["timeframes"],
@@ -483,7 +491,7 @@ if st.button("🧠 GROQ AI MAKRO & HÍR ELEMZÉS Futtatása", use_container_widt
         st.warning("Előbb töltsd be az adatokat!")
 
 if not st.session_state["btc_analysis"]:
-    st.session_state["btc_analysis"] = run_full_cycle()
+    st.session_state["btc_analysis"] = run_full_cycle(lookback_candles)
     st.session_state["last_refresh"] = time.time()
 
 data = st.session_state["btc_analysis"]
@@ -519,15 +527,15 @@ with m_col4:
 
 
 # ============================================================
-# 10. ÉLŐ ALAKZAT ÉS S/R RADAR PANEL
+# 10. HISTORICAL PATTERN MATCHING RADAR PANEL
 # ============================================================
 
 st.markdown("---")
-st.header("🎯 ÉLŐ ALAKZAT ÉS IRÁNYVONAL RADAR")
+st.header(f"🎯 TÖRTÉNELMI MINTA-ÖSSZEHASONLÍTÓ RADAR (Visszanézve: {lookback_candles} gyertya)")
 
 h1_info = data.get("timeframes", {}).get("H1", {})
 sr = h1_info.get("sr", {})
-pattern = h1_info.get("pattern", {})
+pattern_match = h1_info.get("pattern_match", {})
 price = market.get("price")
 direction = h1_info.get("direction", "WAIT")
 
@@ -542,15 +550,14 @@ with col_a:
         st.warning("### 🟡 BTC JELZÉS: KIVÁRÁS (WAIT)")
 
     st.metric("Élő BTC Árfolyam", fmt(price, 2))
-    st.metric("H1 Trend Státusz", h1_info.get("trend_desc", "N/A"))
-    st.metric("Kombinált Pontszám (H1)", h1_info.get("score", 0))
+    st.metric("H1 Minta Pontszám", h1_info.get("score", 0))
 
 with col_b:
     st.info(
-        f"🔍 **Felismerett Alakzat:**\n**{pattern.get('pattern', 'N/A')}**\n\n"
+        f"🔍 **Múltbeli Minta Elemzés (H1):**\n"
+        f"{pattern_match.get('matched_pattern_desc', 'N/A')}\n\n"
         f"🧱 **H1 Ellenállás:** `{fmt(sr.get('resistance'), 2)}`\n\n"
-        f"🛡️ **H1 Támasz:** `{fmt(sr.get('support'), 2)}`\n\n"
-        f"📈 **RSI (14):** `{fmt(h1_info.get('rsi'), 1)}`"
+        f"🛡️ **H1 Támasz:** `{fmt(sr.get('support'), 2)}`"
     )
 
 st.markdown("---")
@@ -560,7 +567,7 @@ st.markdown("---")
 # 11. GROQ AI JELENTÉS
 # ============================================================
 
-st.header("🧠 GROQ AI MAKRO & HÍR JELENTÉS")
+st.header("🧠 GROQ AI MINTAELEMZÉSI & MAKRO JELENTÉS")
 
 ai_res = st.session_state["ai_result"]
 ai_err = st.session_state["ai_error"]
@@ -571,14 +578,14 @@ if ai_err:
 if ai_res:
     st.subheader(f"AI Piaci Irány: {ai_res.get('bias', 'N/A')} (Bizalom: {ai_res.get('confidence_score', 'N/A')}%)")
     st.write(f"**Összegzés:** {ai_res.get('executive_summary', '')}")
-    st.info(f"**Makro & Hír Hatás Értékelés:** {ai_res.get('news_and_macro_impact', '')}")
+    st.info(f"**Makro & Történelmi Minta Hatás:** {ai_res.get('news_and_macro_impact', '')}")
     st.success(f"**Ajánlott Művelet:** {ai_res.get('actionable_insight', '')}")
     
     with st.expander("⚠️ Kockázatok"):
         for risk in ai_res.get("risks", []):
             st.write(f"• {risk}")
 else:
-    st.info("Írd be fent a híreket, majd kattints a Groq AI elemzés gombra.")
+    st.info("Írd be fent a híreket (opcionális), majd kattints a Groq AI elemzés gombra.")
 
 
 # ============================================================
@@ -586,31 +593,30 @@ else:
 # ============================================================
 
 st.markdown("---")
-st.subheader("🧭 BTC Időkeretek & Alakzatok Összegzése")
+st.subheader("🧭 BTC Időkeretek & Minta-egyezési Összegzés")
 
 tf_rows = []
 for tf_name in TIMEFRAMES.keys():
     res = data["timeframes"].get(tf_name, {})
-    p_data = res.get("pattern", {})
+    pm = res.get("pattern_match", {})
     tf_rows.append({
         "Időkeret": tf_name,
         "Irány": res.get("direction", "WAIT"),
         "Pontszám": res.get("score", 0),
-        "Felismerett Alakzat": p_data.get("pattern", "N/A"),
-        "Trend": res.get("trend_desc", "N/A"),
-        "RSI": fmt(res.get("rsi"), 1)
+        "Múltbeli Minta Eredmény": pm.get("matched_pattern_desc", "N/A"),
+        "Hasonlóság (Korreláció)": f"{pm.get('similarity', 0)*100:.1f}%"
     })
 
 st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
 
 
 # ============================================================
-# 13. AUTOMATIKUS HÁTTÉRFISSÍTÉSI LOGIKA (IDŐZÍTŐ)
+# 13. AUTOMATIKUS HÁTTÉRFISSÍTÉSI LOGIKA
 # ============================================================
 
 if st.session_state["auto_refresh_active"]:
     interval = st.session_state["refresh_interval"]
     time.sleep(interval)
-    st.session_state["btc_analysis"] = run_full_cycle()
+    st.session_state["btc_analysis"] = run_full_cycle(lookback_candles)
     st.session_state["last_refresh"] = time.time()
     st.rerun()
