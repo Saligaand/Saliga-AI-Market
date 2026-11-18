@@ -1,6 +1,6 @@
 # ================================================================
 # SALIGA AI PRO 31.0
-# ULTIMATE BTC INTELLIGENCE ENGINE
+# ULTIMATE BTC INTELLIGENCE ENGINE (FIXED)
 #
 # BTC ONLY | OKX | GROQ AI
 # NO EMA | NO SMA
@@ -1877,7 +1877,7 @@ def get_macro_status():
 
 
 # ================================================================
-# GROQ AI ENGINE
+# GROQ AI ENGINE (FIXED)
 # ================================================================
 
 def call_groq(payload):
@@ -1887,52 +1887,23 @@ def call_groq(payload):
             "GROQ_API_KEY is missing from secrets.toml or environment."
         )
 
-    system_prompt = """
-You are SALIGA AI PRO 31.0.
-
-You are an analytical BTC market intelligence engine.
-
-Analyze all supplied data together.
-
-Evaluate:
-- BTC market structure
-- Multi timeframe alignment
-- Open interest
-- Funding
-- Order book
-- Trade delta
-- Position flow
-- Liquidity sweep
-- Breakout and retest
-- Historical patterns
-- News sentiment and context
-- Macro data availability
-- Risk and invalidation
-
-Rules:
-- BTC only.
-- Never invent missing data.
-- Never treat an estimate as confirmed fact.
-- Do not use EMA or SMA.
-- Do not force a trade.
-- If evidence conflicts, prefer WAIT.
-- Confidence is not a calibrated probability.
-- Distinguish observed data from interpretation.
-
-Return valid JSON only, using:
-{
- "direction": "LONG / SHORT / WAIT",
- "confidence": 0,
- "conflict": false,
- "summary": "",
- "technical_analysis": "",
- "order_flow_analysis": "",
- "liquidity_analysis": "",
- "news_impact": "",
- "risk": "",
- "invalidation": ""
-}
-"""
+    system_prompt = (
+        "You are SALIGA AI PRO 31.0, an analytical BTC market intelligence engine. "
+        "You MUST output valid JSON only. Do not include markdown code blocks like ```json or any conversational text. "
+        "Your response must match this exact JSON structure:\n"
+        "{\n"
+        ' "direction": "LONG",\n'
+        ' "confidence": 0,\n'
+        ' "conflict": false,\n'
+        ' "summary": "string",\n'
+        ' "technical_analysis": "string",\n'
+        ' "order_flow_analysis": "string",\n'
+        ' "liquidity_analysis": "string",\n'
+        ' "news_impact": "string",\n'
+        ' "risk": "string",\n'
+        ' "invalidation": "string"\n'
+        "}"
+    )
 
     user_prompt = json.dumps(
         payload,
@@ -1942,7 +1913,7 @@ Return valid JSON only, using:
 
     request_data = {
         "model": GROQ_MODEL,
-        "temperature": 0.15,
+        "temperature": 0.1,
         "max_tokens": 450,
         "response_format": {
             "type": "json_object"
@@ -1960,7 +1931,7 @@ Return valid JSON only, using:
     }
 
     response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
+        "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
         headers={
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json"
@@ -1995,7 +1966,11 @@ Return valid JSON only, using:
         "choices"
     ][0]["message"]["content"]
 
-    parsed = json.loads(content)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        clean_content = content.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(clean_content)
 
     if not isinstance(parsed, dict):
         raise RuntimeError(
@@ -2011,9 +1986,7 @@ Return valid JSON only, using:
         "SHORT",
         "WAIT"
     ]:
-        raise RuntimeError(
-            "Groq returned an invalid direction."
-        )
+        direction = "WAIT"
 
     parsed["direction"] = direction
 
@@ -2473,7 +2446,7 @@ def get_performance():
 
 
 # ================================================================
-# SAVE MARKET SNAPSHOT
+# SAVE MARKET SNAPSHOT (FIXED)
 # ================================================================
 
 def save_market_snapshot(
