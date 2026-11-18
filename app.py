@@ -1,7 +1,7 @@
 # ============================================================
-# SALIGA AI PRO 19.2
-# INSTITUTIONAL MARKET INTELLIGENCE
-# OKX + DERIVATIVES + PATTERNS + NEWS AI
+# SALIGA AI PRO 20.0
+# MARKET INTELLIGENCE + AUTOMATIC SIGNAL JOURNAL
+# OKX | DERIVATIVES | PATTERNS | NEWS | GROQ AI
 # ============================================================
 
 import streamlit as st
@@ -24,12 +24,12 @@ from openai import OpenAI
 # ============================================================
 
 st.set_page_config(
-    page_title="SALIGA AI PRO 19.2",
+    page_title="SALIGA AI PRO 20.0",
     page_icon="⚡",
     layout="wide"
 )
 
-APP_VERSION = "19.2"
+APP_VERSION = "20.0"
 
 SYMBOL = "BTC/USDT:USDT"
 INST_ID = "BTC-USDT-SWAP"
@@ -133,8 +133,10 @@ def pct_change(current, previous):
 def get_secret(name):
     try:
         value = st.secrets.get(name)
+
         if value:
             return str(value)
+
     except Exception:
         pass
 
@@ -154,6 +156,7 @@ def db_connection():
 
 
 def init_db():
+
     with db_connection() as conn:
 
         conn.execute("""
@@ -169,16 +172,40 @@ def init_db():
             ON oi_history(created_at)
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signal_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                direction TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                exit_price REAL,
+                entry_time TEXT NOT NULL,
+                exit_time TEXT,
+                result_pct REAL,
+                status TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signal_status
+            ON signal_history(status)
+        """)
+
         conn.commit()
 
 
+# ============================================================
+# 5. OI HISTORY
+# ============================================================
+
 def save_oi(value):
+
     value = safe_float(value)
 
     if value is None:
         return
 
     with db_connection() as conn:
+
         conn.execute(
             """
             INSERT INTO oi_history(value, created_at)
@@ -186,10 +213,12 @@ def save_oi(value):
             """,
             (value, timestamp())
         )
+
         conn.commit()
 
 
 def get_oi_change(current):
+
     current = safe_float(current)
 
     if current is None:
@@ -198,6 +227,7 @@ def get_oi_change(current):
     target = utc_now() - timedelta(minutes=5)
 
     with db_connection() as conn:
+
         rows = conn.execute("""
             SELECT value, created_at
             FROM oi_history
@@ -208,7 +238,9 @@ def get_oi_change(current):
     candidates = []
 
     for value, created_at in rows:
+
         try:
+
             dt = datetime.fromisoformat(created_at)
 
             if dt.tzinfo is None:
@@ -225,18 +257,263 @@ def get_oi_change(current):
 
     old_value, _ = min(
         candidates,
-        key=lambda x: abs((target - x[1]).total_seconds())
+        key=lambda x: abs(
+            (target - x[1]).total_seconds()
+        )
     )
 
     return pct_change(current, old_value)
 
 
 # ============================================================
-# 5. OKX CONNECTION
+# 6. SIGNAL JOURNAL
+# ============================================================
+
+def get_open_signal():
+
+    with db_connection() as conn:
+
+        row = conn.execute("""
+            SELECT id, direction, entry_price, entry_time
+            FROM signal_history
+            WHERE status = 'OPEN'
+            ORDER BY id DESC
+            LIMIT 1
+        """).fetchone()
+
+    return row
+
+
+def open_signal(direction, price):
+
+    if direction not in ("LONG", "SHORT"):
+        return
+
+    price = safe_float(price)
+
+    if price is None or price <= 0:
+        return
+
+    with db_connection() as conn:
+
+        conn.execute("""
+            INSERT INTO signal_history (
+                direction,
+                entry_price,
+                entry_time,
+                status
+            )
+            VALUES (?, ?, ?, 'OPEN')
+        """, (
+            direction,
+            price,
+            timestamp()
+        ))
+
+        conn.commit()
+
+
+def close_signal(
+    signal_id,
+    direction,
+    entry_price,
+    exit_price
+):
+
+    entry_price = safe_float(entry_price)
+    exit_price = safe_float(exit_price)
+
+    if (
+        entry_price is None
+        or exit_price is None
+        or entry_price <= 0
+        or exit_price <= 0
+    ):
+        return
+
+    if direction == "LONG":
+
+        result = (
+            exit_price / entry_price - 1
+        ) * 100
+
+    else:
+
+        result = (
+            entry_price / exit_price - 1
+        ) * 100
+
+    with db_connection() as conn:
+
+        conn.execute("""
+            UPDATE signal_history
+
+            SET
+                exit_price = ?,
+                exit_time = ?,
+                result_pct = ?,
+                status = 'CLOSED'
+
+            WHERE id = ?
+              AND status = 'OPEN'
+        """, (
+            exit_price,
+            timestamp(),
+            result,
+            signal_id
+        ))
+
+        conn.commit()
+
+
+def update_signal_history(direction, price):
+
+    if direction not in ("LONG", "SHORT"):
+        return
+
+    price = safe_float(price)
+
+    if price is None or price <= 0:
+        return
+
+    active = get_open_signal()
+
+    # Nincs nyitott pozíció.
+    if active is None:
+
+        open_signal(direction, price)
+
+        return
+
+    signal_id, old_direction, entry_price, entry_time = active
+
+    # Már ugyanabba az irányba van nyitott pozíció.
+    if old_direction == direction:
+        return
+
+    # Ellentétes jelzés: régi pozíció lezárása.
+    close_signal(
+        signal_id,
+        old_direction,
+        entry_price,
+        price
+    )
+
+    # Új pozíció nyitása.
+    open_signal(
+        direction,
+        price
+    )
+
+
+def get_signal_statistics():
+
+    with db_connection() as conn:
+
+        rows = conn.execute("""
+            SELECT direction, result_pct
+            FROM signal_history
+            WHERE status = 'CLOSED'
+        """).fetchall()
+
+    results = [
+        (direction, float(result))
+        for direction, result in rows
+        if result is not None
+    ]
+
+    if not results:
+
+        return {
+            "total": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0,
+            "total_result": 0,
+            "long_win_rate": 0,
+            "short_win_rate": 0,
+            "long_count": 0,
+            "short_count": 0
+        }
+
+    wins = sum(
+        1 for _, result in results
+        if result > 0
+    )
+
+    losses = sum(
+        1 for _, result in results
+        if result <= 0
+    )
+
+    long_results = [
+        result
+        for direction, result in results
+        if direction == "LONG"
+    ]
+
+    short_results = [
+        result
+        for direction, result in results
+        if direction == "SHORT"
+    ]
+
+    def calculate_win_rate(values):
+
+        if not values:
+            return 0
+
+        return (
+            sum(1 for x in values if x > 0)
+            / len(values)
+        ) * 100
+
+    return {
+        "total": len(results),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": wins / len(results) * 100,
+        "total_result": sum(
+            result for _, result in results
+        ),
+        "long_win_rate": calculate_win_rate(
+            long_results
+        ),
+        "short_win_rate": calculate_win_rate(
+            short_results
+        ),
+        "long_count": len(long_results),
+        "short_count": len(short_results)
+    }
+
+
+def get_signal_history():
+
+    with db_connection() as conn:
+
+        return pd.read_sql_query("""
+            SELECT
+                id AS ID,
+                direction AS IRANY,
+                entry_price AS BELEPESI_AR,
+                exit_price AS ZARASI_AR,
+                entry_time AS NYITAS_IDEJE,
+                exit_time AS ZARAS_IDEJE,
+                result_pct AS EREDMENY_SZAZALEK,
+                status AS ALLAPOT
+            FROM signal_history
+            ORDER BY id DESC
+            LIMIT 1000
+        """, conn)
+
+
+# ============================================================
+# 7. OKX CONNECTION
 # ============================================================
 
 @st.cache_resource
 def get_exchange():
+
     exchange = ccxt.okx({
         "enableRateLimit": True,
         "timeout": 20000,
@@ -246,6 +523,7 @@ def get_exchange():
     })
 
     exchange.load_markets()
+
     return exchange
 
 
@@ -254,7 +532,7 @@ def get_market_info(exchange):
 
 
 # ============================================================
-# 6. DIRECT OKX API
+# 8. OKX DIRECT API
 # ============================================================
 
 def okx_request(endpoint, params=None):
@@ -274,13 +552,16 @@ def okx_request(endpoint, params=None):
 
     try:
         payload = response.json()
+
     except Exception:
+
         raise RuntimeError(
             "Az OKX nem JSON választ adott: "
             + response.text[:300]
         )
 
     if str(payload.get("code")) != "0":
+
         raise RuntimeError(
             "OKX API hiba: "
             + str(payload.get("code"))
@@ -292,7 +573,7 @@ def okx_request(endpoint, params=None):
 
 
 # ============================================================
-# 7. ORDER BOOK ENGINE - VERSION 19.2
+# 9. ORDER BOOK
 # ============================================================
 
 def parse_book_levels(levels):
@@ -379,12 +660,12 @@ def fetch_orderbook_direct(exchange):
 
     if not bids:
         raise RuntimeError(
-            "Az OKX válaszában nincs feldolgozható BID adat."
+            "Nincs feldolgozható BID adat."
         )
 
     if not asks:
         raise RuntimeError(
-            "Az OKX válaszában nincs feldolgozható ASK adat."
+            "Nincs feldolgozható ASK adat."
         )
 
     imbalance, bid_value, ask_value = (
@@ -397,7 +678,7 @@ def fetch_orderbook_direct(exchange):
 
     if imbalance is None:
         raise RuntimeError(
-            "Az ajánlati könyv összértéke nulla."
+            "Az order book összértéke nulla."
         )
 
     return {
@@ -467,8 +748,6 @@ def fetch_orderbook(exchange):
 
     errors = []
 
-    # 1. Közvetlen OKX API
-
     try:
         return fetch_orderbook_direct(exchange)
 
@@ -476,8 +755,6 @@ def fetch_orderbook(exchange):
         errors.append(
             "DIRECT REST: " + str(e)
         )
-
-    # 2. CCXT tartalék
 
     try:
         return fetch_orderbook_ccxt(exchange)
@@ -500,7 +777,7 @@ def fetch_orderbook(exchange):
 
 
 # ============================================================
-# 8. PRICE + VOLUME
+# 10. PRICE + VOLUME
 # ============================================================
 
 def fetch_price_data(exchange):
@@ -543,26 +820,34 @@ def fetch_price_data(exchange):
     volume_source = None
 
     if quote_volume is not None:
+
         volume_usdt = quote_volume
         volume_source = "OKX volCcyQuote24h"
 
     elif base_volume is not None and price is not None:
+
         volume_usdt = base_volume * price
         volume_source = "OKX volCcy24h * price"
 
     elif unified_quote is not None:
+
         volume_usdt = unified_quote
         volume_source = "CCXT quoteVolume"
 
     elif unified_base is not None and price is not None:
+
         volume_usdt = unified_base * price
         volume_source = "CCXT baseVolume * price"
 
     elif contract_volume is not None and price is not None:
+
         volume_usdt = (
             contract_volume * contract_size * price
         )
-        volume_source = "OKX vol24h * contractSize * price"
+
+        volume_source = (
+            "OKX vol24h * contractSize * price"
+        )
 
     return {
         "price": price,
@@ -581,7 +866,7 @@ def fetch_price_data(exchange):
 
 
 # ============================================================
-# 9. OPEN INTEREST
+# 11. OPEN INTEREST
 # ============================================================
 
 def fetch_open_interest(exchange):
@@ -614,7 +899,7 @@ def fetch_open_interest(exchange):
 
 
 # ============================================================
-# 10. FUNDING
+# 12. FUNDING
 # ============================================================
 
 def fetch_funding(exchange):
@@ -634,7 +919,7 @@ def fetch_funding(exchange):
 
 
 # ============================================================
-# 11. TRADE DELTA
+# 13. TRADE DELTA
 # ============================================================
 
 def fetch_trade_delta(exchange):
@@ -685,6 +970,7 @@ def fetch_trade_delta(exchange):
     delta = None
 
     if total > 0:
+
         delta = (
             (buy_amount - sell_amount) / total
         ) * 100
@@ -699,7 +985,7 @@ def fetch_trade_delta(exchange):
 
 
 # ============================================================
-# 12. COMPLETE MARKET DATA
+# 14. COMPLETE MARKET DATA
 # ============================================================
 
 def fetch_market_data(exchange):
@@ -721,12 +1007,14 @@ def fetch_market_data(exchange):
     for name, function in tasks:
 
         try:
+
             data = function(exchange)
 
             if isinstance(data, dict):
                 result.update(data)
 
         except Exception as e:
+
             result["errors"].append(
                 name + ": " + str(e)
             )
@@ -734,16 +1022,20 @@ def fetch_market_data(exchange):
     oi = result.get("oi_usd")
 
     if oi is not None:
+
         result["oi_change"] = get_oi_change(oi)
+
         save_oi(oi)
+
     else:
+
         result["oi_change"] = None
 
     return result
 
 
 # ============================================================
-# 13. DERIVATIVES ANALYSIS
+# 15. DERIVATIVES ANALYSIS
 # ============================================================
 
 def derivatives_analysis(market):
@@ -760,25 +1052,33 @@ def derivatives_analysis(market):
     if oi is not None and price is not None:
 
         if oi > 0.5 and price > 0:
+
             score += 10
+
             notes.append(
                 "Ár emelkedik + OI nő: új pozíciók épülhetnek."
             )
 
         elif oi > 0.5 and price < 0:
+
             score -= 10
+
             notes.append(
                 "Ár esik + OI nő: új short pozíciók épülhetnek."
             )
 
         elif oi < -0.5 and price > 0:
+
             score += 4
+
             notes.append(
                 "Emelkedő ár + csökkenő OI: shortzárás lehetséges."
             )
 
         elif oi < -0.5 and price < 0:
+
             score -= 4
+
             notes.append(
                 "Eső ár + csökkenő OI: longzárás lehetséges."
             )
@@ -786,13 +1086,17 @@ def derivatives_analysis(market):
     if funding is not None:
 
         if funding > 0.0008:
+
             score -= 4
+
             notes.append(
                 "Magas pozitív funding."
             )
 
         elif funding < -0.0003:
+
             score += 4
+
             notes.append(
                 "Negatív funding."
             )
@@ -800,13 +1104,17 @@ def derivatives_analysis(market):
     if delta is not None:
 
         if delta > 8:
+
             score += 8
+
             notes.append(
                 "Vételi agresszió a legutóbbi ügyletekben."
             )
 
         elif delta < -8:
+
             score -= 8
+
             notes.append(
                 "Eladói agresszió a legutóbbi ügyletekben."
             )
@@ -814,13 +1122,17 @@ def derivatives_analysis(market):
     if imbalance is not None:
 
         if imbalance > 15:
+
             score += 4
+
             notes.append(
                 "Pillanatnyi vételi túlsúly az order bookban."
             )
 
         elif imbalance < -15:
+
             score -= 4
+
             notes.append(
                 "Pillanatnyi eladói túlsúly az order bookban."
             )
@@ -832,7 +1144,7 @@ def derivatives_analysis(market):
 
 
 # ============================================================
-# 14. MARKET STRUCTURE
+# 16. MARKET STRUCTURE
 # ============================================================
 
 def analyze_structure(df):
@@ -847,6 +1159,7 @@ def analyze_structure(df):
         }
 
     last = df.iloc[-1]
+
     previous = df.iloc[-21:-1]
 
     support = float(
@@ -857,7 +1170,9 @@ def analyze_structure(df):
         previous["high"].max()
     )
 
-    close = float(last["close"])
+    close = float(
+        last["close"]
+    )
 
     if close > resistance:
 
@@ -883,7 +1198,7 @@ def analyze_structure(df):
 
 
 # ============================================================
-# 15. MOMENTUM
+# 17. MOMENTUM
 # ============================================================
 
 def analyze_momentum(df):
@@ -934,7 +1249,7 @@ def analyze_momentum(df):
 
 
 # ============================================================
-# 16. HISTORICAL PATTERNS
+# 18. HISTORICAL PATTERNS
 # ============================================================
 
 def find_historical_patterns(
@@ -962,6 +1277,7 @@ def find_historical_patterns(
     recent = closes[-window:]
 
     recent = recent / recent[0] - 1
+
     recent = recent - np.mean(recent)
 
     std = np.std(recent)
@@ -1009,6 +1325,7 @@ def find_historical_patterns(
             continue
 
         end_index = i + window - 1
+
         future_index = end_index + horizon
 
         future_move = pct_change(
@@ -1017,6 +1334,7 @@ def find_historical_patterns(
         )
 
         if future_move is not None:
+
             candidates.append(
                 (correlation, future_move)
             )
@@ -1067,18 +1385,32 @@ def find_historical_patterns(
     if len(returns) >= 5:
 
         if up >= 60 and average > 0:
+
             score = 12
-            description = "BULLISH HISTORICAL PATTERN"
+
+            description = (
+                "BULLISH HISTORICAL PATTERN"
+            )
 
         elif down >= 60 and average < 0:
+
             score = -12
-            description = "BEARISH HISTORICAL PATTERN"
+
+            description = (
+                "BEARISH HISTORICAL PATTERN"
+            )
 
         else:
-            description = "MIXED HISTORICAL PATTERN"
+
+            description = (
+                "MIXED HISTORICAL PATTERN"
+            )
 
     else:
-        description = "LIMITED HISTORICAL SAMPLE"
+
+        description = (
+            "LIMITED HISTORICAL SAMPLE"
+        )
 
     return {
         "score": score,
@@ -1093,7 +1425,7 @@ def find_historical_patterns(
 
 
 # ============================================================
-# 17. ATR
+# 19. ATR
 # ============================================================
 
 def calculate_atr(df, period=14):
@@ -1103,6 +1435,7 @@ def calculate_atr(df, period=14):
 
     high = df["high"]
     low = df["low"]
+
     previous_close = df["close"].shift(1)
 
     tr = pd.concat([
@@ -1118,11 +1451,13 @@ def calculate_atr(df, period=14):
     if pd.isna(atr) or close == 0:
         return None
 
-    return float(atr / close * 100)
+    return float(
+        atr / close * 100
+    )
 
 
 # ============================================================
-# 18. POSITION FLOW
+# 20. POSITION FLOW
 # ============================================================
 
 def analyze_position_flow(market):
@@ -1158,7 +1493,7 @@ def analyze_position_flow(market):
 
 
 # ============================================================
-# 19. CANDLE DOWNLOAD
+# 21. CANDLE DOWNLOAD
 # ============================================================
 
 def fetch_candles(exchange, timeframe, requested):
@@ -1235,6 +1570,7 @@ def fetch_candles(exchange, timeframe, requested):
         "close",
         "volume"
     ]:
+
         df[col] = pd.to_numeric(
             df[col],
             errors="coerce"
@@ -1242,6 +1578,7 @@ def fetch_candles(exchange, timeframe, requested):
 
     df = df.dropna()
 
+    # A még nyitott gyertyát nem használjuk.
     if len(df) > 1:
         df = df.iloc[:-1]
 
@@ -1249,7 +1586,7 @@ def fetch_candles(exchange, timeframe, requested):
 
 
 # ============================================================
-# 20. TIMEFRAME ANALYSIS
+# 22. TIMEFRAME ANALYSIS
 # ============================================================
 
 def analyze_timeframe(
@@ -1267,6 +1604,7 @@ def analyze_timeframe(
     )
 
     if df is None:
+
         return {
             "direction": "WAIT",
             "score": 0,
@@ -1274,7 +1612,9 @@ def analyze_timeframe(
         }
 
     structure = analyze_structure(df)
+
     momentum = analyze_momentum(df)
+
     pattern = find_historical_patterns(df)
 
     deriv_score = (
@@ -1291,10 +1631,15 @@ def analyze_timeframe(
     )
 
     if score >= 20:
+
         direction = "LONG"
+
     elif score <= -20:
+
         direction = "SHORT"
+
     else:
+
         direction = "WAIT"
 
     return {
@@ -1312,7 +1657,7 @@ def analyze_timeframe(
 
 
 # ============================================================
-# 21. NEWS
+# 23. NEWS
 # ============================================================
 
 def fetch_news():
@@ -1356,16 +1701,23 @@ def fetch_news():
     unique = {}
 
     for item in headlines:
-        unique[item["title"].lower().strip()] = item
+
+        unique[
+            item["title"].lower().strip()
+        ] = item
 
     return list(unique.values())[:20]
 
 
 # ============================================================
-# 22. GROQ AI
+# 24. GROQ AI
 # ============================================================
 
-def run_groq_analysis(market, timeframe_data, news):
+def run_groq_analysis(
+    market,
+    timeframe_data,
+    news
+):
 
     key = get_secret("GROQ_API_KEY")
 
@@ -1409,6 +1761,7 @@ Do not invent macroeconomic releases.
 Distinguish facts from interpretations.
 If evidence conflicts, explain the conflict.
 If evidence is weak, recommend WAIT.
+
 The confidence score is an AI assessment,
 not a statistically calibrated probability.
 
@@ -1453,16 +1806,19 @@ Return valid JSON only:
             }
         )
 
-        content = response.choices[0].message.content
+        content = (
+            response.choices[0].message.content
+        )
 
         return json.loads(content), None
 
     except Exception as e:
+
         return None, str(e)
 
 
 # ============================================================
-# 23. FULL ANALYSIS
+# 25. FULL ANALYSIS CYCLE
 # ============================================================
 
 def run_full_cycle(lookback):
@@ -1503,32 +1859,59 @@ def run_full_cycle(lookback):
         news
     )
 
+    # --------------------------------------------------------
+    # AUTOMATIC SIGNAL JOURNAL
+    # H1 signal controls virtual position tracking.
+    # --------------------------------------------------------
+
+    h1 = timeframe_data.get("H1", {})
+
+    signal_direction = h1.get(
+        "direction",
+        "WAIT"
+    )
+
+    current_price = market.get("price")
+
+    update_signal_history(
+        signal_direction,
+        current_price
+    )
+
+    # --------------------------------------------------------
+
     st.session_state["market"] = market
+
     st.session_state["timeframes"] = timeframe_data
+
     st.session_state["news"] = news
+
     st.session_state["ai"] = ai
+
     st.session_state["ai_error"] = ai_error
+
     st.session_state["last_refresh"] = timestamp()
+
     st.session_state["last_refresh_epoch"] = time.time()
 
 
 # ============================================================
-# 24. STREAMLIT UI
+# 26. INITIALIZE
 # ============================================================
 
 init_db()
 
-st.title("⚡ SALIGA AI PRO 19.2")
+st.title("⚡ SALIGA AI PRO 20.0")
 
 st.caption(
-    "INSTITUTIONAL MARKET INTELLIGENCE | "
-    "DERIVATIVES | POSITION FLOW | "
-    "PATTERNS | NEWS AI"
+    "MARKET INTELLIGENCE | DERIVATIVES | "
+    "POSITION FLOW | PATTERNS | NEWS AI | "
+    "AUTOMATIC SIGNAL HISTORY"
 )
 
 
 # ============================================================
-# 25. SIDEBAR
+# 27. SIDEBAR
 # ============================================================
 
 with st.sidebar:
@@ -1563,7 +1946,7 @@ with st.sidebar:
 
 
 # ============================================================
-# 26. INITIAL LOAD
+# 28. INITIAL LOAD
 # ============================================================
 
 if (
@@ -1571,93 +1954,133 @@ if (
     or manual_refresh
 ):
 
-    with st.spinner("SALIGA AI MARKET ANALYSIS..."):
+    with st.spinner(
+        "SALIGA AI MARKET ANALYSIS..."
+    ):
 
         try:
+
             run_full_cycle(lookback)
 
         except Exception as e:
-            st.error(str(e))
+
+            st.error(
+                "Analysis error: " + str(e)
+            )
 
 
 market = st.session_state["market"]
+
 timeframes = st.session_state["timeframes"]
+
 news = st.session_state["news"]
+
 ai = st.session_state["ai"]
 
 
 # ============================================================
-# 27. MARKET DASHBOARD
+# 29. MARKET DASHBOARD
 # ============================================================
 
 st.markdown("---")
+
 st.header("📊 BTC MARKET DATA")
 
 c1, c2, c3, c4, c5 = st.columns(5)
 
 with c1:
+
     st.metric(
         "BTC PRICE",
         "$" + fmt(market.get("price"))
     )
 
 with c2:
+
     value = market.get("change_24h")
+
     st.metric(
         "24H CHANGE",
-        fmt(value) + "%" if value is not None else "N/A"
+        fmt(value) + "%"
+        if value is not None
+        else "N/A"
     )
 
 with c3:
+
     st.metric(
         "OPEN INTEREST",
-        "$" + fmt(market.get("oi_usd"), 0)
+        "$" + fmt(
+            market.get("oi_usd"),
+            0
+        )
     )
 
 with c4:
+
     value = market.get("oi_change")
+
     st.metric(
         "OI CHANGE",
-        fmt(value, 3) + "%" if value is not None else "N/A"
+        fmt(value, 3) + "%"
+        if value is not None
+        else "N/A"
     )
 
 with c5:
+
     value = market.get("funding_rate")
+
     st.metric(
         "FUNDING RATE",
-        fmt(value * 100, 4) + "%" if value is not None else "N/A"
+        fmt(value * 100, 4) + "%"
+        if value is not None
+        else "N/A"
     )
 
 
 c6, c7, c8 = st.columns(3)
 
 with c6:
+
     value = market.get("delta_percent")
+
     st.metric(
         "TRADE DELTA",
-        fmt(value) + "%" if value is not None else "N/A"
+        fmt(value) + "%"
+        if value is not None
+        else "N/A"
     )
 
 with c7:
+
     value = market.get("orderbook_imbalance")
+
     st.metric(
         "ORDER BOOK",
-        fmt(value) + "%" if value is not None else "N/A"
+        fmt(value) + "%"
+        if value is not None
+        else "N/A"
     )
 
 with c8:
+
     value = market.get("volume_24h")
+
     st.metric(
         "24H VOLUME",
-        "$" + fmt(value, 0) if value is not None else "N/A"
+        "$" + fmt(value, 0)
+        if value is not None
+        else "N/A"
     )
 
 
 # ============================================================
-# 28. ORDER BOOK DIAGNOSTICS
+# 30. ORDER BOOK DIAGNOSTICS
 # ============================================================
 
 st.markdown("---")
+
 st.header("📚 ORDER BOOK DIAGNOSTICS")
 
 if market.get("orderbook_imbalance") is not None:
@@ -1704,26 +2127,16 @@ else:
         )
     )
 
-    st.warning(
-        "A fenti hibaüzenet mutatja meg, "
-        "miért nem érkezett ajánlati könyv adat."
-    )
-
-
-# ============================================================
-# 29. VOLUME DIAGNOSTICS
-# ============================================================
 
 st.subheader("24H VOLUME SOURCE")
 
 st.write(
-    market.get("volume_source", "N/A")
+    market.get(
+        "volume_source",
+        "N/A"
+    )
 )
 
-
-# ============================================================
-# 30. OTHER DATA ERRORS
-# ============================================================
 
 if market.get("errors"):
 
@@ -1738,6 +2151,7 @@ if market.get("errors"):
 # ============================================================
 
 st.markdown("---")
+
 st.header("🏦 POSITION FLOW INTELLIGENCE")
 
 st.info(
@@ -1752,6 +2166,7 @@ st.metric(
 )
 
 for note in derivatives["notes"]:
+
     st.write("• " + note)
 
 
@@ -1760,27 +2175,42 @@ for note in derivatives["notes"]:
 # ============================================================
 
 st.markdown("---")
+
 st.header("🎯 BTC INTELLIGENCE RADAR")
 
 h1 = timeframes.get("H1", {})
 
-direction = h1.get("direction", "WAIT")
-score = h1.get("score", 0)
+direction = h1.get(
+    "direction",
+    "WAIT"
+)
+
+score = h1.get(
+    "score",
+    0
+)
 
 if direction == "LONG":
+
     st.success("🟢 BTC LONG BIAS")
 
 elif direction == "SHORT":
+
     st.error("🔴 BTC SHORT BIAS")
 
 else:
+
     st.warning("🟡 BTC WAIT / NEUTRAL")
+
 
 left, right = st.columns(2)
 
 with left:
 
-    st.metric("H1 SCORE", score)
+    st.metric(
+        "H1 SCORE",
+        score
+    )
 
     st.metric(
         "BTC PRICE",
@@ -1796,11 +2226,16 @@ with left:
 
 with right:
 
-    structure = h1.get("structure", {})
+    structure = h1.get(
+        "structure",
+        {}
+    )
 
     st.write(
         "STRUCTURE: "
-        + str(structure.get("status", "N/A"))
+        + str(
+            structure.get("status", "N/A")
+        )
     )
 
     st.write(
@@ -1819,42 +2254,65 @@ with right:
 # ============================================================
 
 st.markdown("---")
+
 st.header("🧩 HISTORICAL PATTERN INTELLIGENCE")
 
-pattern = h1.get("pattern", {})
+pattern = h1.get(
+    "pattern",
+    {}
+)
 
 p1, p2, p3, p4 = st.columns(4)
 
 with p1:
+
     value = pattern.get("up_rate")
+
     st.metric(
         "BULLISH OUTCOMES",
-        fmt(value) + "%" if value is not None else "N/A"
+        fmt(value) + "%"
+        if value is not None
+        else "N/A"
     )
 
 with p2:
+
     value = pattern.get("down_rate")
+
     st.metric(
         "BEARISH OUTCOMES",
-        fmt(value) + "%" if value is not None else "N/A"
+        fmt(value) + "%"
+        if value is not None
+        else "N/A"
     )
 
 with p3:
+
     value = pattern.get("flat_rate")
+
     st.metric(
         "SIDEWAYS OUTCOMES",
-        fmt(value) + "%" if value is not None else "N/A"
+        fmt(value) + "%"
+        if value is not None
+        else "N/A"
     )
 
 with p4:
+
     value = pattern.get("average_move")
+
     st.metric(
         "AVERAGE MOVE",
-        fmt(value, 3) + "%" if value is not None else "N/A"
+        fmt(value, 3) + "%"
+        if value is not None
+        else "N/A"
     )
 
 st.write(
-    pattern.get("description", "N/A")
+    pattern.get(
+        "description",
+        "N/A"
+    )
 )
 
 st.write(
@@ -1879,29 +2337,76 @@ st.write(
 # ============================================================
 
 st.markdown("---")
+
 st.header("🧭 MULTI-TIMEFRAME INTELLIGENCE")
 
 rows = []
 
 for name in TIMEFRAMES:
 
-    data = timeframes.get(name, {})
+    data = timeframes.get(
+        name,
+        {}
+    )
 
-    structure = data.get("structure", {})
-    momentum = data.get("momentum", {})
-    pattern_data = data.get("pattern", {})
+    structure = data.get(
+        "structure",
+        {}
+    )
+
+    momentum = data.get(
+        "momentum",
+        {}
+    )
+
+    pattern_data = data.get(
+        "pattern",
+        {}
+    )
 
     rows.append({
+
         "TIMEFRAME": name,
-        "DIRECTION": data.get("direction", "WAIT"),
-        "SCORE": data.get("score", 0),
-        "CANDLES": data.get("candles_loaded", 0),
-        "STRUCTURE": structure.get("status", "N/A"),
-        "MOMENTUM 5": momentum.get("return_5"),
-        "MOMENTUM 20": momentum.get("return_20"),
-        "PATTERN SCORE": pattern_data.get("score", 0),
-        "ATR %": data.get("atr_percent")
+
+        "DIRECTION": data.get(
+            "direction",
+            "WAIT"
+        ),
+
+        "SCORE": data.get(
+            "score",
+            0
+        ),
+
+        "CANDLES": data.get(
+            "candles_loaded",
+            0
+        ),
+
+        "STRUCTURE": structure.get(
+            "status",
+            "N/A"
+        ),
+
+        "MOMENTUM 5": momentum.get(
+            "return_5"
+        ),
+
+        "MOMENTUM 20": momentum.get(
+            "return_20"
+        ),
+
+        "PATTERN SCORE": pattern_data.get(
+            "score",
+            0
+        ),
+
+        "ATR %": data.get(
+            "atr_percent"
+        )
+
     })
+
 
 st.dataframe(
     pd.DataFrame(rows),
@@ -1911,25 +2416,219 @@ st.dataframe(
 
 
 # ============================================================
-# 35. GROQ AI REPORT
+# 35. AUTOMATIC SIGNAL PERFORMANCE JOURNAL
 # ============================================================
 
 st.markdown("---")
+
+st.header("📒 SALIGA AI – SIGNAL PERFORMANCE HISTORY")
+
+st.caption(
+    "Automatikusan naplózott virtuális H1 pozíciók."
+)
+
+stats = get_signal_statistics()
+
+a, b, c, d = st.columns(4)
+
+with a:
+
+    st.metric(
+        "LEZÁRT POZÍCIÓK",
+        stats["total"]
+    )
+
+with b:
+
+    st.metric(
+        "NYERŐ",
+        stats["wins"]
+    )
+
+with c:
+
+    st.metric(
+        "VESZTES",
+        stats["losses"]
+    )
+
+with d:
+
+    st.metric(
+        "WIN RATE",
+        f'{stats["win_rate"]:.2f}%'
+    )
+
+
+e, f, g = st.columns(3)
+
+with e:
+
+    st.metric(
+        "LONG WIN RATE",
+        f'{stats["long_win_rate"]:.2f}%'
+    )
+
+with f:
+
+    st.metric(
+        "SHORT WIN RATE",
+        f'{stats["short_win_rate"]:.2f}%'
+    )
+
+with g:
+
+    st.metric(
+        "ÖSSZESÍTETT EREDMÉNY",
+        f'{stats["total_result"]:+.3f}%'
+    )
+
+
+# Aktuális nyitott virtuális pozíció
+
+active = get_open_signal()
+
+st.subheader("AKTUÁLIS POZÍCIÓ")
+
+if active:
+
+    signal_id, active_direction, entry_price, entry_time = active
+
+    current_price = safe_float(
+        market.get("price")
+    )
+
+    if current_price and entry_price > 0:
+
+        if active_direction == "LONG":
+
+            floating_result = (
+                current_price / entry_price - 1
+            ) * 100
+
+        else:
+
+            floating_result = (
+                entry_price / current_price - 1
+            ) * 100
+
+    else:
+
+        floating_result = None
+
+    x1, x2, x3, x4 = st.columns(4)
+
+    x1.metric(
+        "IRÁNY",
+        active_direction
+    )
+
+    x2.metric(
+        "BELÉPÉSI ÁR",
+        fmt(entry_price)
+    )
+
+    x3.metric(
+        "AKTUÁLIS ÁR",
+        fmt(current_price)
+    )
+
+    x4.metric(
+        "PILLANATNYI EREDMÉNY",
+        fmt(floating_result, 3) + "%"
+        if floating_result is not None
+        else "N/A"
+    )
+
+    st.caption(
+        "Nyitás: " + str(entry_time)
+    )
+
+else:
+
+    st.info(
+        "Jelenleg nincs nyitott virtuális pozíció."
+    )
+
+
+# Korábbi pozíciók
+
+st.subheader("KORÁBBI POZÍCIÓK")
+
+history = get_signal_history()
+
+if not history.empty:
+
+    def format_result(value):
+
+        if pd.isna(value):
+            return "NYITOTT"
+
+        if value > 0:
+            return "PROFIT"
+
+        if value < 0:
+            return "LOSS"
+
+        return "BREAK EVEN"
+
+    history["EREDMENY"] = (
+        history["EREDMENY_SZAZALEK"]
+        .apply(format_result)
+    )
+
+    st.dataframe(
+        history,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    csv_data = history.to_csv(
+        index=False
+    ).encode("utf-8-sig")
+
+    st.download_button(
+        "⬇️ SIGNAL HISTORY CSV LETÖLTÉSE",
+        data=csv_data,
+        file_name="saliga_signal_history.csv",
+        mime="text/csv"
+    )
+
+else:
+
+    st.info(
+        "Még nincs naplózott jelzés."
+    )
+
+
+# ============================================================
+# 36. GROQ AI REPORT
+# ============================================================
+
+st.markdown("---")
+
 st.header("🤖 GROQ AI INTELLIGENCE")
 
 if st.session_state["ai_error"]:
-    st.error(st.session_state["ai_error"])
+
+    st.error(
+        st.session_state["ai_error"]
+    )
 
 if ai:
 
     st.subheader(
         "MARKET BIAS: "
-        + str(ai.get("bias", "N/A"))
+        + str(
+            ai.get("bias", "N/A")
+        )
     )
 
     st.metric(
         "AI CONFIDENCE ASSESSMENT",
-        str(ai.get("confidence_score", "N/A")) + "%"
+        str(
+            ai.get("confidence_score", "N/A")
+        ) + "%"
     )
 
     st.caption(
@@ -1937,36 +2636,53 @@ if ai:
     )
 
     for title, key in [
+
         ("EXECUTIVE SUMMARY", "executive_summary"),
+
         ("DERIVATIVES", "derivatives_analysis"),
+
         ("POSITION FLOW", "position_flow_analysis"),
+
         ("HISTORICAL PATTERNS", "historical_pattern_analysis"),
+
         ("NEWS IMPACT", "news_impact"),
+
         ("TIMEFRAME ANALYSIS", "timeframe_analysis"),
+
         ("ACTIONABLE INSIGHT", "actionable_insight")
+
     ]:
 
         st.subheader(title)
-        st.write(ai.get(key, ""))
+
+        st.write(
+            ai.get(key, "")
+        )
 
     with st.expander("RISKS"):
 
         for risk in ai.get("risks", []):
-            st.write("• " + str(risk))
+
+            st.write(
+                "• " + str(risk)
+            )
 
 
 # ============================================================
-# 36. NEWS
+# 37. AUTOMATIC CRYPTO NEWS
 # ============================================================
 
 st.markdown("---")
+
 st.header("📰 AUTOMATIC CRYPTO NEWS")
 
 if news:
 
     for item in news:
 
-        st.write("### " + item["title"])
+        st.write(
+            "### " + item["title"]
+        )
 
         st.caption(
             item["source"]
@@ -1975,28 +2691,43 @@ if news:
         )
 
         if item.get("summary"):
-            st.write(item["summary"])
+
+            st.write(
+                item["summary"]
+            )
 
         if item.get("link"):
+
             st.markdown(
                 "[OPEN NEWS](" + item["link"] + ")"
             )
 
 else:
 
-    st.info("No news available.")
+    st.info(
+        "No news available."
+    )
 
 
 # ============================================================
-# 37. SYSTEM STATUS
+# 38. SYSTEM STATUS
 # ============================================================
 
 st.markdown("---")
+
 st.header("🛡️ SYSTEM STATUS")
 
-st.write("VERSION: " + APP_VERSION)
-st.write("EXCHANGE: OKX")
-st.write("INSTRUMENT: " + INST_ID)
+st.write(
+    "VERSION: " + APP_VERSION
+)
+
+st.write(
+    "EXCHANGE: OKX"
+)
+
+st.write(
+    "INSTRUMENT: " + INST_ID
+)
 
 st.write(
     "ORDER BOOK: "
@@ -2036,22 +2767,36 @@ st.write(
 
 st.write(
     "NEWS: "
-    + ("ACTIVE" if news else "UNAVAILABLE")
+    + (
+        "ACTIVE"
+        if news
+        else "UNAVAILABLE"
+    )
 )
 
 st.write(
     "GROQ AI: "
-    + ("ACTIVE" if ai else "UNAVAILABLE")
+    + (
+        "ACTIVE"
+        if ai
+        else "UNAVAILABLE"
+    )
+)
+
+st.write(
+    "SIGNAL JOURNAL: ACTIVE"
 )
 
 st.write(
     "LAST REFRESH: "
-    + str(st.session_state["last_refresh"])
+    + str(
+        st.session_state["last_refresh"]
+    )
 )
 
 
 # ============================================================
-# 38. AUTO REFRESH
+# 39. AUTO REFRESH
 # ============================================================
 
 if auto_refresh:
@@ -2065,11 +2810,19 @@ if auto_refresh:
             key="saliga_auto_refresh"
         )
 
-        if refresh_count != st.session_state["refresh_count"]:
+        if (
+            refresh_count
+            != st.session_state["refresh_count"]
+        ):
 
-            st.session_state["refresh_count"] = refresh_count
+            st.session_state["refresh_count"] = (
+                refresh_count
+            )
 
-            if st.session_state["last_refresh"] is not None:
+            if (
+                st.session_state["last_refresh"]
+                is not None
+            ):
 
                 if (
                     time.time()
@@ -2077,7 +2830,16 @@ if auto_refresh:
                     >= refresh_minutes * 60
                 ):
 
-                    run_full_cycle(lookback)
+                    try:
+
+                        run_full_cycle(lookback)
+
+                    except Exception as e:
+
+                        st.error(
+                            "Refresh error: " + str(e)
+                        )
+
                     st.rerun()
 
     except ImportError:
@@ -2088,14 +2850,14 @@ if auto_refresh:
 
 
 # ============================================================
-# 39. FOOTER
+# 40. FOOTER
 # ============================================================
 
 st.markdown("---")
 
 st.caption(
-    "⚡ SALIGA AI PRO 19.2 | "
-    "INSTITUTIONAL MARKET INTELLIGENCE | "
-    "DATA-DRIVEN ANALYSIS | "
+    "⚡ SALIGA AI PRO 20.0 | "
+    "MARKET INTELLIGENCE | "
+    "AUTOMATIC VIRTUAL SIGNAL JOURNAL | "
     "NOT FINANCIAL ADVICE"
 )
