@@ -6,13 +6,11 @@ import time
 import sqlite3
 import logging
 from datetime import datetime, timezone
-from typing import Any
 
 import ccxt
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
 import feedparser
 
 try:
@@ -27,12 +25,12 @@ except Exception:
 
 
 # ============================================================
-# SALIGA AI PRO 10.0
-# CENTRAL INTELLIGENCE ENGINE
+# SALIGA AI PRO 11.0
+# CENTRAL INTELLIGENCE + SIGNAL JOURNAL
 # OKX ONLY
 # ============================================================
 
-APP_NAME = "SALIGA AI PRO 10.0"
+APP_NAME = "SALIGA AI PRO 11.0"
 
 SYMBOLS = {
     "BTC": "BTC/USDT:USDT",
@@ -66,7 +64,7 @@ logger = logging.getLogger("SALIGA")
 
 
 # ============================================================
-# PAGE
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -102,38 +100,31 @@ st.markdown("""
     color: #b7791f;
     font-weight: 800;
 }
-.intelligence-box {
-    background: white;
-    border: 1px solid #dce3ed;
-    border-radius: 12px;
-    padding: 18px;
-    margin-bottom: 12px;
-}
 .thought-box {
     background: #ffffff;
+    border: 1px solid #dce3ed;
     border-left: 5px solid #475467;
     border-radius: 8px;
     padding: 18px;
     margin: 10px 0;
-}
-.small-muted {
-    color: #667085;
-    font-size: 12px;
 }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ============================================================
-# DATABASE – AUTOMATIC SCHEMA MIGRATION
+# DATABASE
 # ============================================================
 
 def db_connection():
     conn = sqlite3.connect(
         DB_PATH,
-        timeout=20,
+        timeout=30,
         check_same_thread=False,
     )
+
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS market_history (
@@ -146,31 +137,49 @@ def db_connection():
         )
     """)
 
-    existing = {
-        row[1]
-        for row in conn.execute(
-            "PRAGMA table_info(market_history)"
-        ).fetchall()
-    }
-
-    required = {
-        "symbol": "TEXT",
-        "timestamp": "INTEGER",
-        "price": "REAL",
-        "open_interest": "REAL",
-        "delta": "REAL",
-    }
-
-    for column, dtype in required.items():
-        if column not in existing:
-            conn.execute(
-                f"ALTER TABLE market_history "
-                f"ADD COLUMN {column} {dtype}"
-            )
-
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_market_history_symbol_time
         ON market_history(symbol, timestamp)
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_key TEXT UNIQUE,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            candle_timestamp INTEGER,
+            entry REAL NOT NULL,
+            stop_loss REAL NOT NULL,
+            tp1 REAL NOT NULL,
+            tp2 REAL NOT NULL,
+            tp3 REAL NOT NULL,
+            status TEXT DEFAULT 'OPEN',
+            hit_tp1 INTEGER DEFAULT 0,
+            hit_tp2 INTEGER DEFAULT 0,
+            hit_tp3 INTEGER DEFAULT 0,
+            last_price REAL,
+            exit_price REAL,
+            closed_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_signals_status
+        ON signals(status)
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signal_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            price REAL NOT NULL,
+            event_time TEXT NOT NULL,
+            FOREIGN KEY(signal_id) REFERENCES signals(id)
+        )
     """)
 
     conn.commit()
@@ -197,12 +206,7 @@ def save_snapshot(symbol, price, oi, delta):
 
 
 def get_previous_oi_snapshot(symbol):
-    """
-    Olyan korábbi mintát keres, amely legalább 5 perce készült.
-    A legfeljebb 24 órás mintákat veszi figyelembe.
-    """
     conn = db_connection()
-
     now = int(time.time())
 
     row = conn.execute("""
@@ -263,7 +267,7 @@ def fetch_ohlcv(symbol, timeframe, limit=200):
         limit=limit,
     )
 
-    if not candles:
+    if not candles or len(candles) < 3:
         return None
 
     df = pd.DataFrame(
@@ -290,7 +294,14 @@ def fetch_ohlcv(symbol, timeframe, limit=200):
             errors="coerce",
         )
 
-    return df.dropna().reset_index(drop=True)
+    df = df.dropna().reset_index(drop=True)
+
+    # Az utolsó gyertya még formálódhat.
+    # Az elemzés kizárólag lezárt gyertyákat használ.
+    if len(df) > 2:
+        df = df.iloc[:-1].reset_index(drop=True)
+
+    return df
 
 
 def fetch_ticker(symbol):
@@ -312,10 +323,8 @@ def fetch_trades(symbol):
 
 
 def fetch_open_interest(symbol):
-    exchange = get_exchange()
-
     try:
-        result = exchange.fetch_open_interest(symbol)
+        result = get_exchange().fetch_open_interest(symbol)
 
         if not result:
             return None
@@ -331,22 +340,24 @@ def fetch_open_interest(symbol):
         ]
 
         for value in candidates:
-            if value is not None:
-                number = float(value)
-                if np.isfinite(number) and number > 0:
-                    return number
+            if value is None:
+                continue
+
+            number = float(value)
+
+            if np.isfinite(number) and number > 0:
+                return number
 
         return None
 
     except Exception as exc:
-        logger.warning("Open interest error: %s", exc)
+        logger.warning("OI error: %s", exc)
         return None
 
 
 def fetch_funding(symbol):
     try:
         result = get_exchange().fetch_funding_rate(symbol)
-
         value = result.get("fundingRate")
 
         if value is None:
@@ -360,7 +371,7 @@ def fetch_funding(symbol):
 
 
 # ============================================================
-# INDICATOR CALCULATIONS
+# INDICATORS
 # ============================================================
 
 def calculate_rsi(series, period=14):
@@ -372,13 +383,9 @@ def calculate_rsi(series, period=14):
     avg_gain = gains.rolling(period).mean()
     avg_loss = losses.rolling(period).mean()
 
-    relative_strength = (
-        avg_gain / avg_loss.replace(0, np.nan)
-    )
+    rs = avg_gain / avg_loss.replace(0, np.nan)
 
-    result = 100 - (
-        100 / (1 + relative_strength)
-    )
+    result = 100 - (100 / (1 + rs))
 
     return result.fillna(50)
 
@@ -403,39 +410,26 @@ def calculate_vwap(df, period=48):
         df["high"] + df["low"] + df["close"]
     ) / 3
 
-    volume = df["volume"]
-
     weighted_price = (
-        typical_price * volume
+        typical_price * df["volume"]
     ).rolling(period).sum()
 
-    total_volume = volume.rolling(period).sum()
+    total_volume = df["volume"].rolling(period).sum()
 
-    return weighted_price / total_volume.replace(
-        0,
-        np.nan,
-    )
+    return weighted_price / total_volume.replace(0, np.nan)
 
 
 def calculate_momentum(df, lookback=5):
     if len(df) <= lookback:
         return 0.0
 
-    old_price = float(
-        df["close"].iloc[-lookback - 1]
-    )
-
-    current_price = float(
-        df["close"].iloc[-1]
-    )
+    old_price = float(df["close"].iloc[-lookback - 1])
+    current_price = float(df["close"].iloc[-1])
 
     if old_price == 0:
         return 0.0
 
-    return (
-        (current_price - old_price)
-        / old_price
-    ) * 100
+    return (current_price - old_price) / old_price * 100
 
 
 # ============================================================
@@ -562,6 +556,8 @@ def calculate_orderbook_imbalance(orderbook):
         return {
             "imbalance": None,
             "state": "NINCS ORDER BOOK ADAT",
+            "bid_volume": 0,
+            "ask_volume": 0,
         }
 
     bids = orderbook.get("bids", [])[:20]
@@ -583,6 +579,8 @@ def calculate_orderbook_imbalance(orderbook):
         return {
             "imbalance": None,
             "state": "NINCS HASZNÁLHATÓ ADAT",
+            "bid_volume": 0,
+            "ask_volume": 0,
         }
 
     imbalance = (
@@ -605,7 +603,7 @@ def calculate_orderbook_imbalance(orderbook):
 
 
 # ============================================================
-# OPEN INTEREST
+# OPEN INTEREST ANALYSIS
 # ============================================================
 
 def analyze_open_interest(name, current_oi, current_price):
@@ -671,9 +669,7 @@ def analyze_open_interest(name, current_oi, current_price):
         "state": state,
         "direction": direction,
         "confidence": "BECSLÉS",
-        "elapsed_seconds": int(
-            time.time() - old_timestamp
-        ),
+        "elapsed_seconds": int(time.time() - old_timestamp),
     }
 
 
@@ -696,10 +692,10 @@ def analyze_timeframe(df, label):
             "sweep": "NINCS ADAT",
             "price": None,
             "atr": None,
+            "reasons": [],
         }
 
     current = df.iloc[-1]
-
     price = float(current["close"])
 
     rsi = float(
@@ -708,8 +704,7 @@ def analyze_timeframe(df, label):
 
     momentum = calculate_momentum(df)
 
-    atr_series = calculate_atr(df)
-    atr_value = atr_series.iloc[-1]
+    atr_value = calculate_atr(df).iloc[-1]
 
     atr = (
         float(atr_value)
@@ -717,8 +712,7 @@ def analyze_timeframe(df, label):
         else None
     )
 
-    vwap_series = calculate_vwap(df)
-    vwap_value = vwap_series.iloc[-1]
+    vwap_value = calculate_vwap(df).iloc[-1]
 
     vwap = (
         float(vwap_value)
@@ -743,7 +737,6 @@ def analyze_timeframe(df, label):
     score = 0
     reasons = []
 
-    # Piaci struktúra
     score += structure_score * 2
 
     if structure_score > 0:
@@ -751,7 +744,6 @@ def analyze_timeframe(df, label):
     elif structure_score < 0:
         reasons.append("Csökkenő struktúra")
 
-    # RSI
     if rsi > 55:
         score += 2
         reasons.append("RSI vevői erőt mutat")
@@ -759,7 +751,6 @@ def analyze_timeframe(df, label):
         score -= 2
         reasons.append("RSI eladói erőt mutat")
 
-    # Momentum
     if momentum > 0.15:
         score += 2
         reasons.append("Pozitív momentum")
@@ -767,7 +758,6 @@ def analyze_timeframe(df, label):
         score -= 2
         reasons.append("Negatív momentum")
 
-    # VWAP helyzet
     if vwap is not None:
         if price > vwap:
             score += 1
@@ -776,7 +766,6 @@ def analyze_timeframe(df, label):
             score -= 1
             reasons.append("Ár a VWAP alatt")
 
-    # Forgalom
     if volume_ratio >= 1.3:
         if momentum > 0:
             score += 1
@@ -827,7 +816,7 @@ def analyze_timeframe(df, label):
 
 
 # ============================================================
-# CENTRAL INTELLIGENCE
+# MULTI-TIMEFRAME SUMMARY
 # ============================================================
 
 def summarize_timeframes(timeframes):
@@ -838,20 +827,14 @@ def summarize_timeframes(timeframes):
     short_count = 0
     neutral_count = 0
 
-    valid_count = 0
-
     for label, result in timeframes.items():
         if result["direction"] == "NINCS ADAT":
             continue
 
         weight = TIMEFRAME_WEIGHTS[label]
 
-        weighted_score += (
-            result["score"] * weight
-        )
-
+        weighted_score += result["score"] * weight
         total_weight += weight
-        valid_count += 1
 
         if result["direction"] == "LONG":
             long_count += 1
@@ -868,6 +851,7 @@ def summarize_timeframes(timeframes):
             "long_count": 0,
             "short_count": 0,
             "neutral_count": 0,
+            "valid_count": 0,
         }
 
     final_score = weighted_score / total_weight
@@ -895,17 +879,15 @@ def summarize_timeframes(timeframes):
         "long_count": long_count,
         "short_count": short_count,
         "neutral_count": neutral_count,
-        "valid_count": valid_count,
+        "valid_count": long_count + short_count + neutral_count,
     }
 
 
-def central_intelligence(data):
-    """
-    A központi motor az összes elérhető jelzést összeveti.
-    Ez egy magyarázható piaci összefoglaló, nem rejtett
-    belső gondolatmenet.
-    """
+# ============================================================
+# CENTRAL INTELLIGENCE
+# ============================================================
 
+def central_intelligence(data):
     tf = data["timeframes"]
     mtf = data["mtf"]
 
@@ -914,7 +896,6 @@ def central_intelligence(data):
     conflicts = []
     watch_items = []
 
-    # Idősíkok
     for label, result in tf.items():
         direction = result["direction"]
 
@@ -938,33 +919,31 @@ def central_intelligence(data):
             "A rövidebb és hosszabb idősíkok eltérő irányt mutatnak."
         )
 
-    # Delta
     delta = data["delta"]
 
     if delta["delta_percent"] > 5:
         long_reasons.append(
-            "A legutóbb lekért kötésekben vevői fölény látható."
+            "A lekért kötésekben vevői fölény látható."
         )
     elif delta["delta_percent"] < -5:
         short_reasons.append(
-            "A legutóbb lekért kötésekben eladói fölény látható."
+            "A lekért kötésekben eladói fölény látható."
         )
     else:
         watch_items.append(
-            "A kötések deltaértéke nem mutat jelentős fölényt."
+            "A delta nem mutat jelentős fölényt."
         )
 
-    # Order book
     imbalance = data["orderbook"]["imbalance"]
 
     if imbalance is not None:
         if imbalance > 10:
             long_reasons.append(
-                "Az order book pillanatképe vételi oldali fölényt mutat."
+                "Az order book pillanatképe vételi fölényt mutat."
             )
         elif imbalance < -10:
             short_reasons.append(
-                "Az order book pillanatképe eladási oldali fölényt mutat."
+                "Az order book pillanatképe eladási fölényt mutat."
             )
         else:
             watch_items.append(
@@ -972,56 +951,43 @@ def central_intelligence(data):
             )
     else:
         watch_items.append(
-            "Az order book adata nem elérhető."
+            "Az order book adata nem érhető el."
         )
 
-    # OI
     oi = data["oi_analysis"]
 
     if oi["direction"] > 0:
-        long_reasons.append(
-            oi["state"]
-        )
+        long_reasons.append(oi["state"])
     elif oi["direction"] < 0:
-        short_reasons.append(
-            oi["state"]
-        )
+        short_reasons.append(oi["state"])
     else:
-        watch_items.append(
-            oi["state"]
-        )
+        watch_items.append(oi["state"])
 
-    # Funding
     funding = data["funding"]
 
     if funding is not None:
         if funding > 0.0005:
             watch_items.append(
-                "A funding pozitív és emelkedett: a long pozíciók költsége magasabb lehet."
+                "A pozitív funding miatt a long pozíciók költsége magasabb lehet."
             )
         elif funding < -0.0005:
             watch_items.append(
-                "A funding negatív: a short pozíciók költsége magasabb lehet."
+                "A negatív funding miatt a short pozíciók költsége magasabb lehet."
             )
 
-    # Likviditási söprés
     sweeps = [
         result["sweep"]
         for result in tf.values()
-        if result["sweep"] != "NINCS FRISS LIKVIDITÁSI SÖPRÉS"
-        and result["sweep"] != "NINCS ADAT"
+        if result["sweep"] not in (
+            "NINCS FRISS LIKVIDITÁSI SÖPRÉS",
+            "NINCS ADAT",
+        )
     ]
 
     if sweeps:
         watch_items.extend(sweeps)
 
-    # Központi következtetés
-    if mtf["direction"] == "LONG":
-        overall = "LONG"
-    elif mtf["direction"] == "SHORT":
-        overall = "SHORT"
-    else:
-        overall = "SEMLEGES"
+    overall = mtf["direction"]
 
     if (
         len(long_reasons) >= 2
@@ -1035,58 +1001,52 @@ def central_intelligence(data):
     else:
         confidence = "KORLÁTOZOTT MEGERŐSÍTÉS"
 
-    # Következtetés szövege
     if overall == "LONG":
         conclusion = (
             "Az összesített idősíkos értékelés LONG irányba mutat. "
-            "A jelzés erősségét az order flow, az OI és az order book "
-            "adataival együtt kell megítélni. A magasabb idősíkok "
-            "megerősítése különösen fontos."
+            "A vételi struktúrát a delta, az OI és az order book "
+            "adataival együtt kell ellenőrizni."
         )
+
+        waiting_for = (
+            "A vételi nyomás fennmaradására, a rövidebb idősíkok "
+            "megerősítésére és az ellenállások áttörésére."
+        )
+
+        invalidation = (
+            "A vételi delta eltűnése, az árstruktúra letörése "
+            "és a tartós eladói fölény gyengítené az értékelést."
+        )
+
     elif overall == "SHORT":
         conclusion = (
             "Az összesített idősíkos értékelés SHORT irányba mutat. "
             "Az eladói struktúrát a delta, az OI és az order book "
-            "adataival együtt kell ellenőrizni. Egy rövid távú "
-            "visszapattanás önmagában nem feltétlenül trendforduló."
-        )
-    else:
-        conclusion = (
-            "A jelenlegi összesített kép nem ad kellően egyértelmű "
-            "irányt. A rendszer kivárást jelez, amíg az idősíkok és "
-            "az order flow nem adnak tisztább megerősítést."
+            "adataival együtt kell ellenőrizni."
         )
 
-    # Mire vár?
-    if overall == "LONG":
         waiting_for = (
-            "A vételi nyomás fennmaradására, az alacsonyabb idősíkok "
-            "megerősítésére és a magasabb idősíkú ellenállások "
-            "áttörésére."
+            "Az eladói nyomás fennmaradására és a fontos támaszok letörésére."
         )
+
         invalidation = (
-            "A vételi delta eltűnése, az árstruktúra letörése és "
-            "a tartós eladói fölény gyengítené vagy érvénytelenítené "
-            "a LONG értékelést."
+            "A tartós vevői fölény és a fontos ellenállások visszavétele "
+            "gyengítené az értékelést."
         )
-    elif overall == "SHORT":
-        waiting_for = (
-            "Az eladói nyomás fennmaradására, az alacsonyabb idősíkok "
-            "megerősítésére és a támaszok letörésére."
-        )
-        invalidation = (
-            "A tartós vevői fölény, a negatív delta megszűnése és "
-            "a fontos ellenállások visszavétele gyengítené vagy "
-            "érvénytelenítené a SHORT értékelést."
-        )
+
     else:
-        waiting_for = (
-            "Egyértelmű kitörésre, több idősíkon megerősített "
-            "irányra és az order flow támogatására."
+        conclusion = (
+            "A jelenlegi összesített kép nem ad kellően egyértelmű irányt. "
+            "A rendszer kivárást jelez."
         )
+
+        waiting_for = (
+            "Egyértelmű kitörésre, több idősíkon megerősített irányra "
+            "és az order flow támogatására."
+        )
+
         invalidation = (
-            "Nincs aktív irányjelzés, ezért jelenleg nincs "
-            "érvényesített LONG vagy SHORT terv."
+            "Jelenleg nincs érvényesített LONG vagy SHORT terv."
         )
 
     return {
@@ -1133,8 +1093,7 @@ def calculate_trade_plan(price, atr, direction, support, resistance):
         if support is not None and support < price:
             candidate = support - atr * 0.1
 
-            # Ne engedjük a stopot indokolatlanul messzire.
-            if candidate < price and candidate > price - atr * 2.5:
+            if price - candidate < atr * 2.5:
                 stop = min(stop, candidate)
 
         risk = price - stop
@@ -1158,7 +1117,7 @@ def calculate_trade_plan(price, atr, direction, support, resistance):
         if resistance is not None and resistance > price:
             candidate = resistance + atr * 0.1
 
-            if candidate > price and candidate < price + atr * 2.5:
+            if candidate - price < atr * 2.5:
                 stop = max(stop, candidate)
 
         risk = stop - price
@@ -1180,7 +1139,7 @@ def calculate_trade_plan(price, atr, direction, support, resistance):
 
 
 # ============================================================
-# FULL COIN ANALYSIS
+# COMPLETE COIN ANALYSIS
 # ============================================================
 
 def analyze_coin(name, symbol):
@@ -1196,7 +1155,6 @@ def analyze_coin(name, symbol):
 
         price = float(ticker["last"])
 
-        # Öt idősík
         frames = {}
 
         for label, timeframe in TIMEFRAMES.items():
@@ -1208,17 +1166,22 @@ def analyze_coin(name, symbol):
 
             frames[label] = df
 
-            result["timeframes"][label] = (
-                analyze_timeframe(df, label)
+            result["timeframes"][label] = analyze_timeframe(
+                df,
+                label,
             )
 
-        # Kiegészítő adatforrások
         df15 = frames.get("15 perc")
 
-        if df15 is None:
+        if df15 is None or len(df15) < 50:
             raise RuntimeError(
-                "A 15 perces adatok nem érhetők el."
+                "A 15 perces adatok nem érhetők el megfelelő mennyiségben."
             )
+
+        # A jelzésnapló az utolsó lezárt gyertya időbélyegét használja.
+        result["df15_timestamp"] = int(
+            df15.iloc[-1]["timestamp"]
+        )
 
         trades = safe_api_call(
             lambda: fetch_trades(symbol),
@@ -1282,9 +1245,7 @@ def analyze_coin(name, symbol):
             ),
         })
 
-        result["intelligence"] = central_intelligence(
-            result
-        )
+        result["intelligence"] = central_intelligence(result)
 
         result["plan"] = calculate_trade_plan(
             price,
@@ -1294,7 +1255,6 @@ def analyze_coin(name, symbol):
             resistance,
         )
 
-        # A mintát az elemzés után mentjük.
         save_snapshot(
             name,
             price,
@@ -1311,7 +1271,7 @@ def analyze_coin(name, symbol):
 
 
 # ============================================================
-# MARKET DATA CACHE
+# MARKET CACHE
 # ============================================================
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -1325,6 +1285,374 @@ def load_market_data():
         )
 
     return output
+
+
+# ============================================================
+# SIGNAL JOURNAL
+# ============================================================
+
+def create_signal(name, data):
+    plan = data.get("plan")
+
+    if not plan:
+        return
+
+    direction = plan["direction"]
+
+    if direction not in ("LONG", "SHORT"):
+        return
+
+    candle_timestamp = data.get("df15_timestamp")
+
+    if not candle_timestamp:
+        return
+
+    signal_key = (
+        f"{name}_15m_{direction}_{candle_timestamp}"
+    )
+
+    conn = db_connection()
+
+    try:
+        conn.execute("""
+            INSERT OR IGNORE INTO signals (
+                signal_key,
+                symbol,
+                timeframe,
+                direction,
+                created_at,
+                candle_timestamp,
+                entry,
+                stop_loss,
+                tp1,
+                tp2,
+                tp3,
+                last_price
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            signal_key,
+            name,
+            "15m",
+            direction,
+            datetime.now(timezone.utc).isoformat(),
+            candle_timestamp,
+            float(plan["entry"]),
+            float(plan["stop"]),
+            float(plan["tp1"]),
+            float(plan["tp2"]),
+            float(plan["tp3"]),
+            float(data["price"]),
+        ))
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+
+def record_signal_event(conn, signal_id, event_type, price):
+    conn.execute("""
+        INSERT INTO signal_events (
+            signal_id,
+            event_type,
+            price,
+            event_time
+        )
+        VALUES (?, ?, ?, ?)
+    """, (
+        signal_id,
+        event_type,
+        float(price),
+        datetime.now(timezone.utc).isoformat(),
+    ))
+
+
+def update_signal_journal():
+    conn = db_connection()
+
+    rows = conn.execute("""
+        SELECT
+            id,
+            symbol,
+            direction,
+            entry,
+            stop_loss,
+            tp1,
+            tp2,
+            tp3,
+            status,
+            hit_tp1,
+            hit_tp2,
+            hit_tp3
+        FROM signals
+        WHERE status NOT IN (
+            'STOP_LOSS',
+            'STOP_AFTER_TP1',
+            'STOP_AFTER_TP2',
+            'TP3'
+        )
+    """).fetchall()
+
+    conn.close()
+
+    exchange = get_exchange()
+
+    for row in rows:
+        (
+            signal_id,
+            name,
+            direction,
+            entry,
+            stop,
+            tp1,
+            tp2,
+            tp3,
+            status,
+            hit_tp1,
+            hit_tp2,
+            hit_tp3,
+        ) = row
+
+        symbol = SYMBOLS.get(name)
+
+        if not symbol:
+            continue
+
+        ticker = safe_api_call(
+            lambda: exchange.fetch_ticker(symbol),
+            None,
+        )
+
+        if not ticker or ticker.get("last") is None:
+            continue
+
+        price = float(ticker["last"])
+
+        conn = db_connection()
+
+        try:
+            signal = conn.execute("""
+                SELECT status, hit_tp1, hit_tp2, hit_tp3
+                FROM signals
+                WHERE id = ?
+            """, (signal_id,)).fetchone()
+
+            if not signal:
+                continue
+
+            status, hit_tp1, hit_tp2, hit_tp3 = signal
+
+            if status in (
+                "STOP_LOSS",
+                "STOP_AFTER_TP1",
+                "STOP_AFTER_TP2",
+                "TP3",
+            ):
+                continue
+
+            # LONG
+            if direction == "LONG":
+
+                # A stopot először vizsgáljuk.
+                if price <= stop:
+
+                    if hit_tp2:
+                        final_status = "STOP_AFTER_TP2"
+                    elif hit_tp1:
+                        final_status = "STOP_AFTER_TP1"
+                    else:
+                        final_status = "STOP_LOSS"
+
+                    conn.execute("""
+                        UPDATE signals
+                        SET status = ?,
+                            last_price = ?,
+                            exit_price = ?,
+                            closed_at = ?
+                        WHERE id = ?
+                    """, (
+                        final_status,
+                        price,
+                        price,
+                        datetime.now(timezone.utc).isoformat(),
+                        signal_id,
+                    ))
+
+                    record_signal_event(
+                        conn,
+                        signal_id,
+                        final_status,
+                        price,
+                    )
+
+                else:
+                    targets = [
+                        ("TP1", tp1, hit_tp1),
+                        ("TP2", tp2, hit_tp2),
+                        ("TP3", tp3, hit_tp3),
+                    ]
+
+                    for label, target, already_hit in targets:
+
+                        if price >= target and not already_hit:
+
+                            if label == "TP1":
+                                conn.execute("""
+                                    UPDATE signals
+                                    SET hit_tp1 = 1,
+                                        status = 'TP1'
+                                    WHERE id = ?
+                                """, (signal_id,))
+
+                            elif label == "TP2":
+                                conn.execute("""
+                                    UPDATE signals
+                                    SET hit_tp2 = 1,
+                                        status = 'TP2'
+                                    WHERE id = ?
+                                """, (signal_id,))
+
+                            elif label == "TP3":
+                                conn.execute("""
+                                    UPDATE signals
+                                    SET hit_tp3 = 1,
+                                        status = 'TP3',
+                                        exit_price = ?,
+                                        closed_at = ?
+                                    WHERE id = ?
+                                """, (
+                                    price,
+                                    datetime.now(timezone.utc).isoformat(),
+                                    signal_id,
+                                ))
+
+                            record_signal_event(
+                                conn,
+                                signal_id,
+                                label,
+                                price,
+                            )
+
+            # SHORT
+            elif direction == "SHORT":
+
+                if price >= stop:
+
+                    if hit_tp2:
+                        final_status = "STOP_AFTER_TP2"
+                    elif hit_tp1:
+                        final_status = "STOP_AFTER_TP1"
+                    else:
+                        final_status = "STOP_LOSS"
+
+                    conn.execute("""
+                        UPDATE signals
+                        SET status = ?,
+                            last_price = ?,
+                            exit_price = ?,
+                            closed_at = ?
+                        WHERE id = ?
+                    """, (
+                        final_status,
+                        price,
+                        price,
+                        datetime.now(timezone.utc).isoformat(),
+                        signal_id,
+                    ))
+
+                    record_signal_event(
+                        conn,
+                        signal_id,
+                        final_status,
+                        price,
+                    )
+
+                else:
+                    targets = [
+                        ("TP1", tp1, hit_tp1),
+                        ("TP2", tp2, hit_tp2),
+                        ("TP3", tp3, hit_tp3),
+                    ]
+
+                    for label, target, already_hit in targets:
+
+                        if price <= target and not already_hit:
+
+                            if label == "TP1":
+                                conn.execute("""
+                                    UPDATE signals
+                                    SET hit_tp1 = 1,
+                                        status = 'TP1'
+                                    WHERE id = ?
+                                """, (signal_id,))
+
+                            elif label == "TP2":
+                                conn.execute("""
+                                    UPDATE signals
+                                    SET hit_tp2 = 1,
+                                        status = 'TP2'
+                                    WHERE id = ?
+                                """, (signal_id,))
+
+                            elif label == "TP3":
+                                conn.execute("""
+                                    UPDATE signals
+                                    SET hit_tp3 = 1,
+                                        status = 'TP3',
+                                        exit_price = ?,
+                                        closed_at = ?
+                                    WHERE id = ?
+                                """, (
+                                    price,
+                                    datetime.now(timezone.utc).isoformat(),
+                                    signal_id,
+                                ))
+
+                            record_signal_event(
+                                conn,
+                                signal_id,
+                                label,
+                                price,
+                            )
+
+            conn.execute("""
+                UPDATE signals
+                SET last_price = ?
+                WHERE id = ?
+            """, (price, signal_id))
+
+            conn.commit()
+
+        finally:
+            conn.close()
+
+
+def get_signal_journal():
+    conn = db_connection()
+
+    signals = pd.read_sql_query("""
+        SELECT *
+        FROM signals
+        ORDER BY id DESC
+        LIMIT 500
+    """, conn)
+
+    events = pd.read_sql_query("""
+        SELECT
+            signal_events.*,
+            signals.symbol,
+            signals.direction
+        FROM signal_events
+        JOIN signals
+        ON signals.id = signal_events.signal_id
+        ORDER BY signal_events.id DESC
+        LIMIT 500
+    """, conn)
+
+    conn.close()
+
+    return signals, events
 
 
 # ============================================================
@@ -1351,13 +1679,13 @@ def fetch_news():
                 })
 
         except Exception as exc:
-            logger.warning("News feed error: %s", exc)
+            logger.warning("News error: %s", exc)
 
     return items[:15]
 
 
 # ============================================================
-# GROQ CLIENT
+# GROQ
 # ============================================================
 
 def get_groq_client():
@@ -1386,6 +1714,7 @@ def market_context_text(market_data):
     context = {}
 
     for name, data in market_data.items():
+
         if data.get("error"):
             context[name] = {
                 "error": data["error"],
@@ -1413,13 +1742,95 @@ def market_context_text(market_data):
     )
 
 
+def local_market_answer(question, market_data):
+    """
+    Groq nélkül is használható egyszerű belső válasz.
+    A válasz kizárólag a betöltött piaci adatokból dolgozik.
+    """
+
+    lines = [
+        "SALIGA AI – BELSŐ PIACI ADATOK",
+        "",
+        f"Kérdés: {question}",
+        "",
+    ]
+
+    for name, data in market_data.items():
+
+        if data.get("error"):
+            lines.append(
+                f"{name}: az adatok nem érhetők el. "
+                f"Hiba: {data['error']}"
+            )
+            continue
+
+        intelligence = data["intelligence"]
+        plan = data.get("plan")
+
+        lines.append(
+            f"{name}: {intelligence['direction']} – "
+            f"{intelligence['confidence']}"
+        )
+
+        lines.append(
+            f"Ár: {data['price']:,.4f} USDT"
+        )
+
+        lines.append(
+            f"Idősíkok: {data['mtf']['agreement']}"
+        )
+
+        lines.append(
+            f"Delta: {data['delta']['delta_percent']:.2f}%"
+        )
+
+        lines.append(
+            f"OI: {data['oi_analysis']['state']}"
+        )
+
+        lines.append(
+            f"Order book: {data['orderbook']['state']}"
+        )
+
+        if plan:
+            lines.append(
+                f"Referencia Entry: {plan['entry']:.4f}"
+            )
+            lines.append(
+                f"Stop Loss: {plan['stop']:.4f}"
+            )
+            lines.append(
+                f"TP1: {plan['tp1']:.4f}"
+            )
+            lines.append(
+                f"TP2: {plan['tp2']:.4f}"
+            )
+            lines.append(
+                f"TP3: {plan['tp3']:.4f}"
+            )
+        else:
+            lines.append(
+                "Nincs érvényesített kereskedési terv."
+            )
+
+        lines.append("")
+
+    lines.append(
+        "Megjegyzés: az OI-alapú pozícióáramlás becslés, "
+        "a delta a lekért kötésekből származik, "
+        "az order book pedig pillanatfelvétel."
+    )
+
+    return "\n".join(lines)
+
+
 def ask_groq(question, market_data):
     client = get_groq_client()
 
     if client is None:
-        return (
-            "A Groq AI jelenleg nem érhető el vagy nincs beállítva. "
-            "A belső SALIGA elemzőmotor ettől függetlenül működik."
+        return local_market_answer(
+            question,
+            market_data,
         )
 
     context = market_context_text(market_data)
@@ -1441,14 +1852,13 @@ Szabályok:
 - Az OI-alapú pozícióépülés csak becslés.
 - A delta csak a lekért kötések becslése.
 - Az order book pillanatfelvétel.
-- Mindig vedd figyelembe az öt idősíkot.
-- Jelezd az idősíkok közötti ellentmondásokat.
-- Magyarázd el, mely adatok támogatják és melyek gyengítik az irányt.
+- Vedd figyelembe mind az öt idősíkot.
+- Jelezd az ellentmondásokat.
+- Magyarázd el, mely adatok támogatják és gyengítik az irányt.
 - Ha nincs elég adat, mondd ki.
 - Ne ígérj nyereséget.
-- Ne használj mozgóátlag-alapú jelzéseket.
-
-A válasz legyen magyar, világos és konkrét.
+- Ne használj EMA- vagy SMA-alapú jelzéseket.
+- Magyarul, világosan és konkrétan válaszolj.
 """
                 },
                 {
@@ -1467,7 +1877,13 @@ A válasz legyen magyar, világos és konkrét.
         return response.choices[0].message.content
 
     except Exception as exc:
-        return f"Groq kommunikációs hiba: {exc}"
+        logger.warning("Groq error: %s", exc)
+
+        return (
+            "A külső AI jelenleg nem válaszol. "
+            "Az alábbi válasz a belső SALIGA adatokból készült:\n\n"
+            + local_market_answer(question, market_data)
+        )
 
 
 # ============================================================
@@ -1517,26 +1933,45 @@ if st.sidebar.button("🔄 Adatok frissítése"):
 # HEADER
 # ============================================================
 
-st.title("⚡ SALIGA AI PRO 10.0")
+st.title("⚡ SALIGA AI PRO 11.0")
+
 st.caption(
     "CENTRAL INTELLIGENCE | OKX ONLY | "
-    "MULTI-TIMEFRAME | ORDER FLOW"
+    "MULTI-TIMEFRAME | ORDER FLOW | SIGNAL JOURNAL"
 )
 
 st.info(
-    "A központi elemzőmotor önállóan működik. "
-    "A külső AI a magyarázatot és a kommunikációt egészíti ki."
+    "A belső elemzőmotor önállóan működik. "
+    "A külső AI csak kiegészítő értelmezést ad."
 )
 
 
 # ============================================================
-# LOAD
+# LOAD MARKET DATA
 # ============================================================
 
 with st.spinner(
     "SALIGA AI: BTC, ETH és SOL elemzése..."
 ):
     market_data = load_market_data()
+
+
+# ============================================================
+# INITIALIZE AND UPDATE JOURNAL
+# ============================================================
+
+init_signal_journal = db_connection
+_init_conn = init_signal_journal()
+_init_conn.close()
+
+for coin_name, coin_data in market_data.items():
+    if not coin_data.get("error"):
+        create_signal(coin_name, coin_data)
+
+try:
+    update_signal_journal()
+except Exception as exc:
+    logger.warning("Journal update error: %s", exc)
 
 
 # ============================================================
@@ -1548,9 +1983,11 @@ st.header("Piaci összkép")
 top_columns = st.columns(3)
 
 for index, name in enumerate(["BTC", "ETH", "SOL"]):
+
     data = market_data[name]
 
     with top_columns[index]:
+
         st.subheader(name)
 
         if data.get("error"):
@@ -1592,6 +2029,7 @@ tabs = st.tabs([
     "📈 Order Flow",
     "📰 Hírek és AI",
     "💬 Chat",
+    "📒 Jelzésnapló",
 ])
 
 
@@ -1600,6 +2038,7 @@ tabs = st.tabs([
 # ============================================================
 
 with tabs[0]:
+
     st.header("🧠 SALIGA AI – Központi intelligencia")
 
     st.write(
@@ -1609,20 +2048,18 @@ with tabs[0]:
     )
 
     for name in ["BTC", "ETH", "SOL"]:
+
         data = market_data[name]
 
-        st.subheader(f"{name} – aktuális piaci értékelés")
+        st.subheader(
+            f"{name} – aktuális piaci értékelés"
+        )
 
         if data.get("error"):
             st.error(data["error"])
             continue
 
         intelligence = data["intelligence"]
-
-        st.markdown(
-            '<div class="thought-box">',
-            unsafe_allow_html=True,
-        )
 
         if intelligence["direction"] == "LONG":
             st.success("KÖZPONTI KÖVETKEZTETÉS: LONG")
@@ -1659,15 +2096,14 @@ with tabs[0]:
             for item in intelligence["conflicts"]:
                 st.warning(item)
         else:
-            st.write("Nem észlelhető egyértelmű idősík-ellentmondás.")
+            st.write(
+                "Nem észlelhető egyértelmű idősík-ellentmondás."
+            )
 
         st.markdown("**Mit figyel most a rendszer?**")
 
-        if intelligence["watch_items"]:
-            for item in intelligence["watch_items"]:
-                st.write(f"• {item}")
-        else:
-            st.write("Nincs külön kiemelt figyelmeztetés.")
+        for item in intelligence["watch_items"]:
+            st.write(f"• {item}")
 
         st.markdown("**Mire vár a rendszer?**")
         st.write(intelligence["waiting_for"])
@@ -1679,8 +2115,6 @@ with tabs[0]:
             f"Frissítve: {data['last_update']}"
         )
 
-        st.markdown("</div>", unsafe_allow_html=True)
-
         st.divider()
 
 
@@ -1689,9 +2123,11 @@ with tabs[0]:
 # ============================================================
 
 with tabs[1]:
+
     st.header("⏱️ Multi-Timeframe Intelligence")
 
     for name in ["BTC", "ETH", "SOL"]:
+
         data = market_data[name]
 
         st.subheader(f"{name} – idősíkos elemzés")
@@ -1703,6 +2139,7 @@ with tabs[1]:
         rows = []
 
         for label, result in data["timeframes"].items():
+
             rows.append({
                 "Idősík": label,
                 "Irány": result["direction"],
@@ -1767,9 +2204,11 @@ with tabs[1]:
 # ============================================================
 
 with tabs[2]:
+
     st.header("📊 Részletes piaci elemzés")
 
     for name in ["BTC", "ETH", "SOL"]:
+
         data = market_data[name]
 
         st.subheader(name)
@@ -1836,20 +2275,24 @@ with tabs[2]:
 # ============================================================
 
 with tabs[3]:
+
     st.header("🎯 Belépés / Stop Loss / Take Profit")
 
     data = market_data[selected_coin]
 
     if data.get("error"):
+
         st.error(data["error"])
 
     elif data["plan"] is None:
+
         st.warning(
             "A központi motor nem lát kellően egyértelmű irányt. "
             "Nem készít mesterséges kereskedési tervet."
         )
 
     else:
+
         plan = data["plan"]
 
         st.subheader(
@@ -1911,14 +2354,17 @@ with tabs[3]:
 # ============================================================
 
 with tabs[4]:
+
     st.header("📈 Order Flow Intelligence")
 
     data = market_data[selected_coin]
 
     if data.get("error"):
+
         st.error(data["error"])
 
     else:
+
         delta = data["delta"]
         book = data["orderbook"]
 
@@ -1963,7 +2409,7 @@ with tabs[4]:
             )
 
         st.caption(
-            "A delta a lekért legutóbbi kötésekből számított "
+            "A delta a legutóbb lekért kötésekből számított "
             "taker buy/sell becslés. Nem teljes historikus CVD. "
             "Az order book pillanatfelvétel."
         )
@@ -1974,6 +2420,7 @@ with tabs[4]:
 # ============================================================
 
 with tabs[5]:
+
     st.header("📰 Piaci hírek és AI")
 
     if st.button("Hírek frissítése"):
@@ -1983,6 +2430,7 @@ with tabs[5]:
         st.session_state["saliga_news"] = fetch_news()
 
     for item in st.session_state["saliga_news"]:
+
         st.markdown(
             f"**{item['title']}**  \n"
             f"[Hír megnyitása]({item['link']})"
@@ -1996,13 +2444,15 @@ with tabs[5]:
     st.subheader("AI piaci összefoglaló")
 
     if st.button("SALIGA AI – Teljes piaci összefoglaló"):
+
         with st.spinner("AI értelmezi a központi elemzést..."):
+
             answer = ask_groq(
                 (
-                    "Készíts részletes, de érthető magyar piaci "
+                    "Készíts részletes, érthető magyar piaci "
                     "összefoglalót BTC, ETH és SOL instrumentumokra. "
                     "Mutasd meg az irányokat, ellentmondásokat, "
-                    "kockázatokat és a fontosabb megerősítési feltételeket."
+                    "kockázatokat és a megerősítési feltételeket."
                 ),
                 market_data,
             )
@@ -2015,17 +2465,19 @@ with tabs[5]:
 # ============================================================
 
 with tabs[6]:
+
     st.header("💬 Kommunikáció a SALIGA AI-val")
 
     st.write(
-        "Kérdezz rá az idősíkokra, az OI-ra, a deltára, "
-        "a pozícióépülésre vagy a központi következtetésre."
+        "Kérdezz az idősíkokról, OI-ról, deltáról, "
+        "pozícióáramlásról vagy a központi következtetésről."
     )
 
     if "saliga_chat" not in st.session_state:
         st.session_state["saliga_chat"] = []
 
     for message in st.session_state["saliga_chat"]:
+
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
@@ -2034,6 +2486,7 @@ with tabs[6]:
     )
 
     if question:
+
         st.session_state["saliga_chat"].append({
             "role": "user",
             "content": question,
@@ -2043,7 +2496,9 @@ with tabs[6]:
             st.markdown(question)
 
         with st.chat_message("assistant"):
+
             with st.spinner("SALIGA AI válaszol..."):
+
                 answer = ask_groq(
                     question,
                     market_data,
@@ -2058,6 +2513,173 @@ with tabs[6]:
 
 
 # ============================================================
+# TAB 8 – SIGNAL JOURNAL
+# ============================================================
+
+with tabs[7]:
+
+    st.header("📒 SALIGA AI – Kereskedési jelzésnapló")
+
+    signals, events = get_signal_journal()
+
+    if signals.empty:
+
+        st.info(
+            "Még nincs rögzített kereskedési jelzés. "
+            "A napló akkor rögzít új sort, amikor a belső motor "
+            "LONG vagy SHORT tervet készít."
+        )
+
+    else:
+
+        total = len(signals)
+
+        open_count = int(
+            (signals["status"] == "OPEN").sum()
+        )
+
+        tp1_count = int(
+            signals["hit_tp1"].sum()
+        )
+
+        tp2_count = int(
+            signals["hit_tp2"].sum()
+        )
+
+        tp3_count = int(
+            signals["hit_tp3"].sum()
+        )
+
+        stop_count = int(
+            signals["status"].isin([
+                "STOP_LOSS",
+                "STOP_AFTER_TP1",
+                "STOP_AFTER_TP2",
+            ]).sum()
+        )
+
+        a, b, c, d, e = st.columns(5)
+
+        a.metric("Összes jelzés", total)
+        b.metric("Nyitott", open_count)
+        c.metric("TP1 elérve", tp1_count)
+        d.metric("TP2 elérve", tp2_count)
+        e.metric("TP3 elérve", tp3_count)
+
+        st.divider()
+
+        st.subheader("Jelzések")
+
+        display = signals[[
+            "created_at",
+            "symbol",
+            "timeframe",
+            "direction",
+            "entry",
+            "stop_loss",
+            "tp1",
+            "tp2",
+            "tp3",
+            "last_price",
+            "status",
+        ]].copy()
+
+        display["created_at"] = (
+            pd.to_datetime(
+                display["created_at"],
+                errors="coerce",
+                utc=True,
+            )
+            .dt.strftime("%Y-%m-%d %H:%M")
+        )
+
+        display.columns = [
+            "Létrehozva",
+            "Coin",
+            "Idősík",
+            "Irány",
+            "Entry",
+            "Stop Loss",
+            "TP1",
+            "TP2",
+            "TP3",
+            "Utolsó ár",
+            "Állapot",
+        ]
+
+        st.dataframe(
+            display,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.divider()
+
+        st.subheader("Eseménynapló")
+
+        if events.empty:
+
+            st.info(
+                "Még nincs célár- vagy stopesemény."
+            )
+
+        else:
+
+            event_display = events[[
+                "event_time",
+                "symbol",
+                "direction",
+                "event_type",
+                "price",
+            ]].copy()
+
+            event_display.columns = [
+                "Időpont",
+                "Coin",
+                "Irány",
+                "Esemény",
+                "Ár",
+            ]
+
+            st.dataframe(
+                event_display,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.divider()
+
+        st.subheader("Eredménykimutatás")
+
+        closed_count = tp3_count + stop_count
+
+        if closed_count > 0:
+
+            success_rate = (
+                tp3_count / closed_count
+            ) * 100
+
+            st.metric(
+                "TP3 / lezárt jelzések aránya",
+                f"{success_rate:.2f}%",
+            )
+
+        else:
+
+            st.info(
+                "Még nincs elegendő lezárt jelzés "
+                "az eredményarány kiszámításához."
+            )
+
+        st.caption(
+            "A TP1 és TP2 részleges célár-elérést jelent. "
+            "A TP3 teljes célár-elérést jelent. "
+            "A stopesemények külön kerülnek rögzítésre. "
+            "A napló nem valódi tőzsdei megbízásokat kezel."
+        )
+
+
+# ============================================================
 # FOOTER
 # ============================================================
 
@@ -2065,7 +2687,7 @@ st.divider()
 
 st.caption(
     f"{APP_NAME} | OKX ONLY | "
-    "CENTRAL INTELLIGENCE ENGINE"
+    "CENTRAL INTELLIGENCE ENGINE | SIGNAL JOURNAL"
 )
 
 st.caption(
