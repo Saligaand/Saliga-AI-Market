@@ -1,16 +1,17 @@
+from __future__ import annotations
+
 import os
 import time
-import json
 import sqlite3
 import logging
 from datetime import datetime, timezone
 
 import ccxt
+import feedparser
 import numpy as np
 import pandas as pd
-import requests
-import streamlit as st
 import plotly.graph_objects as go
+import streamlit as st
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -18,13 +19,15 @@ except ImportError:
     st_autorefresh = None
 
 
-# =========================================================
-# SALIGA AI 7.1
-# OKX ONLY | INTERNAL MARKET INTELLIGENCE
-# =========================================================
+# ============================================================
+# SALIGA AI — MARKET INTELLIGENCE PRO
+# OKX ONLY
+# NO EMA
+# NO SMA
+# MULTI-TIMEFRAME MARKET STRUCTURE
+# ============================================================
 
-APP_NAME = "SALIGA AI 7.1"
-DB_FILE = "saliga_market.db"
+VERSION = "SALIGA AI PRO 8.0"
 
 ASSETS = {
     "BTC": "BTC/USDT:USDT",
@@ -32,273 +35,193 @@ ASSETS = {
     "SOL": "SOL/USDT:USDT",
 }
 
-TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h"]
+TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"]
 
-logging.basicConfig(level=logging.ERROR)
-
-
-# =========================================================
-# STREAMLIT CONFIG
-# =========================================================
-
-st.set_page_config(
-    page_title=APP_NAME,
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
+DB_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "saliga_ai_history.db"
 )
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("SALIGA_AI")
 
-# =========================================================
-# LIGHT THEME
-# =========================================================
+
+# ============================================================
+# STREAMLIT CONFIGURATION
+# ============================================================
+
+st.set_page_config(
+    page_title="SALIGA AI PRO",
+    page_icon="📊",
+    layout="wide"
+)
 
 st.markdown("""
 <style>
 
 .stApp {
-    background-color: #f4f7fb;
+    background-color: #f3f5f9;
     color: #172033;
 }
 
-header[data-testid="stHeader"] {
-    background-color: #f4f7fb;
+[data-testid="stSidebar"] {
+    background-color: #e8edf5;
 }
 
-section[data-testid="stSidebar"] {
-    background-color: #ffffff;
-    border-right: 1px solid #dce3ed;
-}
-
-h1, h2, h3, h4 {
-    color: #172033 !important;
-}
-
-p, label, span, div {
-    color: inherit;
+.block-container {
+    padding-top: 1.2rem;
+    max-width: 1600px;
 }
 
 [data-testid="stMetric"] {
-    background: #ffffff;
+    background: white;
     border: 1px solid #dce3ed;
-    padding: 15px;
+    padding: 12px;
     border-radius: 12px;
 }
 
-[data-testid="stMetricValue"] {
-    color: #172033 !important;
+.signal-card {
+    background: white;
+    border: 1px solid #dce3ed;
+    border-radius: 14px;
+    padding: 18px;
 }
 
-[data-testid="stMetricLabel"] {
-    color: #64748b !important;
+.long {
+    color: #07834c;
+    font-weight: bold;
 }
 
-.stButton button {
-    border-radius: 9px;
-    border: 1px solid #cbd5e1;
-    background: #ffffff;
-    color: #172033;
+.short {
+    color: #d12626;
+    font-weight: bold;
 }
 
-.stButton button:hover {
-    border-color: #2563eb;
-    color: #2563eb;
-}
-
-.long-box {
-    background: #e9f9ef;
-    border-left: 5px solid #16a34a;
-    padding: 14px;
-    border-radius: 8px;
-    margin-bottom: 8px;
-}
-
-.short-box {
-    background: #fff0f0;
-    border-left: 5px solid #dc2626;
-    padding: 14px;
-    border-radius: 8px;
-    margin-bottom: 8px;
-}
-
-.neutral-box {
-    background: #edf2f7;
-    border-left: 5px solid #64748b;
-    padding: 14px;
-    border-radius: 8px;
-    margin-bottom: 8px;
-}
-
-.small-text {
-    font-size: 12px;
-    color: #64748b;
+.wait {
+    color: #a66b00;
+    font-weight: bold;
 }
 
 </style>
 """, unsafe_allow_html=True)
 
 
-# =========================================================
+# ============================================================
 # DATABASE
-# =========================================================
+# ============================================================
 
-def get_db():
+def init_database():
 
-    conn = sqlite3.connect(
-        DB_FILE,
-        check_same_thread=False,
-        timeout=30
-    )
+    with sqlite3.connect(DB_PATH) as db:
 
-    conn.execute("PRAGMA journal_mode=WAL")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS market_history (
 
-    return conn
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
 
+                symbol TEXT,
+                timestamp INTEGER,
 
-def migrate_database():
+                open_interest REAL,
+                price REAL,
 
-    conn = get_db()
-    cur = conn.cursor()
+                cvd REAL,
+                delta REAL
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS oi_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            timestamp INTEGER,
-            oi REAL
-        )
-    """)
-
-    cur.execute("PRAGMA table_info(oi_history)")
-    columns = [row[1] for row in cur.fetchall()]
-
-    # Régi adatbázis: open_interest oszlop
-    if "oi" not in columns:
-
-        cur.execute("""
-            ALTER TABLE oi_history
-            ADD COLUMN oi REAL
+            )
         """)
 
-        columns.append("oi")
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_market_history_symbol_time
 
-    if "open_interest" in columns:
-
-        cur.execute("""
-            UPDATE oi_history
-            SET oi = open_interest
-            WHERE oi IS NULL
+            ON market_history(symbol, timestamp)
         """)
 
-    # Régi timestamp mező kezelése
-    if "timestamp" not in columns:
-
-        cur.execute("""
-            ALTER TABLE oi_history
-            ADD COLUMN timestamp INTEGER
-        """)
-
-        columns.append("timestamp")
-
-    if "ts" in columns:
-
-        cur.execute("""
-            UPDATE oi_history
-            SET timestamp = ts
-            WHERE timestamp IS NULL
-        """)
-
-    # Régi szimbólummező ellenőrzése
-    if "symbol" not in columns:
-
-        cur.execute("""
-            ALTER TABLE oi_history
-            ADD COLUMN symbol TEXT
-        """)
-
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_oi_symbol_time
-        ON oi_history(symbol, timestamp)
-    """)
-
-    conn.commit()
-    conn.close()
+        db.commit()
 
 
-def save_oi(symbol, value):
+def save_market_snapshot(
+    symbol,
+    oi,
+    price,
+    cvd,
+    delta
+):
 
-    if value is None:
+    if oi is None:
         return
 
-    conn = get_db()
+    timestamp = int(time.time())
 
-    now = int(time.time())
+    with sqlite3.connect(DB_PATH) as db:
 
-    conn.execute("""
-        INSERT INTO oi_history(symbol, timestamp, oi)
-        VALUES (?, ?, ?)
-    """, (symbol, now, float(value)))
+        db.execute("""
+            INSERT INTO market_history
+            (
+                symbol,
+                timestamp,
+                open_interest,
+                price,
+                cvd,
+                delta
+            )
 
-    conn.commit()
-    conn.close()
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            symbol,
+            timestamp,
+            oi,
+            price,
+            cvd,
+            delta
+        ))
+
+        db.execute("""
+            DELETE FROM market_history
+            WHERE timestamp < ?
+        """, (timestamp - 60 * 86400,))
+
+        db.commit()
 
 
-def previous_oi(symbol, minutes=15):
-
-    conn = get_db()
+def get_previous_snapshot(symbol, minutes=15):
 
     cutoff = int(time.time()) - minutes * 60
 
-    row = conn.execute("""
-        SELECT oi, timestamp
-        FROM oi_history
-        WHERE symbol = ?
-        AND timestamp <= ?
-        AND oi IS NOT NULL
-        ORDER BY timestamp DESC
-        LIMIT 1
-    """, (symbol, cutoff)).fetchone()
+    with sqlite3.connect(DB_PATH) as db:
 
-    conn.close()
+        row = db.execute("""
+            SELECT
+                open_interest,
+                price,
+                cvd,
+                delta
 
-    if row:
-        return row[0], row[1]
+            FROM market_history
 
-    return None, None
+            WHERE symbol = ?
+            AND timestamp <= ?
 
+            ORDER BY timestamp DESC
 
-def get_oi_history(symbol, limit=100):
+            LIMIT 1
+        """, (symbol, cutoff)).fetchone()
 
-    conn = get_db()
+    if not row:
+        return None
 
-    rows = conn.execute("""
-        SELECT timestamp, oi
-        FROM oi_history
-        WHERE symbol = ?
-        AND oi IS NOT NULL
-        ORDER BY timestamp DESC
-        LIMIT ?
-    """, (symbol, limit)).fetchall()
-
-    conn.close()
-
-    return rows
+    return {
+        "oi": row[0],
+        "price": row[1],
+        "cvd": row[2],
+        "delta": row[3]
+    }
 
 
-# =========================================================
-# START DATABASE MIGRATION
-# =========================================================
-
-try:
-    migrate_database()
-except Exception as e:
-    st.error(f"Adatbázis inicializálási hiba: {e}")
-    st.stop()
-
-
-# =========================================================
+# ============================================================
 # OKX CONNECTION
-# =========================================================
+# ============================================================
 
 @st.cache_resource
 def get_exchange():
@@ -316,18 +239,19 @@ def get_exchange():
     return exchange
 
 
-def fetch_ohlcv(symbol, timeframe="15m", limit=150):
+@st.cache_data(ttl=15, show_spinner=False)
+def get_ohlcv(symbol, timeframe, limit=350):
 
     exchange = get_exchange()
 
-    data = exchange.fetch_ohlcv(
+    candles = exchange.fetch_ohlcv(
         symbol,
         timeframe=timeframe,
         limit=limit
     )
 
     df = pd.DataFrame(
-        data,
+        candles,
         columns=[
             "timestamp",
             "open",
@@ -338,7 +262,7 @@ def fetch_ohlcv(symbol, timeframe="15m", limit=150):
         ]
     )
 
-    df["datetime"] = pd.to_datetime(
+    df["timestamp"] = pd.to_datetime(
         df["timestamp"],
         unit="ms",
         utc=True
@@ -347,57 +271,67 @@ def fetch_ohlcv(symbol, timeframe="15m", limit=150):
     return df
 
 
-def fetch_ticker(symbol):
+@st.cache_data(ttl=15, show_spinner=False)
+def get_ticker(symbol):
 
-    exchange = get_exchange()
-
-    return exchange.fetch_ticker(symbol)
+    return get_exchange().fetch_ticker(symbol)
 
 
-def fetch_orderbook(symbol):
+@st.cache_data(ttl=15, show_spinner=False)
+def get_orderbook(symbol):
 
-    exchange = get_exchange()
-
-    return exchange.fetch_order_book(
+    return get_exchange().fetch_order_book(
         symbol,
-        limit=20
+        limit=50
     )
 
 
-def fetch_trades(symbol):
+@st.cache_data(ttl=15, show_spinner=False)
+def get_trades(symbol):
 
-    exchange = get_exchange()
-
-    return exchange.fetch_trades(
+    return get_exchange().fetch_trades(
         symbol,
         limit=300
     )
 
 
-def fetch_open_interest(symbol):
+@st.cache_data(ttl=30, show_spinner=False)
+def get_open_interest(symbol):
 
     exchange = get_exchange()
 
     try:
 
-        result = exchange.fetch_open_interest(symbol)
+        data = exchange.fetch_open_interest(symbol)
 
-        value = result.get("openInterestAmount")
-
-        if value is None:
-            value = result.get("openInterestValue")
+        value = data.get("openInterestAmount")
 
         if value is None:
-            value = result.get("openInterest")
+            value = data.get("openInterest")
 
         if value is None:
-            info = result.get("info", {})
+            return None
 
-            value = (
-                info.get("oi")
-                or info.get("oiCcy")
-                or info.get("oiUsd")
-            )
+        return float(value)
+
+    except Exception as error:
+
+        logger.warning(
+            "Open Interest error: %s",
+            error
+        )
+
+        return None
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_funding(symbol):
+
+    try:
+
+        data = get_exchange().fetch_funding_rate(symbol)
+
+        value = data.get("fundingRate")
 
         if value is None:
             return None
@@ -405,682 +339,751 @@ def fetch_open_interest(symbol):
         return float(value)
 
     except Exception:
+
         return None
 
 
-def fetch_funding(symbol):
+# ============================================================
+# PRICE STRUCTURE
+# ============================================================
 
-    exchange = get_exchange()
+def calculate_atr(df, period=14):
 
-    try:
+    previous_close = df["close"].shift(1)
 
-        result = exchange.fetch_funding_rate(symbol)
+    tr = pd.concat([
 
-        return float(result.get("fundingRate", 0))
+        df["high"] - df["low"],
 
-    except Exception:
-        return None
+        (df["high"] - previous_close).abs(),
+
+        (df["low"] - previous_close).abs()
+
+    ], axis=1).max(axis=1)
+
+    return tr.rolling(period).mean()
 
 
-# =========================================================
-# INDICATORS
-# =========================================================
+def calculate_rsi(df, period=14):
 
-def calculate_indicators(df):
+    change = df["close"].diff()
 
-    df = df.copy()
+    gain = change.clip(lower=0)
 
-    df["SMA20"] = df["close"].rolling(20).mean()
-    df["SMA50"] = df["close"].rolling(50).mean()
+    loss = -change.clip(upper=0)
 
-    delta = df["close"].diff()
+    avg_gain = gain.rolling(period).mean()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
+    avg_loss = loss.rolling(period).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
 
-    df["RSI"] = 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + rs))
 
-    high_low = df["high"] - df["low"]
-    high_close = abs(df["high"] - df["close"].shift())
-    low_close = abs(df["low"] - df["close"].shift())
 
-    tr = pd.concat(
-        [high_low, high_close, low_close],
-        axis=1
-    ).max(axis=1)
+def calculate_vwap(df):
 
-    df["ATR"] = tr.rolling(14).mean()
+    typical_price = (
+        df["high"] +
+        df["low"] +
+        df["close"]
+    ) / 3
 
-    df["volume_average"] = df["volume"].rolling(20).mean()
+    numerator = (
+        typical_price * df["volume"]
+    ).rolling(48).sum()
+
+    denominator = (
+        df["volume"]
+    ).rolling(48).sum()
+
+    return numerator / denominator.replace(0, np.nan)
+
+
+def prepare_data(df):
+
+    df = df.copy()
+
+    df["atr"] = calculate_atr(df)
+
+    df["rsi"] = calculate_rsi(df)
+
+    df["vwap"] = calculate_vwap(df)
+
+    df["volume_median"] = (
+        df["volume"]
+        .rolling(30)
+        .median()
+    )
+
+    df["volume_ratio"] = (
+        df["volume"] /
+        df["volume_median"].replace(0, np.nan)
+    )
 
     return df
 
 
-# =========================================================
-# ORDER BOOK ANALYSIS
-# =========================================================
-
-def analyze_orderbook(symbol):
-
-    try:
-
-        book = fetch_orderbook(symbol)
-
-        bids = book["bids"][:20]
-        asks = book["asks"][:20]
-
-        bid_volume = sum(
-            price * amount
-            for price, amount in bids
-        )
-
-        ask_volume = sum(
-            price * amount
-            for price, amount in asks
-        )
-
-        total = bid_volume + ask_volume
-
-        if total == 0:
-            return 0, 0, 0
-
-        imbalance = (
-            (bid_volume - ask_volume) / total
-        )
-
-        return (
-            bid_volume,
-            ask_volume,
-            imbalance
-        )
-
-    except Exception:
-        return 0, 0, 0
-
-
-# =========================================================
-# BUY / SELL FLOW
-# =========================================================
-
-def analyze_trades(symbol):
-
-    try:
-
-        trades = fetch_trades(symbol)
-
-        buy_volume = 0
-        sell_volume = 0
-
-        for trade in trades:
-
-            amount = float(trade.get("amount") or 0)
-
-            side = trade.get("side")
-
-            if side == "buy":
-                buy_volume += amount
-
-            elif side == "sell":
-                sell_volume += amount
-
-        total = buy_volume + sell_volume
-
-        if total == 0:
-            return 0, 0, 0
-
-        delta = buy_volume - sell_volume
-
-        delta_percent = (
-            delta / total
-        ) * 100
-
-        return (
-            buy_volume,
-            sell_volume,
-            delta_percent
-        )
-
-    except Exception:
-        return 0, 0, 0
-
-
-# =========================================================
+# ============================================================
 # MARKET STRUCTURE
-# =========================================================
+# ============================================================
 
-def analyze_structure(df):
+def detect_structure(df):
 
-    if len(df) < 30:
-        return "Nincs elegendő adat"
+    if len(df) < 40:
 
-    recent = df.tail(20)
+        return {
+            "bias": 0,
+            "event": "Insufficient data",
+            "support": None,
+            "resistance": None
+        }
 
-    highs = recent["high"]
-    lows = recent["low"]
+    high = df["high"].to_numpy()
 
-    higher_high = highs.iloc[-1] > highs.iloc[0]
-    higher_low = lows.iloc[-1] > lows.iloc[0]
+    low = df["low"].to_numpy()
 
-    lower_high = highs.iloc[-1] < highs.iloc[0]
-    lower_low = lows.iloc[-1] < lows.iloc[0]
+    close = float(df["close"].iloc[-1])
 
-    if higher_high and higher_low:
-        return "Emelkedő piaci struktúra"
+    swing_high = max(high[-25:-1])
 
-    if lower_high and lower_low:
-        return "Csökkenő piaci struktúra"
+    swing_low = min(low[-25:-1])
 
-    return "Oldalazó / vegyes struktúra"
+    bias = 0
 
+    event = "No confirmed structure break"
+
+    if close > swing_high:
+
+        bias = 2
+
+        event = "BULLISH BOS"
+
+    elif close < swing_low:
+
+        bias = -2
+
+        event = "BEARISH BOS"
+
+    return {
+        "bias": bias,
+        "event": event,
+        "support": swing_low,
+        "resistance": swing_high
+    }
+
+
+# ============================================================
+# LIQUIDITY SWEEPS
+# ============================================================
 
 def detect_liquidity_sweep(df):
 
-    if len(df) < 25:
-        return "Nincs adat"
+    if len(df) < 30:
 
-    previous = df.iloc[-21:-1]
-    current = df.iloc[-1]
+        return "Insufficient data"
 
-    old_high = previous["high"].max()
-    old_low = previous["low"].min()
+    candle = df.iloc[-1]
 
-    if (
-        current["high"] > old_high
-        and current["close"] < old_high
-    ):
-        return "Felső likviditás kisöprés"
+    previous = df.iloc[-25:-1]
+
+    previous_high = previous["high"].max()
+
+    previous_low = previous["low"].min()
 
     if (
-        current["low"] < old_low
-        and current["close"] > old_low
+        candle["high"] > previous_high
+        and candle["close"] < previous_high
     ):
-        return "Alsó likviditás kisöprés"
 
-    return "Nem észlelhető egyértelmű sweep"
+        return "UPPER LIQUIDITY SWEEP"
+
+    if (
+        candle["low"] < previous_low
+        and candle["close"] > previous_low
+    ):
+
+        return "LOWER LIQUIDITY SWEEP"
+
+    return "No fresh liquidity sweep"
 
 
-# =========================================================
-# OI ANALYSIS
-# =========================================================
+# ============================================================
+# BUY / SELL FLOW
+# ============================================================
 
-def analyze_oi(symbol, current_oi, current_price):
+def calculate_delta(trades):
 
-    if current_oi is None:
-        return {
-            "change": None,
-            "state": "OI adat nem elérhető"
-        }
+    buy_volume = 0.0
 
-    old_oi, old_timestamp = previous_oi(
-        symbol,
-        minutes=15
+    sell_volume = 0.0
+
+    for trade in trades:
+
+        amount = float(
+            trade.get("amount") or 0
+        )
+
+        side = trade.get("side")
+
+        if side == "buy":
+
+            buy_volume += amount
+
+        elif side == "sell":
+
+            sell_volume += amount
+
+    delta = buy_volume - sell_volume
+
+    total = buy_volume + sell_volume
+
+    buy_percentage = (
+        buy_volume / total * 100
+        if total > 0 else 50
     )
 
-    save_oi(symbol, current_oi)
+    return {
+        "buy": buy_volume,
+        "sell": sell_volume,
+        "delta": delta,
+        "buy_percentage": buy_percentage,
+        "total": total
+    }
 
-    if old_oi is None or old_oi == 0:
 
-        return {
-            "change": None,
-            "state": "OI adatgyűjtés folyamatban"
-        }
+# ============================================================
+# ORDER BOOK
+# ============================================================
 
-    change = (
-        (current_oi - old_oi) / abs(old_oi)
-    ) * 100
+def analyze_orderbook(book):
 
-    if change > 0.15:
-        state = "Nyitott pozíciók épülnek"
+    bids = book.get("bids", [])
 
-    elif change < -0.15:
-        state = "Pozíciók záródnak"
+    asks = book.get("asks", [])
+
+    bid_volume = sum(
+        float(level[1])
+        for level in bids[:20]
+    )
+
+    ask_volume = sum(
+        float(level[1])
+        for level in asks[:20]
+    )
+
+    total = bid_volume + ask_volume
+
+    imbalance = (
+        bid_volume / total * 100
+        if total > 0 else 50
+    )
+
+    if imbalance > 55:
+
+        state = "BUYER DOMINANCE"
+
+    elif imbalance < 45:
+
+        state = "SELLER DOMINANCE"
 
     else:
-        state = "OI oldalazás"
+
+        state = "BALANCED ORDER BOOK"
 
     return {
-        "change": change,
+        "bid": bid_volume,
+        "ask": ask_volume,
+        "imbalance": imbalance,
         "state": state
     }
 
 
-# =========================================================
-# INTERNAL MARKET INTELLIGENCE
-# =========================================================
+# ============================================================
+# OPEN INTEREST FLOW
+# ============================================================
 
-def internal_analysis(symbol, ticker, df):
+def analyze_oi(current_oi, previous, current_price):
 
-    df = calculate_indicators(df)
+    if current_oi is None or previous is None:
 
-    last = df.iloc[-1]
-    previous = df.iloc[-2]
+        return {
+            "state": "COLLECTING OI HISTORY",
+            "bias": 0,
+            "change": None
+        }
 
-    price = float(last["close"])
+    old_oi = previous["oi"]
 
-    price_change = (
-        (price - float(previous["close"]))
-        / float(previous["close"])
-    ) * 100
+    old_price = previous["price"]
 
-    rsi = float(last["RSI"]) if pd.notna(last["RSI"]) else 50
+    if not old_oi or not old_price:
 
-    sma20 = float(last["SMA20"]) if pd.notna(last["SMA20"]) else price
-    sma50 = float(last["SMA50"]) if pd.notna(last["SMA50"]) else price
+        return {
+            "state": "INSUFFICIENT OI HISTORY",
+            "bias": 0,
+            "change": None
+        }
 
-    bid_volume, ask_volume, imbalance = analyze_orderbook(symbol)
-
-    buy_volume, sell_volume, delta = analyze_trades(symbol)
-
-    oi_value = fetch_open_interest(symbol)
-
-    oi = analyze_oi(
-        symbol,
-        oi_value,
-        price
+    oi_change = (
+        (current_oi - old_oi) /
+        abs(old_oi) * 100
     )
 
-    funding = fetch_funding(symbol)
+    price_change = (
+        (current_price - old_price) /
+        old_price * 100
+    )
 
-    score = 0
+    if oi_change > 0.15 and price_change > 0.05:
 
-    reasons = []
+        state = "LONG BUILDUP — ESTIMATED"
 
-    if price > sma20:
-        score += 10
-        reasons.append("Ár az SMA20 felett")
+        bias = 1
 
-    else:
-        score -= 10
-        reasons.append("Ár az SMA20 alatt")
+    elif oi_change > 0.15 and price_change < -0.05:
 
-    if sma20 > sma50:
-        score += 15
-        reasons.append("Pozitív SMA20/SMA50 viszony")
+        state = "SHORT BUILDUP — ESTIMATED"
 
-    else:
-        score -= 15
-        reasons.append("Negatív SMA20/SMA50 viszony")
+        bias = -1
 
-    if rsi > 55:
-        score += 10
-        reasons.append("Erősödő RSI")
+    elif oi_change < -0.15 and price_change > 0.05:
 
-    elif rsi < 45:
-        score -= 10
-        reasons.append("Gyengülő RSI")
+        state = "SHORT CLOSING — ESTIMATED"
 
-    if delta > 5:
-        score += 15
-        reasons.append("Vételi dominancia a kötésekben")
+        bias = 1
 
-    elif delta < -5:
-        score -= 15
-        reasons.append("Eladási dominancia a kötésekben")
+    elif oi_change < -0.15 and price_change < -0.05:
 
-    if imbalance > 0.10:
-        score += 10
-        reasons.append("Vevői order book fölény")
+        state = "LONG CLOSING — ESTIMATED"
 
-    elif imbalance < -0.10:
-        score -= 10
-        reasons.append("Eladói order book fölény")
-
-    if price_change > 0.15:
-        score += 10
-
-    elif price_change < -0.15:
-        score -= 10
-
-    if oi["change"] is not None:
-
-        if oi["change"] > 0.15 and price_change > 0:
-            score += 10
-            reasons.append("Áremelkedés és OI-növekedés")
-
-        elif oi["change"] > 0.15 and price_change < 0:
-            score -= 10
-            reasons.append("Áresés és OI-növekedés")
-
-    score = max(-100, min(100, score))
-
-    if score >= 35:
-        signal = "LONG"
-        status = "Vevői fölény"
-
-    elif score <= -35:
-        signal = "SHORT"
-        status = "Eladói fölény"
+        bias = -1
 
     else:
-        signal = "NEUTRAL"
-        status = "Nincs egyértelmű irány"
 
-    structure = analyze_structure(df)
+        state = "MIXED OI FLOW"
 
-    sweep = detect_liquidity_sweep(df)
-
-    if oi["change"] is not None:
-
-        if oi["change"] > 0.15 and price_change > 0:
-            flow = "LONG ÉPÜLÉS – becslés"
-
-        elif oi["change"] > 0.15 and price_change < 0:
-            flow = "SHORT ÉPÜLÉS – becslés"
-
-        elif oi["change"] < -0.15 and price_change > 0:
-            flow = "SHORT ZÁRÁSOK – becslés"
-
-        elif oi["change"] < -0.15 and price_change < 0:
-            flow = "LONG ZÁRÁSOK – becslés"
-
-        else:
-            flow = "Nincs egyértelmű pozícióáramlás"
-
-    else:
-        flow = "OI adatgyűjtés alatt"
+        bias = 0
 
     return {
-        "price": price,
-        "change": price_change,
-        "rsi": rsi,
-        "sma20": sma20,
-        "sma50": sma50,
-        "score": score,
-        "signal": signal,
-        "status": status,
-        "flow": flow,
-        "oi": oi,
-        "oi_value": oi_value,
-        "funding": funding,
-        "delta": delta,
-        "buy_volume": buy_volume,
-        "sell_volume": sell_volume,
-        "imbalance": imbalance,
-        "bid_volume": bid_volume,
-        "ask_volume": ask_volume,
-        "structure": structure,
-        "sweep": sweep,
-        "reasons": reasons,
-        "df": df
+        "state": state,
+        "bias": bias,
+        "change": oi_change,
+        "price_change": price_change
     }
 
 
-# =========================================================
-# GROQ EXTERNAL AI
-# =========================================================
+# ============================================================
+# TRADE PLAN
+# ============================================================
 
-def get_groq_key():
+def calculate_trade_plan(
+    side,
+    price,
+    atr,
+    support,
+    resistance,
+    account,
+    risk_percent
+):
 
-    try:
-        return st.secrets.get("GROQ_API_KEY", "")
-    except Exception:
-        return os.getenv("GROQ_API_KEY", "")
+    if side not in ["LONG", "SHORT"]:
+
+        return None
+
+    if atr is None or not np.isfinite(atr) or atr <= 0:
+
+        return None
+
+    minimum_distance = max(
+        atr * 1.5,
+        price * 0.0015
+    )
+
+    if side == "LONG":
+
+        stop = price - minimum_distance
+
+        if support is not None and support < price:
+
+            structural_stop = support - atr * 0.15
+
+            stop = min(stop, structural_stop)
+
+        distance = price - stop
+
+        direction = 1
+
+    else:
+
+        stop = price + minimum_distance
+
+        if resistance is not None and resistance > price:
+
+            structural_stop = resistance + atr * 0.15
+
+            stop = max(stop, structural_stop)
+
+        distance = stop - price
+
+        direction = -1
+
+    if distance <= 0:
+
+        return None
+
+    risk_amount = account * risk_percent / 100
+
+    position_size = risk_amount / distance
+
+    return {
+
+        "entry": price,
+
+        "stop": stop,
+
+        "target1": price + direction * distance,
+
+        "target2": price + direction * distance * 2,
+
+        "target3": price + direction * distance * 3,
+
+        "risk_amount": risk_amount,
+
+        "position_size": position_size,
+
+        "notional": position_size * price,
+
+        "risk_distance": distance
+
+    }
 
 
-def groq_analysis(results):
+# ============================================================
+# MULTI-TIMEFRAME ANALYSIS
+# ============================================================
 
-    api_key = get_groq_key()
+def calculate_multitimeframe(symbol):
 
-    if not api_key:
-        return "A Groq API-kulcs nincs beállítva."
+    result = {}
 
-    context = {}
+    for timeframe in TIMEFRAMES:
 
-    for asset, data in results.items():
-
-        context[asset] = {
-            "price": data["price"],
-            "price_change": data["change"],
-            "signal": data["signal"],
-            "score": data["score"],
-            "rsi": data["rsi"],
-            "oi_state": data["oi"]["state"],
-            "oi_change": data["oi"]["change"],
-            "flow": data["flow"],
-            "funding": data["funding"],
-            "delta": data["delta"],
-            "orderbook_imbalance": data["imbalance"],
-            "structure": data["structure"],
-            "liquidity_sweep": data["sweep"],
-        }
-
-    prompt = f"""
-Te a SALIGA AI külső piaci elemzője vagy.
-
-Értékeld az alábbi OKX piaci adatokat.
-
-Feladat:
-1. BTC, ETH és SOL irányának értékelése.
-2. Long és short pozícióépülés vizsgálata.
-3. OI és ármozgás összhangja.
-4. Vételi és eladási nyomás.
-5. Eltérő vagy ellentmondó jelzések.
-6. Kockázatok.
-7. Rövid összefoglaló.
-
-Ne találj ki adatokat.
-Ne állítsd, hogy a becslés biztos.
-Különítsd el a tényadatokat és az értelmezést.
-
-Adatok:
-{json.dumps(context, ensure_ascii=False, default=str)}
-"""
-
-    try:
-
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "openai/gpt-oss-120b",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a careful cryptocurrency market analyst."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "temperature": 0.3,
-                "max_completion_tokens": 1500
-            },
-            timeout=60
+        df = prepare_data(
+            get_ohlcv(symbol, timeframe)
         )
 
-        response.raise_for_status()
-
-        return response.json()["choices"][0]["message"]["content"]
-
-    except Exception as e:
-
-        return f"Groq elemzési hiba: {e}"
-
-
-# =========================================================
-# CHATBOT
-# =========================================================
-
-def groq_chat(question, results, history):
-
-    api_key = get_groq_key()
-
-    if not api_key:
-        return "A Groq API-kulcs nincs beállítva."
-
-    market_context = {}
-
-    for asset, data in results.items():
-
-        market_context[asset] = {
-            "price": data["price"],
-            "signal": data["signal"],
-            "score": data["score"],
-            "flow": data["flow"],
-            "oi": data["oi"],
-            "rsi": data["rsi"],
-            "delta": data["delta"],
-            "funding": data["funding"]
+        result[timeframe] = {
+            "data": df,
+            "structure": detect_structure(df)
         }
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Te a SALIGA AI kriptopiaci asszisztense vagy. "
-                "Magyarul válaszolj. "
-                "Csak a megadott adatokat tekintsd aktuális piaci adatnak. "
-                "Ne találj ki árakat vagy eseményeket."
-                "\nPiaci adatok: "
-                + json.dumps(
-                    market_context,
-                    ensure_ascii=False,
-                    default=str
-                )
-            )
-        }
+    return result
+
+
+# ============================================================
+# INTERNAL INTELLIGENCE ENGINE
+# ============================================================
+
+def run_engine(asset, symbol, account, risk_percent):
+
+    frames = calculate_multitimeframe(symbol)
+
+    main = frames["15m"]["data"]
+
+    ticker = get_ticker(symbol)
+
+    price = float(
+        ticker.get("last") or
+        main["close"].iloc[-1]
+    )
+
+    current_oi = get_open_interest(symbol)
+
+    trades = calculate_delta(
+        get_trades(symbol)
+    )
+
+    book = analyze_orderbook(
+        get_orderbook(symbol)
+    )
+
+    previous = get_previous_snapshot(
+        symbol,
+        15
+    )
+
+    oi = analyze_oi(
+        current_oi,
+        previous,
+        price
+    )
+
+    save_market_snapshot(
+        symbol,
+        current_oi,
+        price,
+        None,
+        trades["delta"]
+    )
+
+    structures = {
+        tf: frames[tf]["structure"]
+        for tf in TIMEFRAMES
+    }
+
+    sweep = detect_liquidity_sweep(main)
+
+    last = main.iloc[-1]
+
+    rsi = float(last["rsi"])
+
+    atr = float(last["atr"])
+
+    vwap = float(last["vwap"])
+
+    score = 0.0
+
+    weights = {
+        "5m": 0.10,
+        "15m": 0.15,
+        "1h": 0.20,
+        "4h": 0.30,
+        "1d": 0.25
+    }
+
+    for timeframe, weight in weights.items():
+
+        score += (
+            structures[timeframe]["bias"]
+            * weight
+            * 12
+        )
+
+    score += np.clip(
+        (trades["buy_percentage"] - 50) / 5,
+        -2,
+        2
+    ) * 4
+
+    score += np.clip(
+        (book["imbalance"] - 50) / 5,
+        -2,
+        2
+    ) * 2
+
+    score += oi["bias"] * 5
+
+    if price > vwap:
+
+        score += 3
+
+    else:
+
+        score -= 3
+
+    if rsi > 75:
+
+        score -= 3
+
+    elif rsi < 25:
+
+        score += 3
+
+    if sweep == "LOWER LIQUIDITY SWEEP":
+
+        score += 3
+
+    elif sweep == "UPPER LIQUIDITY SWEEP":
+
+        score -= 3
+
+    # Reduce the signal strength if major timeframes conflict.
+    major_bias = [
+        np.sign(structures["1h"]["bias"]),
+        np.sign(structures["4h"]["bias"]),
+        np.sign(structures["1d"]["bias"])
     ]
 
-    messages.extend(history[-8:])
+    conflict = (
+        1 in major_bias and
+        -1 in major_bias
+    )
 
-    messages.append({
-        "role": "user",
-        "content": question
-    })
+    if conflict:
+
+        score *= 0.65
+
+    if score >= 12:
+
+        signal = "LONG"
+
+    elif score <= -12:
+
+        signal = "SHORT"
+
+    else:
+
+        signal = "WAIT"
+
+    plan = calculate_trade_plan(
+        signal,
+        price,
+        atr,
+        structures["1h"]["support"],
+        structures["1h"]["resistance"],
+        account,
+        risk_percent
+    )
+
+    return {
+
+        "asset": asset,
+
+        "price": price,
+
+        "signal": signal,
+
+        "score": score,
+
+        "rsi": rsi,
+
+        "atr": atr,
+
+        "vwap": vwap,
+
+        "frames": frames,
+
+        "structures": structures,
+
+        "oi": oi,
+
+        "trades": trades,
+
+        "book": book,
+
+        "sweep": sweep,
+
+        "plan": plan,
+
+        "conflict": conflict
+
+    }
+
+
+# ============================================================
+# NEWS
+# ============================================================
+
+@st.cache_data(ttl=300)
+def get_news():
+
+    feeds = [
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cointelegraph.com/rss"
+    ]
+
+    news = []
+
+    for feed in feeds:
+
+        try:
+
+            parsed = feedparser.parse(feed)
+
+            for item in parsed.entries[:8]:
+
+                news.append({
+                    "title": item.get("title", ""),
+                    "link": item.get("link", ""),
+                    "source": feed
+                })
+
+        except Exception:
+
+            continue
+
+    return news[:15]
+
+
+# ============================================================
+# GROQ AI
+# ============================================================
+
+def groq_chat(question, context):
+
+    api_key = st.secrets.get(
+        "GROQ_API_KEY",
+        os.getenv("GROQ_API_KEY", "")
+    )
+
+    if not api_key:
+
+        return (
+            "A Groq API-kulcs nincs beállítva. "
+            "A belső elemzőmotor ettől függetlenül működik."
+        )
 
     try:
 
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "openai/gpt-oss-120b",
-                "messages": messages,
-                "temperature": 0.3,
-                "max_completion_tokens": 1200
-            },
-            timeout=60
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1"
         )
 
-        response.raise_for_status()
+        response = client.chat.completions.create(
 
-        return response.json()["choices"][0]["message"]["content"]
+            model="openai/gpt-oss-120b",
 
-    except Exception as e:
+            temperature=0.2,
 
-        return f"Chatbot hiba: {e}"
+            max_tokens=1500,
 
+            messages=[
 
-# =========================================================
-# CHART
-# =========================================================
+                {
+                    "role": "system",
 
-def show_chart(asset, data):
+                    "content": (
+                        "Te a SALIGA AI professzionális kriptopiaci "
+                        "elemzőasszisztense vagy. Magyarul válaszolj. "
+                        "Ne találj ki adatokat. Különítsd el a tényeket "
+                        "és a becsléseket. Magyarázd el a piaci "
+                        "ellentmondásokat. Ne ígérj biztos nyereséget."
+                    )
+                },
 
-    df = data["df"]
+                {
+                    "role": "user",
 
-    fig = go.Figure()
+                    "content": (
+                        f"PIACI ADATOK:\n{context}\n\n"
+                        f"KÉRDÉS:\n{question}"
+                    )
+                }
 
-    fig.add_trace(
-        go.Candlestick(
-            x=df["datetime"],
-            open=df["open"],
-            high=df["high"],
-            low=df["low"],
-            close=df["close"],
-            name=asset
+            ]
         )
-    )
 
-    fig.add_trace(
-        go.Scatter(
-            x=df["datetime"],
-            y=df["SMA20"],
-            name="SMA20",
-            line=dict(width=1)
-        )
-    )
+        return response.choices[0].message.content
 
-    fig.add_trace(
-        go.Scatter(
-            x=df["datetime"],
-            y=df["SMA50"],
-            name="SMA50",
-            line=dict(width=1)
-        )
-    )
+    except Exception as error:
 
-    fig.update_layout(
-        height=450,
-        template="plotly_white",
-        xaxis_rangeslider_visible=False,
-        margin=dict(l=10, r=10, t=30, b=10)
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True
-    )
+        return f"Groq hiba: {error}"
 
 
-# =========================================================
-# SESSION STATE
-# =========================================================
-
-if "results" not in st.session_state:
-    st.session_state.results = {}
-
-if "chat" not in st.session_state:
-    st.session_state.chat = []
-
-if "last_internal" not in st.session_state:
-    st.session_state.last_internal = None
-
-if "last_groq" not in st.session_state:
-    st.session_state.last_groq = None
-
-if "last_errors" not in st.session_state:
-    st.session_state.last_errors = {}
-
-
-# =========================================================
+# ============================================================
 # SIDEBAR
-# =========================================================
+# ============================================================
 
-st.sidebar.title("SALIGA AI")
-
-st.sidebar.caption("Market Intelligence 7.1")
+st.sidebar.title("SALIGA AI PRO")
 
 selected_assets = st.sidebar.multiselect(
-    "Elemzett eszközök",
+    "Piacok",
     list(ASSETS.keys()),
     default=["BTC", "ETH", "SOL"]
-)
-
-timeframe = st.sidebar.selectbox(
-    "Elemzési idősík",
-    TIMEFRAMES,
-    index=2
-)
-
-refresh_seconds = st.sidebar.slider(
-    "Automatikus frissítés (másodperc)",
-    30,
-    300,
-    60,
-    30
 )
 
 auto_refresh = st.sidebar.toggle(
@@ -1088,155 +1091,160 @@ auto_refresh = st.sidebar.toggle(
     value=True
 )
 
-run_groq_auto = st.sidebar.toggle(
-    "Groq automatikus külső elemzés",
-    value=False
+refresh_time = st.sidebar.selectbox(
+    "Frissítés másodpercben",
+    [15, 30, 60, 120],
+    index=1
 )
 
-if st.sidebar.button("MOSTANI ELEMZÉS FRISSÍTÉSE"):
-    st.session_state.force_refresh = True
-else:
-    if "force_refresh" not in st.session_state:
-        st.session_state.force_refresh = False
+account = st.sidebar.number_input(
+    "Számlaegyenleg USDT",
+    min_value=10.0,
+    value=10000.0,
+    step=100.0
+)
 
+risk_percent = st.sidebar.number_input(
+    "Kockázat pozíciónként (%)",
+    min_value=0.1,
+    max_value=5.0,
+    value=1.0,
+    step=0.1
+)
 
-# =========================================================
-# AUTO REFRESH
-# =========================================================
-
-if auto_refresh and st_autorefresh is not None:
+if auto_refresh and st_autorefresh:
 
     st_autorefresh(
-        interval=refresh_seconds * 1000,
+        interval=refresh_time * 1000,
         key="saliga_refresh"
     )
 
 
-# =========================================================
-# HEADER
-# =========================================================
+# ============================================================
+# MAIN DASHBOARD
+# ============================================================
 
-st.title("📊 SALIGA AI – Market Intelligence")
+init_database()
+
+st.title("⚡ SALIGA AI — MARKET INTELLIGENCE PRO")
 
 st.caption(
-    "OKX ONLY | Internal Engine + External AI"
+    f"{VERSION} | OKX ONLY | INTERNAL ENGINE + GROQ AI"
 )
 
 st.info(
-    "A belső elemzés piaci adatokból számított becsléseket használ. "
-    "A jelzések nem garantálnak kereskedési eredményt."
+    "Az elemzőmotor nem használ EMA-t vagy SMA-t. "
+    "A döntéseket több idősík, piaci struktúra, volumen, "
+    "Open Interest, delta, order book és likviditás alapján hozza."
 )
 
+if not selected_assets:
 
-# =========================================================
-# DATA COLLECTION
-# =========================================================
+    st.warning("Válassz ki legalább egy piacot.")
 
-should_update = (
-    not st.session_state.results
-    or st.session_state.force_refresh
-)
-
-if auto_refresh:
-    should_update = True
-
-if selected_assets:
-
-    if should_update:
-
-        new_results = {}
-        errors = {}
-
-        progress = st.progress(0)
-
-        for index, asset in enumerate(selected_assets):
-
-            symbol = ASSETS[asset]
-
-            try:
-
-                ticker = fetch_ticker(symbol)
-
-                df = fetch_ohlcv(
-                    symbol,
-                    timeframe,
-                    150
-                )
-
-                if df.empty:
-                    raise ValueError("Üres OHLCV adat")
-
-                result = internal_analysis(
-                    symbol,
-                    ticker,
-                    df
-                )
-
-                new_results[asset] = result
-
-            except Exception as e:
-
-                errors[asset] = str(e)
-
-            progress.progress(
-                (index + 1) / len(selected_assets)
-            )
-
-        progress.empty()
-
-        if new_results:
-
-            st.session_state.results = new_results
-
-            st.session_state.last_internal = (
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
-
-            st.session_state.last_errors = errors
-
-            st.session_state.force_refresh = False
-
-            if run_groq_auto:
-                st.session_state.last_groq = groq_analysis(
-                    new_results
-                )
-
-        else:
-
-            st.session_state.last_errors = errors
-
-    else:
-
-        st.session_state.force_refresh = False
-
-else:
-
-    st.warning("Válassz legalább egy eszközt.")
+    st.stop()
 
 
-# =========================================================
-# RESULTS
-# =========================================================
+results = {}
 
-results = st.session_state.results
+errors = {}
 
-if results:
-
-    st.success(
-        "Utolsó belső elemzés: "
-        + str(st.session_state.last_internal)
-    )
+with st.spinner("OKX piaci adatok elemzése..."):
 
     for asset in selected_assets:
 
-        if asset not in results:
-            continue
+        try:
 
-        data = results[asset]
+            results[asset] = run_engine(
+                asset,
+                ASSETS[asset],
+                account,
+                risk_percent
+            )
 
-        st.markdown("---")
+        except Exception as error:
 
-        st.header(f"{asset} – Piaci elemzés")
+            errors[asset] = str(error)
+
+
+for asset, error in errors.items():
+
+    st.error(f"{asset}: {error}")
+
+
+if not results:
+
+    st.error(
+        "Nem érkezett használható adat az OKX-ről."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# SIGNAL CARDS
+# ============================================================
+
+columns = st.columns(len(results))
+
+for column, (asset, data) in zip(columns, results.items()):
+
+    signal = data["signal"]
+
+    css = (
+        "long" if signal == "LONG"
+        else "short" if signal == "SHORT"
+        else "wait"
+    )
+
+    column.markdown(
+        f"""
+        <div class="signal-card">
+
+        <h3>{asset}</h3>
+
+        <h2 class="{css}">{signal}</h2>
+
+        <p>Ár: {data["price"]:,.4f}</p>
+
+        <p>Score: {data["score"]:+.1f}</p>
+
+        <p>RSI: {data["rsi"]:.1f}</p>
+
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# ============================================================
+# TABS
+# ============================================================
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+
+    "📊 Piaci elemzés",
+
+    "🎯 Target / Stop Loss",
+
+    "🧭 Multi-Timeframe",
+
+    "📰 Hírek / AI",
+
+    "💬 SALIGA AI Chat"
+
+])
+
+
+# ============================================================
+# MARKET ANALYSIS
+# ============================================================
+
+with tab1:
+
+    for asset, data in results.items():
+
+        st.subheader(asset)
 
         c1, c2, c3, c4 = st.columns(4)
 
@@ -1246,64 +1254,23 @@ if results:
         )
 
         c2.metric(
-            "Árváltozás",
-            f"{data['change']:+.2f}%"
-        )
-
-        c3.metric(
-            "Belső pontszám",
-            f"{data['score']:+d}/100"
-        )
-
-        c4.metric(
             "RSI",
             f"{data['rsi']:.1f}"
         )
 
-        if data["signal"] == "LONG":
+        c3.metric(
+            "ATR",
+            f"{data['atr']:.4f}"
+        )
 
-            st.markdown(
-                f"""
-                <div class="long-box">
-                <b>🟢 LONG – {data['status']}</b><br>
-                Belső pontszám: {data['score']}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-        elif data["signal"] == "SHORT":
-
-            st.markdown(
-                f"""
-                <div class="short-box">
-                <b>🔴 SHORT – {data['status']}</b><br>
-                Belső pontszám: {data['score']}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-        else:
-
-            st.markdown(
-                f"""
-                <div class="neutral-box">
-                <b>⚪ SEMLEGES – {data['status']}</b><br>
-                Belső pontszám: {data['score']}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-        # POSITION FLOW
-
-        st.subheader("Pozícióáramlás")
-
-        st.write(data["flow"])
+        c4.metric(
+            "Order Book",
+            data["book"]["state"]
+        )
 
         st.write(
-            f"OI állapot: {data['oi']['state']}"
+            "**Open Interest:**",
+            data["oi"]["state"]
         )
 
         if data["oi"]["change"] is not None:
@@ -1313,176 +1280,354 @@ if results:
             )
 
         st.write(
-            f"Vételi volumen: {data['buy_volume']:.4f}"
+            "**Becsült delta:**",
+            f"{data['trades']['delta']:+.4f}"
         )
 
         st.write(
-            f"Eladási volumen: {data['sell_volume']:.4f}"
+            "**Vevői arány:**",
+            f"{data['trades']['buy_percentage']:.1f}%"
         )
 
         st.write(
-            f"Becsült delta: {data['delta']:+.2f}%"
+            "**Order Book imbalance:**",
+            f"{data['book']['imbalance']:.1f}%"
         )
 
         st.write(
-            f"Order book imbalance: {data['imbalance']:+.3f}"
+            "**Likviditás:**",
+            data["sweep"]
         )
 
-        if data["funding"] is not None:
+        st.write(
+            "**1H struktúra:**",
+            data["structures"]["1h"]["event"]
+        )
 
-            st.write(
-                f"Funding: {data['funding'] * 100:.4f}%"
+        if data["conflict"]:
+
+            st.warning(
+                "A magasabb idősíkok között irányellentmondás van."
             )
 
-        st.write(
-            f"Piaci struktúra: {data['structure']}"
-        )
+        df = data["frames"]["15m"]["data"].tail(150)
 
-        st.write(
-            f"Likviditás: {data['sweep']}"
-        )
+        fig = go.Figure()
 
-        with st.expander("Belső elemzés indokai"):
+        fig.add_trace(
+            go.Candlestick(
 
-            for reason in data["reasons"]:
-                st.write("• " + reason)
+                x=df["timestamp"],
 
-        with st.expander("Grafikon"):
+                open=df["open"],
 
-            show_chart(asset, data)
+                high=df["high"],
 
-        with st.expander("OI-adatok"):
+                low=df["low"],
 
-            history = get_oi_history(
-                ASSETS[asset]
+                close=df["close"],
+
+                name=asset
+
             )
-
-            if history:
-
-                history_df = pd.DataFrame(
-                    history,
-                    columns=["timestamp", "oi"]
-                )
-
-                history_df["datetime"] = pd.to_datetime(
-                    history_df["timestamp"],
-                    unit="s"
-                )
-
-                st.line_chart(
-                    history_df.set_index("datetime")["oi"]
-                )
-
-            else:
-
-                st.info("Még nincs elegendő OI-adat.")
-
-
-# =========================================================
-# DATA ERRORS
-# =========================================================
-
-if st.session_state.last_errors:
-
-    st.markdown("---")
-
-    st.subheader("Adatlekérési hibák")
-
-    for asset, error in st.session_state.last_errors.items():
-
-        st.error(
-            f"{asset}: {error}"
         )
 
+        fig.add_trace(
+            go.Scatter(
 
-# =========================================================
-# GROQ EXTERNAL AI
-# =========================================================
+                x=df["timestamp"],
 
-st.markdown("---")
+                y=df["vwap"],
 
-st.header("🧠 SALIGA AI – Külső AI elemzés")
+                name="VWAP",
 
-if st.button("KÜLSŐ AI ELEMZÉS INDÍTÁSA"):
+                line=dict(width=1.5)
 
-    if results:
-
-        with st.spinner("A Groq elemzi a piaci adatokat..."):
-
-            st.session_state.last_groq = groq_analysis(
-                results
             )
+        )
 
-    else:
+        fig.update_layout(
 
-        st.warning("Nincs elérhető piaci adat.")
+            template="plotly_white",
+
+            height=450,
+
+            xaxis_rangeslider_visible=False
+
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True
+        )
+
+        st.divider()
 
 
-if st.session_state.last_groq:
+# ============================================================
+# TARGETS AND STOP LOSS
+# ============================================================
 
-    st.markdown(
-        st.session_state.last_groq
+with tab2:
+
+    st.subheader(
+        "Kereskedési terv — belépő / stop / target"
     )
 
+    for asset, data in results.items():
 
-# =========================================================
-# CHATBOT
-# =========================================================
+        st.markdown(f"### {asset}")
 
-st.markdown("---")
+        plan = data["plan"]
 
-st.header("💬 SALIGA AI – Kérdezz az elemzésről")
+        if plan is None:
 
-for message in st.session_state.chat:
+            st.warning(
+                "Nincs megfelelő LONG vagy SHORT jelzés. "
+                "A rendszer kivár."
+            )
 
-    with st.chat_message(message["role"]):
+            continue
 
-        st.markdown(message["content"])
+        st.write(
+            f"**Irány:** {data['signal']}"
+        )
+
+        st.write(
+            f"**Referencia belépő:** {plan['entry']:,.6f}"
+        )
+
+        a, b, c, d = st.columns(4)
+
+        a.metric(
+            "STOP LOSS",
+            f"{plan['stop']:,.6f}"
+        )
+
+        b.metric(
+            "TARGET 1 — 1R",
+            f"{plan['target1']:,.6f}"
+        )
+
+        c.metric(
+            "TARGET 2 — 2R",
+            f"{plan['target2']:,.6f}"
+        )
+
+        d.metric(
+            "TARGET 3 — 3R",
+            f"{plan['target3']:,.6f}"
+        )
+
+        st.write(
+            f"**Kockáztatott összeg:** "
+            f"{plan['risk_amount']:.2f} USDT"
+        )
+
+        st.write(
+            f"**Becsült pozícióméret:** "
+            f"{plan['position_size']:.6f} {asset}"
+        )
+
+        st.write(
+            f"**Névleges pozícióérték:** "
+            f"{plan['notional']:.2f} USDT"
+        )
+
+        st.caption(
+            "A belépő referenciaár, nem automatikus megbízás. "
+            "A pozícióméret becslés, amelyet az OKX kontraktusméretéhez, "
+            "tőkeáttételéhez, díjaihoz és csúszásához igazítani kell."
+        )
+
+        st.divider()
 
 
-question = st.chat_input(
-    "Kérdezz a BTC, ETH vagy SOL piacáról..."
-)
+# ============================================================
+# MULTI-TIMEFRAME
+# ============================================================
 
-if question:
+with tab3:
 
-    st.session_state.chat.append({
-        "role": "user",
-        "content": question
-    })
+    st.subheader(
+        "Több idősíkú piaci struktúra"
+    )
 
-    with st.chat_message("user"):
-        st.markdown(question)
+    for asset, data in results.items():
 
-    with st.chat_message("assistant"):
+        st.markdown(f"### {asset}")
 
-        with st.spinner("SALIGA AI válaszol..."):
+        rows = []
+
+        for timeframe in TIMEFRAMES:
+
+            structure = data["structures"][timeframe]
+
+            rows.append({
+
+                "Idősík": timeframe,
+
+                "Irány": (
+                    "Bullish"
+                    if structure["bias"] > 0
+                    else "Bearish"
+                    if structure["bias"] < 0
+                    else "Semleges"
+                ),
+
+                "Esemény": structure["event"],
+
+                "Támasz": structure["support"],
+
+                "Ellenállás": structure["resistance"]
+
+            })
+
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True
+        )
+
+
+# ============================================================
+# NEWS AND AI
+# ============================================================
+
+with tab4:
+
+    st.subheader("Kriptopiaci hírek")
+
+    news = get_news()
+
+    for item in news:
+
+        if item["link"]:
+
+            st.markdown(
+                f"- [{item['title']}]({item['link']})"
+            )
+
+        else:
+
+            st.write(item["title"])
+
+    if st.button("SALIGA AI — piaci összefoglaló"):
+
+        context = []
+
+        for asset, data in results.items():
+
+            context.append(
+                f"{asset}: ár={data['price']}, "
+                f"jelzés={data['signal']}, "
+                f"score={data['score']}, "
+                f"OI={data['oi']['state']}, "
+                f"delta={data['trades']['delta']}, "
+                f"struktúra={data['structures']['1h']['event']}"
+            )
+
+        question = (
+            "Elemezd a teljes piaci helyzetet. "
+            "Mutasd be az irányokat, az ellentmondásokat, "
+            "a lehetséges kockázatokat és a kivárási helyzeteket."
+        )
+
+        with st.spinner("SALIGA AI elemzés..."):
 
             answer = groq_chat(
                 question,
-                results,
-                st.session_state.chat[:-1]
+                "\n".join(context)
             )
 
-            st.markdown(answer)
-
-    st.session_state.chat.append({
-        "role": "assistant",
-        "content": answer
-    })
+        st.markdown(answer)
 
 
-# =========================================================
+# ============================================================
+# CHAT
+# ============================================================
+
+with tab5:
+
+    st.subheader(
+        "SALIGA AI — Piaci elemző chat"
+    )
+
+    if "chat_history" not in st.session_state:
+
+        st.session_state.chat_history = []
+
+    for message in st.session_state.chat_history:
+
+        with st.chat_message(message["role"]):
+
+            st.markdown(message["content"])
+
+    question = st.chat_input(
+        "Kérdezz a piacról..."
+    )
+
+    if question:
+
+        st.session_state.chat_history.append({
+
+            "role": "user",
+
+            "content": question
+
+        })
+
+        context = []
+
+        for asset, data in results.items():
+
+            context.append(
+                f"{asset}: ár={data['price']}, "
+                f"jelzés={data['signal']}, "
+                f"score={data['score']}, "
+                f"OI={data['oi']['state']}, "
+                f"delta={data['trades']['delta']}, "
+                f"orderbook={data['book']['state']}"
+            )
+
+        with st.chat_message("user"):
+
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+
+            with st.spinner("SALIGA AI válaszol..."):
+
+                answer = groq_chat(
+                    question,
+                    "\n".join(context)
+                )
+
+                st.markdown(answer)
+
+        st.session_state.chat_history.append({
+
+            "role": "assistant",
+
+            "content": answer
+
+        })
+
+
+# ============================================================
 # FOOTER
-# =========================================================
+# ============================================================
 
-st.markdown("---")
+st.divider()
 
 st.caption(
-    "SALIGA AI 7.1 | OKX ONLY | Internal Market Intelligence"
+    f"{VERSION} | "
+    f"Utolsó frissítés: "
+    f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
 )
 
 st.caption(
-    "A pozícióépülés, zárás, delta és likviditási értelmezés "
-    "becslés, nem közvetlenül igazolt tőzsdei pozícióadat."
+    "Az OI-alapú long/short épülés és zárás becslés. "
+    "A delta a lekért kötésekből számított becslés. "
+    "A rendszer nem garantál nyereséget."
 )
