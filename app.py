@@ -1,5 +1,5 @@
 # ============================================================
-# SALIGA AI PRO 17.0
+# SALIGA AI PRO 17.1
 # OKX MULTI-ASSET MARKET INTELLIGENCE
 # BTC / ETH / SOL
 # M5 / M15 / H1 / H4 / D1
@@ -20,16 +20,16 @@ from openai import OpenAI
 
 
 # ============================================================
-# 1. APP CONFIGURATION
+# 1. CONFIGURATION
 # ============================================================
 
 st.set_page_config(
-    page_title="SALIGA AI PRO 17.0",
+    page_title="SALIGA AI PRO 17.1",
     page_icon="⚡",
     layout="wide"
 )
 
-APP_VERSION = "SALIGA AI PRO 17.0"
+APP_VERSION = "SALIGA AI PRO 17.1"
 DB_PATH = "saliga_ai.db"
 
 SYMBOLS = {
@@ -52,9 +52,9 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 
 MARKET_REFRESH = 60
 OI_HISTORY_INTERVAL = 300
-AI_REFRESH = 900
-
 MIN_SIGNAL_SCORE = 65
+
+HTTP_TIMEOUT = 15
 
 
 # ============================================================
@@ -63,8 +63,6 @@ MIN_SIGNAL_SCORE = 65
 
 DEFAULT_STATE = {
     "last_refresh": 0,
-    "last_ai_refresh": 0,
-    "market_data": {},
     "analysis_data": {},
     "ai_result": None,
     "ai_error": None,
@@ -89,6 +87,7 @@ def timestamp():
 
 
 def safe_float(value):
+
     try:
         result = float(value)
 
@@ -97,21 +96,24 @@ def safe_float(value):
 
         return None
 
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
 def fmt(value, decimals=2):
+
     if value is None:
         return "N/A"
 
     try:
         return f"{float(value):,.{decimals}f}"
-    except Exception:
+
+    except (TypeError, ValueError):
         return "N/A"
 
 
 def pct_change(current, previous):
+
     if current is None or previous is None:
         return None
 
@@ -122,6 +124,7 @@ def pct_change(current, previous):
 
 
 def get_secret(name):
+
     try:
         value = st.secrets.get(name)
 
@@ -134,61 +137,86 @@ def get_secret(name):
     return os.getenv(name)
 
 
+def safe_close(conn):
+
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 # ============================================================
 # 4. DATABASE
 # ============================================================
 
 def db_connection():
+
     return sqlite3.connect(
         DB_PATH,
-        check_same_thread=False
+        check_same_thread=False,
+        timeout=20
     )
 
 
 def init_db():
 
     conn = db_connection()
-    cur = conn.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS oi_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            asset TEXT,
-            value REAL,
-            unit TEXT,
-            created_at TEXT
-        )
-    """)
+    try:
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            asset TEXT,
-            timeframe TEXT,
-            direction TEXT,
-            score REAL,
-            entry REAL,
-            stop_loss REAL,
-            tp1 REAL,
-            tp2 REAL,
-            tp3 REAL,
-            status TEXT,
-            created_at TEXT
-        )
-    """)
+        cur = conn.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS signal_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_id INTEGER,
-            event TEXT,
-            price REAL,
-            created_at TEXT
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS oi_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset TEXT,
+                value REAL,
+                unit TEXT,
+                created_at TEXT
+            )
+        """)
 
-    conn.commit()
-    conn.close()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset TEXT,
+                timeframe TEXT,
+                direction TEXT,
+                score REAL,
+                entry REAL,
+                stop_loss REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                status TEXT,
+                created_at TEXT
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS signal_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER,
+                event TEXT,
+                price REAL,
+                created_at TEXT
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_oi_asset
+            ON oi_history(asset, id)
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signal_status
+            ON signals(status)
+        """)
+
+        conn.commit()
+
+    finally:
+        safe_close(conn)
 
 
 init_db()
@@ -218,8 +246,11 @@ exchange = None
 exchange_error = None
 
 try:
+
     exchange = get_exchange()
+
 except Exception as e:
+
     exchange_error = str(e)
 
 
@@ -288,20 +319,24 @@ def parse_oi_payload(payload):
 def fetch_okx_oi(asset):
 
     if exchange is None:
+
         return {
             "value": None,
             "unit": "N/A",
             "source": "FAILED",
-            "error": exchange_error or "OKX connection unavailable"
+            "error": exchange_error or "OKX unavailable"
         }
 
     symbol = SYMBOLS[asset]
     errors = []
 
     try:
+
         market = exchange.market(symbol)
         inst_id = market["id"]
+
     except Exception as e:
+
         return {
             "value": None,
             "unit": "N/A",
@@ -314,7 +349,7 @@ def fetch_okx_oi(asset):
         "instId": inst_id
     }
 
-    # METHOD 1: CCXT NATIVE OKX ENDPOINT
+    # METHOD 1: CCXT NATIVE
 
     try:
 
@@ -325,6 +360,7 @@ def fetch_okx_oi(asset):
         )
 
         if method is None:
+
             method = getattr(
                 exchange,
                 "publicGetPublicOpenInterest",
@@ -334,6 +370,7 @@ def fetch_okx_oi(asset):
         if method is not None:
 
             payload = method(params)
+
             result = parse_oi_payload(payload)
 
             if result:
@@ -346,18 +383,22 @@ def fetch_okx_oi(asset):
                 }
 
             errors.append(
-                "CCXT native: no usable OI in response"
+                "CCXT native: no usable OI"
             )
 
         else:
+
             errors.append(
-                "CCXT native: endpoint method unavailable"
+                "CCXT native method unavailable"
             )
 
     except Exception as e:
-        errors.append("CCXT native: " + str(e))
 
-    # METHOD 2: CCXT UNIFIED API
+        errors.append(
+            "CCXT native: " + str(e)
+        )
+
+    # METHOD 2: CCXT UNIFIED
 
     try:
 
@@ -368,6 +409,7 @@ def fetch_okx_oi(asset):
             extracted = extract_oi_record(result)
 
             if extracted:
+
                 return {
                     "value": extracted["value"],
                     "unit": extracted["unit"],
@@ -380,6 +422,7 @@ def fetch_okx_oi(asset):
             extracted = extract_oi_record(info)
 
             if extracted:
+
                 return {
                     "value": extracted["value"],
                     "unit": extracted["unit"],
@@ -387,12 +430,30 @@ def fetch_okx_oi(asset):
                     "error": None
                 }
 
+            if isinstance(info, dict):
+
+                for record in info.get("data", []):
+
+                    extracted = extract_oi_record(record)
+
+                    if extracted:
+
+                        return {
+                            "value": extracted["value"],
+                            "unit": extracted["unit"],
+                            "source": "OKX CCXT UNIFIED",
+                            "error": None
+                        }
+
         errors.append(
             "CCXT unified: no usable OI"
         )
 
     except Exception as e:
-        errors.append("CCXT unified: " + str(e))
+
+        errors.append(
+            "CCXT unified: " + str(e)
+        )
 
     # METHOD 3: DIRECT OKX HTTP
 
@@ -405,7 +466,7 @@ def fetch_okx_oi(asset):
                 "Accept": "application/json",
                 "User-Agent": "SALIGA-AI-PRO"
             },
-            timeout=15
+            timeout=HTTP_TIMEOUT
         )
 
         response.raise_for_status()
@@ -424,14 +485,17 @@ def fetch_okx_oi(asset):
             }
 
         errors.append(
-            "Direct HTTP: " +
-            str(payload.get("code")) +
-            " " +
-            str(payload.get("msg"))
+            "Direct HTTP: "
+            + str(payload.get("code"))
+            + " "
+            + str(payload.get("msg"))
         )
 
     except Exception as e:
-        errors.append("Direct HTTP: " + str(e))
+
+        errors.append(
+            "Direct HTTP: " + str(e)
+        )
 
     return {
         "value": None,
@@ -451,21 +515,27 @@ def save_oi_history(asset, value, unit):
         return
 
     conn = db_connection()
-    cur = conn.cursor()
 
-    cur.execute("""
-        INSERT INTO oi_history
-        (asset, value, unit, created_at)
-        VALUES (?, ?, ?, ?)
-    """, (
-        asset,
-        value,
-        unit,
-        timestamp()
-    ))
+    try:
 
-    conn.commit()
-    conn.close()
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO oi_history
+            (asset, value, unit, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (
+            asset,
+            value,
+            unit,
+            timestamp()
+        ))
+
+        conn.commit()
+
+    finally:
+
+        safe_close(conn)
 
 
 def calculate_oi_change(asset, current_value):
@@ -474,30 +544,40 @@ def calculate_oi_change(asset, current_value):
         return None
 
     conn = db_connection()
-    cur = conn.cursor()
 
-    cur.execute("""
-        SELECT value, created_at
-        FROM oi_history
-        WHERE asset = ?
-        ORDER BY id DESC
-        LIMIT 100
-    """, (asset,))
+    try:
 
-    rows = cur.fetchall()
-    conn.close()
+        cur = conn.cursor()
 
-    if len(rows) < 2:
+        cur.execute("""
+            SELECT value, created_at
+            FROM oi_history
+            WHERE asset = ?
+            ORDER BY id DESC
+            LIMIT 100
+        """, (asset,))
+
+        rows = cur.fetchall()
+
+    finally:
+
+        safe_close(conn)
+
+    if not rows:
         return None
 
     current_time = now_utc()
 
-    for value, created_at in rows[1:]:
+    for value, created_at in rows:
 
         try:
-            old_time = datetime.fromisoformat(created_at)
+
+            old_time = datetime.fromisoformat(
+                created_at
+            )
 
             if old_time.tzinfo is None:
+
                 old_time = old_time.replace(
                     tzinfo=timezone.utc
                 )
@@ -514,6 +594,7 @@ def calculate_oi_change(asset, current_value):
                 )
 
         except Exception:
+
             continue
 
     return None
@@ -526,8 +607,16 @@ def calculate_oi_change(asset, current_value):
 def fetch_market_data(asset):
 
     if exchange is None:
+
         return {
-            "error": exchange_error or "OKX unavailable"
+            "asset": asset,
+            "error": exchange_error or "OKX unavailable",
+            "price": None,
+            "oi": None,
+            "oi_unit": "N/A",
+            "oi_change": None,
+            "funding": None,
+            "orderbook_imbalance": None
         }
 
     symbol = SYMBOLS[asset]
@@ -537,6 +626,8 @@ def fetch_market_data(asset):
         "symbol": symbol,
         "error": None
     }
+
+    # TICKER
 
     try:
 
@@ -574,6 +665,8 @@ def fetch_market_data(asset):
 
         result["error"] = "Ticker: " + str(e)
 
+        result["price"] = None
+
     # ORDER BOOK
 
     try:
@@ -587,13 +680,13 @@ def fetch_market_data(asset):
         asks = orderbook.get("asks", [])
 
         bid_volume = sum(
-            float(x[0]) * float(x[1])
-            for x in bids
+            float(item[0]) * float(item[1])
+            for item in bids
         )
 
         ask_volume = sum(
-            float(x[0]) * float(x[1])
-            for x in asks
+            float(item[0]) * float(item[1])
+            for item in asks
         )
 
         total = bid_volume + ask_volume
@@ -608,6 +701,7 @@ def fetch_market_data(asset):
             ) * 100
 
         else:
+
             result["orderbook_imbalance"] = None
 
     except Exception as e:
@@ -638,6 +732,8 @@ def fetch_market_data(asset):
     result["oi_unit"] = oi["unit"]
     result["oi_source"] = oi["source"]
     result["oi_error"] = oi["error"]
+
+    # Calculate change before saving new sample.
 
     result["oi_change"] = calculate_oi_change(
         asset,
@@ -672,6 +768,9 @@ def fetch_candles(asset, timeframe):
             limit=250
         )
 
+        if not data or len(data) < 50:
+            return None
+
         df = pd.DataFrame(
             data,
             columns=[
@@ -690,25 +789,33 @@ def fetch_candles(asset, timeframe):
             utc=True
         )
 
-        for col in [
+        numeric_columns = [
             "open",
             "high",
             "low",
             "close",
             "volume"
-        ]:
+        ]
+
+        for col in numeric_columns:
+
             df[col] = pd.to_numeric(
                 df[col],
                 errors="coerce"
             )
 
-        # Exclude the still-forming candle.
+        # Exclude currently forming candle.
+
         if len(df) > 2:
             df = df.iloc[:-1].copy()
 
-        return df.dropna().reset_index(drop=True)
+        return (
+            df.dropna()
+            .reset_index(drop=True)
+        )
 
     except Exception:
+
         return None
 
 
@@ -733,7 +840,10 @@ def calculate_rsi(series, period=14):
         adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan
+    )
 
     rsi = 100 - (100 / (1 + rs))
 
@@ -763,9 +873,9 @@ def calculate_atr(df, period=14):
 def calculate_vwap(df):
 
     typical = (
-        df["high"] +
-        df["low"] +
-        df["close"]
+        df["high"]
+        + df["low"]
+        + df["close"]
     ) / 3
 
     volume = df["volume"]
@@ -787,33 +897,45 @@ def calculate_vwap(df):
 def analyze_structure(df):
 
     if df is None or len(df) < 30:
+
         return {
             "trend": "UNKNOWN",
             "breakout": "NONE",
-            "sweep": "NONE"
+            "sweep": "NONE",
+            "support": None,
+            "resistance": None
         }
 
     last = df.iloc[-1]
 
     previous = df.iloc[-21:-1]
 
-    resistance = previous["high"].max()
-    support = previous["low"].min()
+    resistance = float(
+        previous["high"].max()
+    )
+
+    support = float(
+        previous["low"].min()
+    )
 
     trend = "NEUTRAL"
 
     if last["close"] > previous["close"].mean():
+
         trend = "BULLISH"
 
     elif last["close"] < previous["close"].mean():
+
         trend = "BEARISH"
 
     breakout = "NONE"
 
     if last["close"] > resistance:
+
         breakout = "BULLISH BREAKOUT"
 
     elif last["close"] < support:
+
         breakout = "BEARISH BREAKDOWN"
 
     sweep = "NONE"
@@ -822,20 +944,22 @@ def analyze_structure(df):
         last["low"] < support
         and last["close"] > support
     ):
+
         sweep = "SELL-SIDE LIQUIDITY SWEEP"
 
     elif (
         last["high"] > resistance
         and last["close"] < resistance
     ):
+
         sweep = "BUY-SIDE LIQUIDITY SWEEP"
 
     return {
         "trend": trend,
         "breakout": breakout,
         "sweep": sweep,
-        "support": float(support),
-        "resistance": float(resistance)
+        "support": support,
+        "resistance": resistance
     }
 
 
@@ -872,14 +996,16 @@ def calculate_estimated_delta(asset):
                 continue
 
             if side == "buy":
+
                 buy_volume += amount
 
             elif side == "sell":
+
                 sell_volume += amount
 
         total = buy_volume + sell_volume
 
-        if total == 0:
+        if total <= 0:
             return None
 
         delta = buy_volume - sell_volume
@@ -890,10 +1016,12 @@ def calculate_estimated_delta(asset):
             "delta": delta,
             "delta_percent": (
                 delta / total
-            ) * 100
+            ) * 100,
+            "total": total
         }
 
     except Exception:
+
         return None
 
 
@@ -909,6 +1037,7 @@ def analyze_timeframe(asset, timeframe):
     )
 
     if df is None or len(df) < 50:
+
         return {
             "asset": asset,
             "timeframe": timeframe,
@@ -930,7 +1059,6 @@ def analyze_timeframe(asset, timeframe):
     )
 
     last = df.iloc[-1]
-    previous = df.iloc[-2]
 
     structure = analyze_structure(df)
 
@@ -948,18 +1076,22 @@ def analyze_timeframe(asset, timeframe):
     ) * 100
 
     if momentum_5 > 0:
+
         score += 10
         reasons.append("Positive short momentum")
 
     elif momentum_5 < 0:
+
         score -= 10
         reasons.append("Negative short momentum")
 
     if momentum_20 > 0:
+
         score += 10
         reasons.append("Positive medium momentum")
 
     elif momentum_20 < 0:
+
         score -= 10
         reasons.append("Negative medium momentum")
 
@@ -968,18 +1100,22 @@ def analyze_timeframe(asset, timeframe):
     rsi = float(last["rsi"])
 
     if 50 < rsi < 70:
+
         score += 10
         reasons.append("Bullish RSI")
 
     elif 30 < rsi < 50:
+
         score -= 10
         reasons.append("Bearish RSI")
 
     elif rsi >= 70:
+
         score -= 5
         reasons.append("RSI overbought")
 
     elif rsi <= 30:
+
         score += 5
         reasons.append("RSI oversold")
 
@@ -990,20 +1126,24 @@ def analyze_timeframe(asset, timeframe):
     if vwap is not None:
 
         if last["close"] > vwap:
+
             score += 10
             reasons.append("Price above VWAP")
 
         elif last["close"] < vwap:
+
             score -= 10
             reasons.append("Price below VWAP")
 
     # VOLUME
 
-    volume_avg = safe_float(last["volume_avg"])
+    volume_avg = safe_float(
+        last["volume_avg"]
+    )
 
     volume_ratio = None
 
-    if volume_avg and volume_avg > 0:
+    if volume_avg is not None and volume_avg > 0:
 
         volume_ratio = (
             float(last["volume"]) / volume_avg
@@ -1012,42 +1152,54 @@ def analyze_timeframe(asset, timeframe):
         if volume_ratio > 1.5:
 
             if last["close"] > last["open"]:
+
                 score += 10
                 reasons.append("Strong bullish volume")
 
             elif last["close"] < last["open"]:
+
                 score -= 10
                 reasons.append("Strong bearish volume")
 
-    # STRUCTURE
+    # MARKET STRUCTURE
 
     if structure["breakout"] == "BULLISH BREAKOUT":
+
         score += 15
         reasons.append("Bullish structure breakout")
 
     elif structure["breakout"] == "BEARISH BREAKDOWN":
+
         score -= 15
         reasons.append("Bearish structure breakdown")
 
     # LIQUIDITY SWEEP
 
     if structure["sweep"] == "SELL-SIDE LIQUIDITY SWEEP":
+
         score += 10
         reasons.append("Sell-side liquidity sweep")
 
     elif structure["sweep"] == "BUY-SIDE LIQUIDITY SWEEP":
+
         score -= 10
         reasons.append("Buy-side liquidity sweep")
 
-    score = max(-100, min(100, score))
+    score = max(
+        -100,
+        min(100, score)
+    )
 
     if score >= MIN_SIGNAL_SCORE:
+
         direction = "LONG"
 
     elif score <= -MIN_SIGNAL_SCORE:
+
         direction = "SHORT"
 
     else:
+
         direction = "WAIT"
 
     return {
@@ -1075,18 +1227,21 @@ def analyze_timeframe(asset, timeframe):
 def determine_position_flow(market, delta):
 
     oi_change = market.get("oi_change")
-    funding = market.get("funding")
 
     delta_percent = None
 
     if delta:
-        delta_percent = delta.get("delta_percent")
+
+        delta_percent = delta.get(
+            "delta_percent"
+        )
 
     if oi_change is None or delta_percent is None:
+
         return {
             "state": "INSUFFICIENT DATA",
             "description": (
-                "OI változás és becsült delta "
+                "Az OI változás és a becsült delta "
                 "együttes értelmezéséhez nincs elegendő adat."
             )
         }
@@ -1096,8 +1251,8 @@ def determine_position_flow(market, delta):
         return {
             "state": "LONG BUILDUP",
             "description": (
-                "Növekvő Open Interest és pozitív "
-                "becsült delta. Long irányú aktivitás."
+                "Növekvő Open Interest és pozitív becsült delta. "
+                "Long irányú aktivitásra utalhat."
             )
         }
 
@@ -1106,8 +1261,8 @@ def determine_position_flow(market, delta):
         return {
             "state": "SHORT BUILDUP",
             "description": (
-                "Növekvő Open Interest és negatív "
-                "becsült delta. Short irányú aktivitás."
+                "Növekvő Open Interest és negatív becsült delta. "
+                "Short irányú aktivitásra utalhat."
             )
         }
 
@@ -1117,7 +1272,7 @@ def determine_position_flow(market, delta):
             "state": "SHORT CLOSING / BUYING",
             "description": (
                 "Csökkenő Open Interest és pozitív delta. "
-                "Short pozíciók zárása is lehetséges."
+                "Short zárások is történhetnek."
             )
         }
 
@@ -1127,15 +1282,14 @@ def determine_position_flow(market, delta):
             "state": "LONG CLOSING / SELLING",
             "description": (
                 "Csökkenő Open Interest és negatív delta. "
-                "Long pozíciók zárása is lehetséges."
+                "Long zárások is történhetnek."
             )
         }
 
     return {
         "state": "MIXED FLOW",
         "description": (
-            "Az OI és a delta nem mutat egyértelmű "
-            "pozícióépülési irányt."
+            "Az OI és a delta nem mutat egyértelmű irányt."
         )
     }
 
@@ -1154,9 +1308,11 @@ def calculate_market_score(market, delta):
     if oi_change is not None:
 
         if oi_change > 1:
+
             factors.append("Open Interest rising")
 
         elif oi_change < -1:
+
             factors.append("Open Interest falling")
 
     if delta:
@@ -1166,10 +1322,12 @@ def calculate_market_score(market, delta):
         if d is not None:
 
             if d > 5:
+
                 score += 15
                 factors.append("Positive estimated delta")
 
             elif d < -5:
+
                 score -= 15
                 factors.append("Negative estimated delta")
 
@@ -1180,10 +1338,12 @@ def calculate_market_score(market, delta):
     if imbalance is not None:
 
         if imbalance > 10:
+
             score += 10
             factors.append("Bid-side orderbook dominance")
 
         elif imbalance < -10:
+
             score -= 10
             factors.append("Ask-side orderbook dominance")
 
@@ -1192,9 +1352,11 @@ def calculate_market_score(market, delta):
     if funding is not None:
 
         if funding > 0.0005:
+
             factors.append("Elevated positive funding")
 
         elif funding < -0.0005:
+
             factors.append("Negative funding")
 
     return {
@@ -1216,29 +1378,27 @@ def create_trade_plan(analysis):
     if (
         price is None
         or atr is None
+        or atr <= 0
         or direction not in ["LONG", "SHORT"]
     ):
+
         return None
 
     risk = atr * 1.5
 
     if direction == "LONG":
 
-        stop = price - risk
-
         return {
             "entry": price,
-            "stop_loss": stop,
+            "stop_loss": price - risk,
             "tp1": price + risk,
             "tp2": price + risk * 2,
             "tp3": price + risk * 3
         }
 
-    stop = price + risk
-
     return {
         "entry": price,
-        "stop_loss": stop,
+        "stop_loss": price + risk,
         "tp1": price - risk,
         "tp2": price - risk * 2,
         "tp3": price - risk * 3
@@ -1267,6 +1427,7 @@ def run_groq_analysis(data):
     client = get_groq_client()
 
     if client is None:
+
         return None, "GROQ_API_KEY is missing"
 
     system_prompt = """
@@ -1278,12 +1439,14 @@ Analyze only the supplied OKX market data.
 Do not invent missing data.
 Do not treat rising Open Interest alone as proof
 of long or short buildup.
+
 Use estimated delta with appropriate caution.
 Order book imbalance is a snapshot, not persistent flow.
+Funding is contextual information, not a standalone signal.
 
 Return valid JSON only.
 
-Required fields:
+Required structure:
 
 {
   "overall_bias": "BULLISH/BEARISH/NEUTRAL",
@@ -1308,7 +1471,8 @@ Required fields:
 }
 
 Never promise profits.
-Do not fabricate entry prices.
+Never invent prices.
+Never claim an order was executed.
 """
 
     try:
@@ -1338,6 +1502,10 @@ Do not fabricate entry prices.
 
         content = response.choices[0].message.content
 
+        if not content:
+
+            return None, "Groq returned an empty response"
+
         result = json.loads(content)
 
         return result, None
@@ -1357,6 +1525,7 @@ def run_analysis_cycle():
     timeframe_results = {}
     delta_results = {}
     flow_results = {}
+    market_scores = {}
 
     for asset in SYMBOLS:
 
@@ -1369,6 +1538,11 @@ def run_analysis_cycle():
         delta_results[asset] = delta
 
         flow_results[asset] = determine_position_flow(
+            market,
+            delta
+        )
+
+        market_scores[asset] = calculate_market_score(
             market,
             delta
         )
@@ -1389,6 +1563,7 @@ def run_analysis_cycle():
         "market": market_results,
         "delta": delta_results,
         "flow": flow_results,
+        "market_scores": market_scores,
         "timeframes": timeframe_results
     }
 
@@ -1403,63 +1578,74 @@ def save_signal(asset, timeframe, analysis):
         "LONG",
         "SHORT"
     ]:
-        return
+
+        return False
 
     plan = create_trade_plan(analysis)
 
     if plan is None:
-        return
+        return False
 
     conn = db_connection()
-    cur = conn.cursor()
 
-    cur.execute("""
-        INSERT INTO signals (
+    try:
+
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO signals (
+                asset,
+                timeframe,
+                direction,
+                score,
+                entry,
+                stop_loss,
+                tp1,
+                tp2,
+                tp3,
+                status,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
             asset,
             timeframe,
-            direction,
-            score,
-            entry,
-            stop_loss,
-            tp1,
-            tp2,
-            tp3,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        asset,
-        timeframe,
-        analysis["direction"],
-        analysis["score"],
-        plan["entry"],
-        plan["stop_loss"],
-        plan["tp1"],
-        plan["tp2"],
-        plan["tp3"],
-        "OPEN",
-        timestamp()
-    ))
+            analysis["direction"],
+            analysis["score"],
+            plan["entry"],
+            plan["stop_loss"],
+            plan["tp1"],
+            plan["tp2"],
+            plan["tp3"],
+            "OPEN",
+            timestamp()
+        ))
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+
+        return True
+
+    finally:
+
+        safe_close(conn)
 
 
 def get_signals():
 
     conn = db_connection()
 
-    df = pd.read_sql_query("""
-        SELECT *
-        FROM signals
-        ORDER BY id DESC
-        LIMIT 100
-    """, conn)
+    try:
 
-    conn.close()
+        return pd.read_sql_query("""
+            SELECT *
+            FROM signals
+            ORDER BY id DESC
+            LIMIT 100
+        """, conn)
 
-    return df
+    finally:
+
+        safe_close(conn)
 
 
 # ============================================================
@@ -1472,84 +1658,819 @@ def update_signal_status():
         return
 
     conn = db_connection()
-    cur = conn.cursor()
 
-    cur.execute("""
-        SELECT id, asset, direction,
-               stop_loss, tp1, tp2, tp3
-        FROM signals
-        WHERE status = 'OPEN'
-    """)
+    try:
 
-    signals = cur.fetchall()
+        cur = conn.cursor()
 
-    for row in signals:
-
-        (
-            signal_id,
-            asset,
-            direction,
-            stop,
-            tp1,
-            tp2,
-            tp3
-        ) = row
-
-        try:
-
-            ticker = exchange.fetch_ticker(
-                SYMBOLS[asset]
+        cur.execute("""
+            SELECT
+                id,
+                asset,
+                direction,
+                stop_loss,
+                tp1,
+                tp2,
+                tp3,
+                status
+            FROM signals
+            WHERE status IN (
+                'OPEN',
+                'TP1 HIT',
+                'TP2 HIT'
             )
+        """)
 
-            price = safe_float(
-                ticker.get("last")
-            )
+        signals = cur.fetchall()
 
-            if price is None:
-                continue
+        for row in signals:
 
-            event = None
+            (
+                signal_id,
+                asset,
+                direction,
+                stop,
+                tp1,
+                tp2,
+                tp3,
+                status
+            ) = row
 
-            if direction == "LONG":
+            try:
 
-                if price <= stop:
-                    event = "STOP LOSS"
+                ticker = exchange.fetch_ticker(
+                    SYMBOLS[asset]
+                )
 
-                elif price >= tp3:
-                    event = "TP3"
+                price = safe_float(
+                    ticker.get("last")
+                )
 
-                elif price >= tp2:
-                    event = "TP2"
+                if price is None:
+                    continue
 
-                elif price >= tp1:
-                    event = "TP1"
+                event = None
+                new_status = status
 
-            else:
+                if direction == "LONG":
 
-                if price >= stop:
-                    event = "STOP LOSS"
+                    if price <= stop:
 
-                elif price <= tp3:
-                    event = "TP3"
+                        event = "STOP LOSS"
+                        new_status = "STOP LOSS"
 
-                elif price <= tp2:
-                    event = "TP2"
+                    elif price >= tp3:
 
-                elif price <= tp1:
-                    event = "TP1"
+                        event = "TP3"
+                        new_status = "TP3"
 
-            if event:
+                    elif price >= tp2 and status != "TP2 HIT":
 
-                cur.execute("""
-                    INSERT INTO signal_events (
+                        event = "TP2"
+                        new_status = "TP2 HIT"
+
+                    elif price >= tp1 and status == "OPEN":
+
+                        event = "TP1"
+                        new_status = "TP1 HIT"
+
+                else:
+
+                    if price >= stop:
+
+                        event = "STOP LOSS"
+                        new_status = "STOP LOSS"
+
+                    elif price <= tp3:
+
+                        event = "TP3"
+                        new_status = "TP3"
+
+                    elif price <= tp2 and status != "TP2 HIT":
+
+                        event = "TP2"
+                        new_status = "TP2 HIT"
+
+                    elif price <= tp1 and status == "OPEN":
+
+                        event = "TP1"
+                        new_status = "TP1 HIT"
+
+                if event:
+
+                    cur.execute("""
+                        INSERT INTO signal_events (
+                            signal_id,
+                            event,
+                            price,
+                            created_at
+                        )
+                        VALUES (?, ?, ?, ?)
+                    """, (
                         signal_id,
                         event,
                         price,
-                        created_at
+                        timestamp()
+                    ))
+
+                    cur.execute("""
+                        UPDATE signals
+                        SET status = ?
+                        WHERE id = ?
+                    """, (
+                        new_status,
+                        signal_id
+                    ))
+
+            except Exception:
+                continue
+
+        conn.commit()
+
+    finally:
+
+        safe_close(conn)
+
+
+# ============================================================
+# 22. SIGNAL EVENTS
+# ============================================================
+
+def get_signal_events():
+
+    conn = db_connection()
+
+    try:
+
+        return pd.read_sql_query("""
+            SELECT *
+            FROM signal_events
+            ORDER BY id DESC
+            LIMIT 100
+        """, conn)
+
+    finally:
+
+        safe_close(conn)
+
+
+# ============================================================
+# 23. DASHBOARD HEADER
+# ============================================================
+
+st.title("⚡ SALIGA AI PRO")
+
+st.caption(
+    "MULTI-ASSET MARKET INTELLIGENCE | "
+    "OKX DATA | GROQ AI | POSITION FLOW"
+)
+
+st.caption(
+    f"Version: {APP_VERSION} | "
+    f"UTC: {timestamp()}"
+)
+
+if exchange_error:
+
+    st.error(
+        "OKX connection error: "
+        + exchange_error
+    )
+
+
+# ============================================================
+# 24. DASHBOARD CONTROLS
+# ============================================================
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+
+    refresh_button = st.button(
+        "🔄 REFRESH MARKET DATA",
+        use_container_width=True
+    )
+
+with col2:
+
+    ai_button = st.button(
+        "🧠 RUN GROQ AI ANALYSIS",
+        use_container_width=True
+    )
+
+with col3:
+
+    st.metric(
+        "Tracked assets",
+        len(SYMBOLS)
+    )
+
+
+# ============================================================
+# 25. MARKET ANALYSIS REFRESH
+# ============================================================
+
+should_refresh = (
+    refresh_button
+    or not st.session_state["analysis_data"]
+    or (
+        time.time()
+        - st.session_state["last_refresh"]
+        > MARKET_REFRESH
+    )
+)
+
+if should_refresh:
+
+    with st.spinner(
+        "Downloading OKX data and analyzing BTC, ETH, SOL..."
+    ):
+
+        try:
+
+            st.session_state["analysis_data"] = (
+                run_analysis_cycle()
+            )
+
+            st.session_state["last_refresh"] = time.time()
+
+            update_signal_status()
+
+        except Exception as e:
+
+            st.error(
+                "Analysis cycle error: " + str(e)
+            )
+
+
+data = st.session_state["analysis_data"]
+
+
+# ============================================================
+# 26. MARKET OVERVIEW
+# ============================================================
+
+st.header("📊 MARKET OVERVIEW")
+
+if data:
+
+    market_data = data.get("market", {})
+
+    cols = st.columns(3)
+
+    for index, asset in enumerate(SYMBOLS):
+
+        market = market_data.get(asset, {})
+
+        with cols[index]:
+
+            st.subheader(asset)
+
+            st.metric(
+                "Price",
+                fmt(market.get("price"), 4)
+            )
+
+            percentage = market.get("percentage")
+
+            st.metric(
+                "24h change",
+                (
+                    fmt(percentage, 2) + "%"
+                    if percentage is not None
+                    else "N/A"
+                )
+            )
+
+            st.metric(
+                "Open Interest "
+                + str(market.get("oi_unit", "N/A")),
+                fmt(market.get("oi"), 2)
+            )
+
+            oi_change = market.get("oi_change")
+
+            st.metric(
+                "OI change",
+                (
+                    f"{oi_change:+.3f}%"
+                    if oi_change is not None
+                    else "Waiting for history"
+                )
+            )
+
+            st.caption(
+                "OI source: "
+                + str(market.get("oi_source", "N/A"))
+            )
+
+            if market.get("oi_error"):
+
+                with st.expander(
+                    "Open Interest diagnostics"
+                ):
+
+                    st.error(
+                        market["oi_error"]
                     )
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    signal_id,
-                    event,
-                    price,
-                    timestamp()
+
+            if market.get("error"):
+
+                st.warning(
+                    market["error"]
+                )
+
+
+# ============================================================
+# 27. POSITION FLOW
+# ============================================================
+
+st.header("🌊 POSITION FLOW")
+
+if data:
+
+    cols = st.columns(3)
+
+    for index, asset in enumerate(SYMBOLS):
+
+        market = data["market"].get(
+            asset,
+            {}
+        )
+
+        delta = data["delta"].get(
+            asset
+        )
+
+        flow = data["flow"].get(
+            asset,
+            {}
+        )
+
+        with cols[index]:
+
+            st.subheader(asset)
+
+            st.markdown(
+                f"**{flow.get('state', 'N/A')}**"
+            )
+
+            st.write(
+                flow.get("description", "")
+            )
+
+            if delta:
+
+                st.metric(
+                    "Estimated delta",
+                    fmt(delta.get("delta"), 4)
+                )
+
+                delta_percent = delta.get(
+                    "delta_percent"
+                )
+
+                st.metric(
+                    "Delta %",
+                    (
+                        fmt(delta_percent, 2) + "%"
+                        if delta_percent is not None
+                        else "N/A"
+                    )
+                )
+
+                st.write(
+                    "Buy volume:",
+                    fmt(delta.get("buy"), 4)
+                )
+
+                st.write(
+                    "Sell volume:",
+                    fmt(delta.get("sell"), 4)
+                )
+
+            else:
+
+                st.warning(
+                    "Estimated delta unavailable"
+                )
+
+            imbalance = market.get(
+                "orderbook_imbalance"
+            )
+
+            st.metric(
+                "Order book imbalance",
+                (
+                    fmt(imbalance, 2) + "%"
+                    if imbalance is not None
+                    else "N/A"
+                )
+            )
+
+            funding = market.get("funding")
+
+            st.metric(
+                "Funding rate",
+                (
+                    fmt(funding * 100, 5) + "%"
+                    if funding is not None
+                    else "N/A"
+                )
+            )
+
+
+# ============================================================
+# 28. MARKET SCORE
+# ============================================================
+
+st.header("📈 MARKET INTELLIGENCE SCORE")
+
+if data:
+
+    cols = st.columns(3)
+
+    for index, asset in enumerate(SYMBOLS):
+
+        market_score = data["market_scores"].get(
+            asset,
+            {}
+        )
+
+        with cols[index]:
+
+            st.subheader(asset)
+
+            st.metric(
+                "Market score",
+                fmt(
+                    market_score.get("score", 0),
+                    0
+                )
+            )
+
+            for factor in market_score.get(
+                "factors",
+                []
+            ):
+
+                st.write("• " + factor)
+
+
+# ============================================================
+# 29. MULTI-TIMEFRAME ANALYSIS
+# ============================================================
+
+st.header("🧭 MULTI-TIMEFRAME ANALYSIS")
+
+if data:
+
+    for asset in SYMBOLS:
+
+        st.subheader(asset)
+
+        rows = []
+
+        for timeframe in TIMEFRAMES:
+
+            analysis = data["timeframes"][
+                asset
+            ][timeframe]
+
+            structure = analysis.get(
+                "structure",
+                {}
+            )
+
+            rows.append({
+                "Timeframe": timeframe,
+                "Direction": analysis.get(
+                    "direction",
+                    "WAIT"
+                ),
+                "Score": analysis.get(
+                    "score",
+                    0
+                ),
+                "Price": analysis.get(
+                    "price"
+                ),
+                "RSI": analysis.get(
+                    "rsi"
+                ),
+                "Momentum 5": analysis.get(
+                    "momentum_5"
+                ),
+                "Momentum 20": analysis.get(
+                    "momentum_20"
+                ),
+                "Structure": structure.get(
+                    "trend",
+                    "N/A"
+                )
+            })
+
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True
+        )
+
+
+# ============================================================
+# 30. DETAILED ANALYSIS
+# ============================================================
+
+st.header("🔍 DETAILED ANALYSIS")
+
+selected_asset = st.selectbox(
+    "Select asset",
+    list(SYMBOLS.keys())
+)
+
+selected_tf = st.selectbox(
+    "Select timeframe",
+    list(TIMEFRAMES.keys())
+)
+
+if data:
+
+    detail = data["timeframes"][
+        selected_asset
+    ][selected_tf]
+
+    if detail.get("error"):
+
+        st.error(
+            detail["error"]
+        )
+
+    else:
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+
+            st.metric(
+                "Direction",
+                detail["direction"]
+            )
+
+        with c2:
+
+            st.metric(
+                "Score",
+                fmt(detail["score"], 0)
+            )
+
+        with c3:
+
+            st.metric(
+                "RSI",
+                fmt(detail["rsi"])
+            )
+
+        st.write(
+            "Market structure:",
+            detail.get("structure", {})
+        )
+
+        st.write("Analysis factors:")
+
+        for reason in detail.get("reasons", []):
+
+            st.write("• " + reason)
+
+        plan = create_trade_plan(detail)
+
+        if plan:
+
+            st.subheader(
+                "Reference trade plan"
+            )
+
+            st.json(plan)
+
+            save_key = (
+                "save_"
+                + selected_asset
+                + "_"
+                + selected_tf
+            )
+
+            if st.button(
+                "SAVE SIGNAL",
+                key=save_key
+            ):
+
+                saved = save_signal(
+                    selected_asset,
+                    selected_tf,
+                    detail
+                )
+
+                if saved:
+
+                    st.success(
+                        "Signal saved to journal."
+                    )
+
+                else:
+
+                    st.warning(
+                        "Signal could not be saved."
+                    )
+
+
+# ============================================================
+# 31. GROQ AI ANALYSIS
+# ============================================================
+
+st.header("🧠 GROQ AI MARKET INTELLIGENCE")
+
+if ai_button and data:
+
+    with st.spinner(
+        "Groq AI is analyzing the market..."
+    ):
+
+        result, error = run_groq_analysis(data)
+
+        st.session_state["ai_result"] = result
+        st.session_state["ai_error"] = error
+
+
+if st.session_state["ai_error"]:
+
+    st.error(
+        "Groq AI error: "
+        + str(st.session_state["ai_error"])
+    )
+
+
+if st.session_state["ai_result"]:
+
+    ai = st.session_state["ai_result"]
+
+    st.subheader(
+        "Overall market bias: "
+        + str(ai.get("overall_bias", "N/A"))
+    )
+
+    st.metric(
+        "AI confidence",
+        str(ai.get("confidence", "N/A"))
+    )
+
+    st.write(
+        ai.get("summary", "")
+    )
+
+    st.subheader("Position flow")
+
+    st.write(
+        ai.get("position_flow", "")
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        st.markdown("### Bullish factors")
+
+        for item in ai.get(
+            "bullish_factors",
+            []
+        ):
+
+            st.write("🟢 " + str(item))
+
+    with col2:
+
+        st.markdown("### Bearish factors")
+
+        for item in ai.get(
+            "bearish_factors",
+            []
+        ):
+
+            st.write("🔴 " + str(item))
+
+    st.subheader("Risks")
+
+    for item in ai.get("risks", []):
+
+        st.write("⚠️ " + str(item))
+
+    st.subheader("Asset outlook")
+
+    st.json(
+        ai.get("assets", {})
+    )
+
+    st.subheader("Timeframe outlook")
+
+    st.json(
+        ai.get("timeframe_outlook", {})
+    )
+
+else:
+
+    st.info(
+        "Press RUN GROQ AI ANALYSIS to generate "
+        "the market intelligence report."
+    )
+
+
+# ============================================================
+# 32. SIGNAL JOURNAL
+# ============================================================
+
+st.header("📒 SIGNAL JOURNAL")
+
+signals = get_signals()
+
+if not signals.empty:
+
+    st.dataframe(
+        signals,
+        use_container_width=True,
+        hide_index=True
+    )
+
+else:
+
+    st.info(
+        "No saved signals yet."
+    )
+
+
+# ============================================================
+# 33. SIGNAL EVENTS
+# ============================================================
+
+st.header("📌 SIGNAL EVENTS")
+
+events = get_signal_events()
+
+if not events.empty:
+
+    st.dataframe(
+        events,
+        use_container_width=True,
+        hide_index=True
+    )
+
+else:
+
+    st.info(
+        "No TP/SL events recorded yet."
+    )
+
+
+# ============================================================
+# 34. SYSTEM STATUS
+# ============================================================
+
+st.header("⚙️ SYSTEM STATUS")
+
+c1, c2, c3 = st.columns(3)
+
+with c1:
+
+    st.metric(
+        "OKX connection",
+        "ONLINE" if exchange else "OFFLINE"
+    )
+
+with c2:
+
+    st.metric(
+        "Groq API key",
+        (
+            "CONFIGURED"
+            if get_secret("GROQ_API_KEY")
+            else "MISSING"
+        )
+    )
+
+with c3:
+
+    st.metric(
+        "Tracked assets",
+        "BTC / ETH / SOL"
+    )
+
+st.caption(
+    "Data provider: OKX only. "
+    "AI provider: Groq. "
+    "Estimated delta uses recent trades. "
+    "Order book imbalance is a snapshot. "
+    "Trade plans are analytical references, "
+    "not executed orders."
+)
+
+st.caption(
+    "SALIGA AI PRO 17.1 | "
+    "Market intelligence, not financial advice."
+)
