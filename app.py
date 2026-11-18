@@ -1,10 +1,17 @@
-# SALIGA AI PRO 21.0
-# OKX + Groq AI + news/macro fusion | No EMA / No SMA
-# Run: pip install streamlit pandas numpy requests plotly
-#      streamlit run saliga_ai_pro_21.py
+# SALIGA AI PRO 21.1 — BTC ONLY
+# OKX + GROQ AI + NEWS FUSION
+# No EMA / No SMA
 
 from __future__ import annotations
-import os, json, time, math, sqlite3, hashlib, re
+
+import os
+import json
+import time
+import math
+import sqlite3
+import hashlib
+import re
+
 from datetime import datetime, timezone
 from typing import Any, List, Optional, Tuple
 
@@ -14,16 +21,22 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-APP_VERSION = "21.0"
+
+APP_VERSION = "21.1 BTC ONLY"
+
 OKX_BASE = "https://www.okx.com"
-DB_PATH = os.getenv("SALIGA_DB", "saliga_ai_pro.db")
+
+DB_PATH = os.getenv(
+    "SALIGA_DB",
+    "saliga_ai_pro.db"
+)
+
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
 DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 SYMBOLS = {
-    "BTC": "BTC-USDT-SWAP",
-    "ETH": "ETH-USDT-SWAP",
-    "SOL": "SOL-USDT-SWAP"
+    "BTC": "BTC-USDT-SWAP"
 }
 
 TF_MAP = {
@@ -44,13 +57,13 @@ HEADERS = {
 }
 
 st.set_page_config(
-    page_title="SALIGA AI PRO 21.0",
+    page_title="SALIGA AI PRO 21.1",
     page_icon="⚡",
     layout="wide"
 )
 
 
-# ----------------------------- UTILITIES -----------------------------
+# ---------------- UTILITIES ----------------
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -78,10 +91,16 @@ def clamp(x, lo, hi):
 
 def fmt_num(x, digits=2):
     v = safe_float(x, float("nan"))
-    return "—" if not math.isfinite(v) else f"{v:,.{digits}f}"
+
+    return (
+        "—"
+        if not math.isfinite(v)
+        else f"{v:,.{digits}f}"
+    )
 
 
 def request_json(path, params=None, timeout=12):
+
     r = requests.get(
         OKX_BASE + path,
         params=params or {},
@@ -90,9 +109,11 @@ def request_json(path, params=None, timeout=12):
     )
 
     r.raise_for_status()
+
     data = r.json()
 
     if str(data.get("code", "0")) != "0":
+
         raise RuntimeError(
             f"OKX API: {data.get('msg', 'unknown error')}"
         )
@@ -100,7 +121,7 @@ def request_json(path, params=None, timeout=12):
     return data
 
 
-# ----------------------------- DATABASE -----------------------------
+# ---------------- DATABASE ----------------
 
 def init_db():
 
@@ -209,7 +230,12 @@ def store_oi(symbol, oi, price):
                 ts,symbol,oi,price
             )
             VALUES(?,?,?,?)
-        """, (ts, symbol, oi, price))
+        """, (
+            ts,
+            symbol,
+            oi,
+            price
+        ))
 
         con.execute("""
             DELETE FROM oi_history
@@ -229,7 +255,10 @@ def oi_change(symbol, minutes=5):
             WHERE symbol=? AND ts<=?
             ORDER BY ts DESC
             LIMIT 1
-        """, (symbol, cutoff)).fetchone()
+        """, (
+            symbol,
+            cutoff
+        )).fetchone()
 
         latest = con.execute("""
             SELECT oi
@@ -242,7 +271,10 @@ def oi_change(symbol, minutes=5):
     if not row or not latest or not row[0]:
         return 0.0
 
-    return pct(float(latest[0]), float(row[0]))
+    return pct(
+        float(latest[0]),
+        float(row[0])
+    )
 
 
 def store_book(symbol, bids, asks):
@@ -299,7 +331,7 @@ def get_trades():
         """, con)
 
 
-# ----------------------------- OKX DATA -----------------------------
+# ---------------- OKX DATA ----------------
 
 @st.cache_data(ttl=45, show_spinner=False)
 def fetch_candles(inst, bar, limit=160):
@@ -314,6 +346,7 @@ def fetch_candles(inst, bar, limit=160):
     )["data"]
 
     rows = []
+
     now_ms = int(time.time() * 1000)
 
     durations = {
@@ -389,7 +422,9 @@ def fetch_funding(inst):
         {"instId": inst}
     )["data"][0]
 
-    return safe_float(d.get("fundingRate")) * 100.0
+    return safe_float(
+        d.get("fundingRate")
+    ) * 100.0
 
 
 def fetch_oi(inst):
@@ -482,7 +517,7 @@ def fetch_trade_delta(inst):
     }
 
 
-# ----------------------------- TECHNICAL ANALYSIS -----------------------------
+# ---------------- TECHNICAL ANALYSIS ----------------
 
 def wilder_smooth(series, period):
 
@@ -504,6 +539,7 @@ def wilder_smooth(series, period):
     )
 
     out[seed_idx] = seed
+
     prev = seed
 
     for i in range(seed_idx + 1, len(values)):
@@ -512,7 +548,9 @@ def wilder_smooth(series, period):
 
         if np.isnan(val):
             out[i] = prev
+
         else:
+
             prev = (
                 prev * (period - 1) + val
             ) / period
@@ -687,7 +725,7 @@ def analyze_tf(df):
     }
 
 
-# ----------------------------- POSITION FLOW -----------------------------
+# ---------------- POSITION FLOW ----------------
 
 def derive_position_flow(
     price_change,
@@ -725,24 +763,18 @@ def derive_position_flow(
         price_change > 0.05
         and delta_pct < -5
     ):
-        return (
-            "SELLING INTO RISE / BEARISH DIVERGENCE",
-            "SHORT"
-        )
+        return "SELLING INTO RISE / BEARISH DIVERGENCE", "SHORT"
 
     if (
         price_change < -0.05
         and delta_pct > 5
     ):
-        return (
-            "BUYING INTO DROP / BULLISH DIVERGENCE",
-            "LONG"
-        )
+        return "BUYING INTO DROP / BULLISH DIVERGENCE", "LONG"
 
     return "NO CLEAR POSITION FLOW", ""
 
 
-# ----------------------------- TECHNICAL FUSION -----------------------------
+# ---------------- TECHNICAL FUSION ----------------
 
 def technical_fusion(tf, deriv, price_change):
 
@@ -885,7 +917,7 @@ def technical_fusion(tf, deriv, price_change):
     }
 
 
-# ----------------------------- NEWS INTELLIGENCE -----------------------------
+# ---------------- NEWS INTELLIGENCE ----------------
 
 def strip_html(s):
 
@@ -980,35 +1012,32 @@ def fetch_news():
     return items[:25]
 
 
-def news_digest(news):
-
-    return "\n".join(
-        f"- {x['title']} | {x['description']} | {x['link']}"
-        for x in news[:15]
-    ) or "No fresh RSS headlines retrieved."
-
-
-# ----------------------------- GROQ AI FUSION -----------------------------
+# ---------------- GROQ AI ----------------
 
 def groq_analyze(api_key, model, payload, news):
 
     system = """
-You are SALIGA AI, a cautious crypto market intelligence analyst.
+You are SALIGA AI, a cautious BTC market intelligence analyst.
 
-Combine technical, derivatives, order-book, news and macro context.
+Combine the supplied live technical, derivatives,
+order-book and news data.
 
-Do not invent facts, prices, headlines, DXY values or economic releases.
+Connect news catalysts with actual BTC market reaction.
 
-Distinguish observed data from interpretation.
+Never invent headlines, prices, DXY values
+or economic releases.
 
-News sentiment is -2 to +2.
+If DXY or macro figures are not supplied,
+explicitly say they are unavailable.
 
-Explain whether news confirms, conflicts with, or is irrelevant to
-the technical setup.
+Separate facts from interpretation.
 
-Never claim certainty or provide guaranteed predictions.
+Assess news sentiment from -2 to +2.
 
-Return ONLY valid JSON with keys:
+Explain whether news confirms, conflicts with,
+or is unrelated to the technical setup.
+
+Return ONLY a valid JSON object with keys:
 
 market_regime,
 bias,
@@ -1023,29 +1052,30 @@ action,
 confidence,
 summary.
 
-action must be LONG / SHORT / WAIT.
+action must be LONG, SHORT, or WAIT.
 
-confidence is an uncalibrated 0-100 analytical score,
-not a probability.
+confidence is an uncalibrated analytical score
+from 0 to 100, not a statistical probability.
 
-If evidence conflicts or is weak, choose WAIT.
+If evidence is mixed, choose WAIT.
 """
 
     user = {
         "market_snapshot": payload,
         "recent_news": news[:15],
         "instruction": (
-            "Assess current setup and potential reversal. "
-            "Give greater weight to live exchange data than "
-            "speculative headlines. State if no meaningful "
-            "news is present."
+            "Analyze BTC now. Cross-check each relevant headline "
+            "against price, OI, funding, trade delta, order book "
+            "and all five timeframes. Identify possible early "
+            "reversal, but do not claim certainty. "
+            "If no relevant news is present, say so."
         )
     }
 
     body = {
-        "model": model,
+        "model": model.strip(),
         "temperature": 0.15,
-        "max_tokens": 1100,
+        "max_tokens": 1400,
         "response_format": {
             "type": "json_object"
         },
@@ -1064,26 +1094,77 @@ If evidence conflicts or is weak, choose WAIT.
         ]
     }
 
-    r = requests.post(
-        GROQ_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        },
-        json=body,
-        timeout=45
-    )
+    try:
 
-    r.raise_for_status()
+        r = requests.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {api_key.strip()}",
+                "Content-Type": "application/json"
+            },
+            json=body,
+            timeout=60
+        )
 
-    content = (
-        r.json()["choices"][0]["message"]["content"]
-    )
+    except requests.RequestException as e:
 
-    return json.loads(content)
+        raise RuntimeError(
+            f"Groq hálózati hiba: {e}"
+        ) from e
+
+    if not r.ok:
+
+        try:
+            detail = r.json().get(
+                "error", {}
+            ).get("message", r.text)
+
+        except Exception:
+            detail = r.text
+
+        raise RuntimeError(
+            f"Groq HTTP {r.status_code}: {detail[:1200]}"
+        )
+
+    try:
+
+        data = r.json()
+
+        content = (
+            data["choices"][0]["message"]["content"]
+        )
+
+        result = json.loads(content)
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"A Groq válasza nem értelmezhető JSON-ként: "
+            f"{e}; válasz: {r.text[:800]}"
+        ) from e
+
+    required = [
+        "bias",
+        "action",
+        "summary"
+    ]
+
+    missing = [
+        k for k in required
+        if k not in result
+    ]
+
+    if missing:
+
+        raise RuntimeError(
+            f"A Groq válaszából hiányzó mezők: "
+            f"{', '.join(missing)}"
+        )
+
+    return result
 
 
-# ----------------------------- EVENT-DRIVEN AI SCHEDULER -----------------------------
+# ---------------- EVENT-DRIVEN AI ----------------
 
 def should_trigger_event(
     tech,
@@ -1122,45 +1203,44 @@ def should_trigger_event(
     )
 
 
-def ai_due(symbol, event_trigger):
+def ai_due(symbol, event_trigger, force=False):
 
     now = time.time()
 
-    last = st.session_state.get(
+    last_success = st.session_state.get(
         f"ai_last_{symbol}",
         0.0
     )
 
-    last_event = st.session_state.get(
+    last_event_success = st.session_state.get(
         f"ai_event_last_{symbol}",
         0.0
     )
 
-    regular_due = now - last >= 15 * 60
+    last_attempt = st.session_state.get(
+        f"ai_attempt_{symbol}",
+        0.0
+    )
+
+    if force:
+        return True
+
+    if now - last_attempt < 45:
+        return False
+
+    regular_due = (
+        now - last_success >= 15 * 60
+    )
 
     event_due = (
         event_trigger
-        and now - last_event >= 180
+        and now - last_event_success >= 180
     )
 
-    if regular_due or event_due:
-
-        if event_due and not regular_due:
-
-            st.session_state[
-                f"ai_event_last_{symbol}"
-            ] = now
-
-        st.session_state[
-            f"ai_last_{symbol}"
-        ] = now
-
-        return True
-
-    return False
+    return regular_due or event_due
 
 
-# ----------------------------- TRADE JOURNAL -----------------------------
+# ---------------- PAPER TRADE JOURNAL ----------------
 
 def update_trade_journal(
     symbol,
@@ -1324,7 +1404,7 @@ def manage_open_trade(symbol, price):
             )
 
 
-# ----------------------------- USER INTERFACE -----------------------------
+# ---------------- USER INTERFACE ----------------
 
 def render_signal_card(
     symbol,
@@ -1337,7 +1417,7 @@ def render_signal_card(
 ):
 
     st.subheader(
-        f"{symbol}  ·  {SYMBOLS[symbol]}"
+        f"{symbol} · {SYMBOLS[symbol]}"
     )
 
     c1, c2, c3, c4 = st.columns(4)
@@ -1363,7 +1443,7 @@ def render_signal_card(
     )
 
     st.write(
-        f"**Position flow:** {fusion['flow_event']}  "
+        f"**Position flow:** {fusion['flow_event']} "
         f"· **Reversal:** {fusion['reversal']}"
     )
 
@@ -1433,22 +1513,28 @@ def render_signal_card(
     else:
 
         st.info(
-            "A Groq AI-értékelés még nem futott le ebben a ciklusban. "
-            "A technikai motor ettől függetlenül működik."
+            "A Groq AI-értékelés még nem futott le. "
+            "Az oldalsávban indítható kézzel."
         )
 
 
-# ----------------------------- MAIN APPLICATION -----------------------------
+# ---------------- MAIN ----------------
 
 def main():
 
     init_db()
 
-    st.title("⚡ SALIGA AI PRO 21.0")
+    symbol = "BTC"
+    inst = SYMBOLS[symbol]
+
+    st.title(
+        "⚡ SALIGA AI PRO 21.1 — BTC ONLY"
+    )
 
     st.caption(
-        "Multi-asset market intelligence · OKX live data · "
-        "Groq + news fusion · No EMA / No SMA · Paper journal only"
+        "BTC-USDT-SWAP · OKX live data · "
+        "Groq + hírelemzés · "
+        "1m / 5m / 15m / 1H / 4H · EMA/SMA nélkül"
     )
 
     with st.sidebar:
@@ -1456,20 +1542,14 @@ def main():
         st.header("Beállítások")
 
         groq_key = st.text_input(
-            "Groq API key",
+            "Groq API-kulcs",
             value=os.getenv("GROQ_API_KEY", ""),
             type="password"
         )
 
         model = st.text_input(
-            "Groq model",
+            "Groq modell",
             value=os.getenv("GROQ_MODEL", DEFAULT_MODEL)
-        )
-
-        selected = st.multiselect(
-            "Eszközök",
-            list(SYMBOLS.keys()),
-            default=["BTC", "ETH", "SOL"]
         )
 
         refresh = st.slider(
@@ -1489,16 +1569,16 @@ def main():
             value=True
         )
 
-        st.caption(
-            "Az AI normál esetben 15 percenként fut. "
-            "Rendkívüli esemény esetén legalább 3 percenként "
-            "újraindítható."
+        force_ai = st.button(
+            "⚡ AI-elemzés indítása most",
+            use_container_width=True
         )
 
-    if not selected:
-
-        st.warning("Válassz legalább egy eszközt.")
-        return
+        st.caption(
+            "A technikai adatok percenként frissülnek. "
+            "A Groq normál esetben 15 percenként, "
+            "jelentős eseménynél korábban fut."
+        )
 
     news = fetch_news()
 
@@ -1508,152 +1588,154 @@ def main():
 
         for item in news[:8]:
 
-            title = item["title"]
-
             if item["link"]:
 
                 st.markdown(
-                    f"- [{title}]({item['link']})"
+                    f"- [{item['title']}]({item['link']})"
                 )
 
             else:
-                st.write(f"- {title}")
+                st.write(f"- {item['title']}")
 
     else:
 
         st.info(
-            "Az RSS-hírcsatornák jelenleg nem érhetők el. "
-            "A technikai elemzés ettől még működik."
+            "Az RSS-hírcsatornák most nem adtak vissza hírt. "
+            "A technikai elemzés ettől függetlenül működik."
         )
 
-    all_snapshots = {}
+    errors = []
 
-    for symbol in selected:
+    try:
 
-        inst = SYMBOLS[symbol]
-        errors = []
+        ticker = fetch_ticker(inst)
+        oi = fetch_oi(inst)
+        funding = fetch_funding(inst)
+        book = fetch_book(inst)
+        delta = fetch_trade_delta(inst)
 
-        try:
+        store_oi(
+            inst,
+            oi,
+            ticker["last"]
+        )
 
-            ticker = fetch_ticker(inst)
-            oi = fetch_oi(inst)
-            funding = fetch_funding(inst)
-            book = fetch_book(inst)
-            delta = fetch_trade_delta(inst)
+        oi5 = oi_change(inst, 5)
 
-            store_oi(
-                inst,
-                oi,
-                ticker["last"]
-            )
+        frames = {}
+        tf_results = {}
 
-            oi5 = oi_change(inst, 5)
+        for tf_name, bar in TF_MAP.items():
 
-            frames = {}
-            tf_results = {}
+            try:
 
-            for tf_name, bar in TF_MAP.items():
-
-                try:
-
-                    frames[tf_name] = fetch_candles(
-                        inst,
-                        bar,
-                        160
-                    )
-
-                    tf_results[tf_name] = analyze_tf(
-                        frames[tf_name]
-                    )
-
-                except Exception as e:
-
-                    errors.append(
-                        f"{tf_name}: {e}"
-                    )
-
-                    tf_results[tf_name] = analyze_tf(
-                        pd.DataFrame()
-                    )
-
-            one = frames.get(
-                "1m",
-                pd.DataFrame()
-            )
-
-            price_change = (
-                pct(
-                    one.close.iloc[-1],
-                    one.close.iloc[-6]
+                frames[tf_name] = fetch_candles(
+                    inst,
+                    bar,
+                    160
                 )
-                if len(one) >= 6
-                else 0.0
+
+                tf_results[tf_name] = analyze_tf(
+                    frames[tf_name]
+                )
+
+            except Exception as e:
+
+                errors.append(
+                    f"{tf_name} gyertyaadat: {e}"
+                )
+
+                tf_results[tf_name] = analyze_tf(
+                    pd.DataFrame()
+                )
+
+        one = frames.get(
+            "1m",
+            pd.DataFrame()
+        )
+
+        price_change = (
+            pct(
+                one.close.iloc[-1],
+                one.close.iloc[-6]
             )
+            if len(one) >= 6
+            else 0.0
+        )
 
-            deriv = {
-                "oi": oi,
-                "oi_change_5m": oi5,
-                "funding_pct": funding,
-                "delta_pct": delta["delta_pct"],
-                "buy_usd": delta["buy_usd"],
-                "sell_usd": delta["sell_usd"],
-                "book_imbalance": book["imbalance"],
-                "bid_usd": book["bid_usd"],
-                "ask_usd": book["ask_usd"]
-            }
+        deriv = {
+            "oi": oi,
+            "oi_change_5m": oi5,
+            "funding_pct": funding,
+            "delta_pct": delta["delta_pct"],
+            "buy_usd": delta["buy_usd"],
+            "sell_usd": delta["sell_usd"],
+            "book_imbalance": book["imbalance"],
+            "bid_usd": book["bid_usd"],
+            "ask_usd": book["ask_usd"]
+        }
 
-            fusion = technical_fusion(
-                tf_results,
+        fusion = technical_fusion(
+            tf_results,
+            deriv,
+            price_change
+        )
+
+        snap = {
+            "symbol": "BTC",
+            "instrument": inst,
+            "price": ticker["last"],
+            "price_change_5m_pct": price_change,
+            "timeframes": tf_results,
+            "derivatives": deriv,
+            "technical_fusion": fusion,
+            "book_top_bids": book["bids"][:8],
+            "book_top_asks": book["asks"][:8]
+        }
+
+        prev_hash = st.session_state.get(
+            "news_hash_BTC",
+            ""
+        )
+
+        event_trigger, event_reason, new_hash = (
+            should_trigger_event(
+                fusion,
                 deriv,
-                price_change
+                news,
+                prev_hash
             )
+        )
 
-            snap = {
-                "symbol": symbol,
-                "instrument": inst,
-                "price": ticker["last"],
-                "price_change_5m_pct": price_change,
-                "timeframes": tf_results,
-                "derivatives": deriv,
-                "technical_fusion": fusion,
-                "book_top_bids": book["bids"][:8],
-                "book_top_asks": book["asks"][:8]
-            }
+        st.session_state["news_hash_BTC"] = new_hash
 
-            # Event-driven AI analysis
+        ai_result = st.session_state.get(
+            "ai_result_BTC"
+        )
 
-            prev_hash = st.session_state.get(
-                f"news_hash_{symbol}",
-                ""
-            )
+        if enable_ai:
 
-            event_trigger, event_reason, new_hash = (
-                should_trigger_event(
-                    fusion,
-                    deriv,
-                    news,
-                    prev_hash
+            if not groq_key.strip():
+
+                errors.append(
+                    "A Groq AI nem indul el: hiányzik az API-kulcs. "
+                    "Add meg a Groq API-kulcsot az oldalsávban."
                 )
-            )
 
-            st.session_state[
-                f"news_hash_{symbol}"
-            ] = new_hash
-
-            ai_result = st.session_state.get(
-                f"ai_result_{symbol}"
-            )
-
-            if (
-                enable_ai
-                and groq_key
-                and ai_due(symbol, event_trigger)
+            elif ai_due(
+                "BTC",
+                event_trigger,
+                force=force_ai
             ):
+
+                st.session_state[
+                    "ai_attempt_BTC"
+                ] = time.time()
 
                 try:
 
                     with st.spinner(
-                        f"{symbol}: Groq AI + hírek elemzése…"
+                        "BTC: Groq AI + hírek + technikai adatok elemzése…"
                     ):
 
                         ai_result = groq_analyze(
@@ -1664,8 +1746,18 @@ def main():
                         )
 
                     st.session_state[
-                        f"ai_result_{symbol}"
+                        "ai_result_BTC"
                     ] = ai_result
+
+                    st.session_state[
+                        "ai_last_BTC"
+                    ] = time.time()
+
+                    if event_trigger:
+
+                        st.session_state[
+                            "ai_event_last_BTC"
+                        ] = time.time()
 
                     db_event(
                         inst,
@@ -1676,197 +1768,189 @@ def main():
                             ai_result.get("confidence")
                         ),
                         (
-                            f"Trigger: {event_reason or '15-minute scheduled analysis'}; "
+                            f"Trigger: {event_reason or 'manual / scheduled'}; "
                             f"{ai_result.get('summary','')}"
                         )
                     )
 
                 except Exception as e:
 
-                    errors.append(
-                        f"Groq: {e}"
-                    )
+                    errors.append(str(e))
 
-            elif enable_ai and not groq_key:
+        # AI contextual validation
 
-                errors.append(
-                    "Add meg a Groq API kulcsot az oldalsávban "
-                    "vagy a GROQ_API_KEY környezeti változóban."
+        if ai_result:
+
+            ai_action = str(
+                ai_result.get("action", "WAIT")
+            ).upper()
+
+            alignment = str(
+                ai_result.get(
+                    "technical_news_alignment",
+                    ""
+                )
+            ).lower()
+
+            if (
+                fusion["direction"] in ("LONG", "SHORT")
+                and ai_action in ("LONG", "SHORT")
+                and ai_action != fusion["direction"]
+            ):
+
+                fusion["entry_stage"] = (
+                    "WATCH — AI CONFLICT"
                 )
 
-            # AI contextual validation
+            elif (
+                "conflict" in alignment
+                and fusion["direction"] in ("LONG", "SHORT")
+            ):
 
-            if ai_result:
-
-                ai_action = str(
-                    ai_result.get("action", "WAIT")
-                ).upper()
-
-                alignment = str(
-                    ai_result.get(
-                        "technical_news_alignment",
-                        ""
-                    )
-                ).lower()
-
-                if (
-                    fusion["direction"] in ("LONG", "SHORT")
-                    and ai_action not in (
-                        fusion["direction"],
-                        "WAIT"
-                    )
-                ):
-
-                    fusion["entry_stage"] = (
-                        "WATCH — AI CONFLICT"
-                    )
-
-                elif (
-                    "conflict" in alignment
-                    and fusion["direction"] in ("LONG", "SHORT")
-                ):
-
-                    fusion["entry_stage"] = (
-                        "WATCH — NEWS CONFLICT"
-                    )
-
-                elif (
-                    ai_action == fusion["direction"]
-                    and fusion["direction"] in ("LONG", "SHORT")
-                    and fusion["entry_stage"] == "EARLY ENTRY"
-                ):
-
-                    fusion["entry_stage"] = (
-                        "AI-ALIGNED EARLY ENTRY"
-                    )
-
-            # Paper trade journal
-
-            if enable_journal:
-
-                manage_open_trade(
-                    inst,
-                    ticker["last"]
+                fusion["entry_stage"] = (
+                    "WATCH — NEWS CONFLICT"
                 )
 
-                update_trade_journal(
-                    inst,
-                    fusion,
-                    ticker["last"],
-                    tf_results.get("15m", {}).get("atr", 0)
+            elif (
+                ai_action == fusion["direction"]
+                and fusion["direction"] in ("LONG", "SHORT")
+                and fusion["entry_stage"] == "EARLY ENTRY"
+            ):
+
+                fusion["entry_stage"] = (
+                    "AI-ALIGNED EARLY ENTRY"
                 )
 
-            all_snapshots[symbol] = snap
+        if enable_journal:
 
-            with st.container(border=True):
-
-                render_signal_card(
-                    symbol,
-                    ticker,
-                    tf_results,
-                    deriv,
-                    fusion,
-                    ai_result,
-                    " · ".join(errors)
-                )
-
-                if len(one) > 5:
-
-                    fig = go.Figure(
-                        data=[
-                            go.Candlestick(
-                                x=one.time,
-                                open=one.open,
-                                high=one.high,
-                                low=one.low,
-                                close=one.close,
-                                name="1m"
-                            )
-                        ]
-                    )
-
-                    fig.update_layout(
-                        height=260,
-                        margin=dict(
-                            l=10,
-                            r=10,
-                            t=20,
-                            b=10
-                        ),
-                        xaxis_rangeslider_visible=False
-                    )
-
-                    st.plotly_chart(
-                        fig,
-                        use_container_width=True,
-                        key=f"chart_{symbol}"
-                    )
-
-                with st.expander(
-                    "Order book / likviditás pillanatkép"
-                ):
-
-                    b1, b2 = st.columns(2)
-
-                    b1.write("**Top bids**")
-
-                    b1.dataframe(
-                        pd.DataFrame(
-                            book["bids"][:10],
-                            columns=[
-                                "Price",
-                                "Size",
-                                "Liquidation",
-                                "Orders"
-                            ]
-                        ).iloc[:, :2],
-                        use_container_width=True,
-                        hide_index=True
-                    )
-
-                    b2.write("**Top asks**")
-
-                    b2.dataframe(
-                        pd.DataFrame(
-                            book["asks"][:10],
-                            columns=[
-                                "Price",
-                                "Size",
-                                "Liquidation",
-                                "Orders"
-                            ]
-                        ).iloc[:, :2],
-                        use_container_width=True,
-                        hide_index=True
-                    )
-
-                with st.expander(
-                    "Idősíkok részletes adatai"
-                ):
-
-                    st.dataframe(
-                        pd.DataFrame([
-                            {
-                                "TF": k,
-                                **{
-                                    kk: vv
-                                    for kk, vv in v.items()
-                                    if kk != "details"
-                                }
-                            }
-                            for k, v in tf_results.items()
-                        ]),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-
-        except Exception as e:
-
-            st.error(
-                f"{symbol}: adatlekérési hiba: {e}"
+            manage_open_trade(
+                inst,
+                ticker["last"]
             )
 
-    # ----------------------------- EVENT LOG -----------------------------
+            update_trade_journal(
+                inst,
+                fusion,
+                ticker["last"],
+                tf_results.get("15m", {}).get("atr", 0)
+            )
+
+        with st.container(border=True):
+
+            render_signal_card(
+                symbol,
+                ticker,
+                tf_results,
+                deriv,
+                fusion,
+                ai_result,
+                " · ".join(errors)
+            )
+
+            if len(one) > 5:
+
+                fig = go.Figure(
+                    data=[
+                        go.Candlestick(
+                            x=one.time,
+                            open=one.open,
+                            high=one.high,
+                            low=one.low,
+                            close=one.close,
+                            name="BTC 1m"
+                        )
+                    ]
+                )
+
+                fig.update_layout(
+                    height=280,
+                    margin=dict(
+                        l=10,
+                        r=10,
+                        t=20,
+                        b=10
+                    ),
+                    xaxis_rangeslider_visible=False
+                )
+
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    key="btc_chart"
+                )
+
+            with st.expander(
+                "Order book / likviditás pillanatkép"
+            ):
+
+                b1, b2 = st.columns(2)
+
+                b1.write("**Top bids**")
+
+                b1.dataframe(
+                    pd.DataFrame(
+                        book["bids"][:10]
+                    ).iloc[:, :2],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                b2.write("**Top asks**")
+
+                b2.dataframe(
+                    pd.DataFrame(
+                        book["asks"][:10]
+                    ).iloc[:, :2],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            with st.expander(
+                "Idősíkok részletes adatai"
+            ):
+
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "TF": k,
+                            **{
+                                kk: vv
+                                for kk, vv in v.items()
+                                if kk != "details"
+                            }
+                        }
+                        for k, v in tf_results.items()
+                    ]),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        last_ai = st.session_state.get(
+            "ai_last_BTC",
+            0
+        )
+
+        if last_ai:
+
+            st.caption(
+                "Utolsó sikeres Groq-elemzés: "
+                + datetime.fromtimestamp(
+                    last_ai
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            )
+
+        else:
+
+            st.caption(
+                "Még nem történt sikeres Groq-elemzés. "
+                "Az oldalsáv AI-elemzés indítása gombjával tesztelhető."
+            )
+
+    except Exception as e:
+
+        st.error(
+            f"BTC adatlekérési hiba: {e}"
+        )
 
     st.divider()
 
@@ -1875,7 +1959,7 @@ def main():
     with left:
 
         st.subheader(
-            "Position flow / eseménynapló"
+            "BTC position flow / eseménynapló"
         )
 
         ev = get_events(100)
@@ -1897,7 +1981,7 @@ def main():
     with right:
 
         st.subheader(
-            "Paper trade napló"
+            "BTC paper trade napló"
         )
 
         trades = get_trades()
@@ -1917,7 +2001,7 @@ def main():
             st.download_button(
                 "Trade napló letöltése CSV-ben",
                 csv_data,
-                "saliga_trade_journal.csv",
+                "saliga_btc_trade_journal.csv",
                 "text/csv"
             )
 
@@ -1928,10 +2012,8 @@ def main():
             )
 
     st.caption(
-        f"SALIGA AI PRO {APP_VERSION} · "
-        f"Last refresh: {iso_now()} · "
-        "A jelzések elemzési/paper-trading célúak, "
-        "nem végrehajtott megbízások."
+        f"SALIGA AI PRO 21.1 BTC ONLY · {iso_now()} · "
+        "Paper trading, nem valódi tőzsdei megbízás."
     )
 
     st.markdown(
