@@ -1,6 +1,6 @@
 # ============================================================
-# SALIGA AI PRO 18.2 (AUTO NEWS + AUTO PATTERN + AUTO-REFRESH)
-# BTC-CENTRIC + AUTO RSS NEWS + HISTORICAL PATTERN MATCHING + GROQ AI
+# SALIGA AI PRO 18.3 (FULL DERIVATIVES + PATTERNS + AUTO NEWS)
+# BTC-CENTRIC + ALL METRICS IN MATH + AUTO RSS + GROQ AI
 # ============================================================
 
 import streamlit as st
@@ -23,12 +23,12 @@ from openai import OpenAI
 # ============================================================
 
 st.set_page_config(
-    page_title="SALIGA AI PRO 18.2 - AUTO NEWS & PATTERN",
+    page_title="SALIGA AI PRO 18.3 - FULL MATH & PATTERN",
     page_icon="⚡",
     layout="wide"
 )
 
-APP_VERSION = "SALIGA AI PRO 18.2"
+APP_VERSION = "SALIGA AI PRO 18.3"
 DB_PATH = "saliga_ai.db"
 
 ASSET = "BTC"
@@ -44,7 +44,6 @@ TIMEFRAMES = {
 OI_URL = "https://www.okx.com/api/v5/public/open-interest"
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-# Megbízható kripto és makro RSS hírforrások
 RSS_FEEDS = [
     "https://cointelegraph.com/rss",
     "https://www.coindesk.com/arc/outboundfeeds/rss/"
@@ -75,7 +74,7 @@ for key, value in DEFAULT_STATE.items():
 
 
 # ============================================================
-# 3. GENERAL HELPERS & AUTO NEWS FETCHER
+# 3. GENERAL HELPERS & AUTO NEWS
 # ============================================================
 
 def now_utc():
@@ -125,21 +124,18 @@ def safe_close(conn):
         pass
 
 def fetch_latest_crypto_news():
-    """
-    Automatikusan lekéri a legfrissebb híreket a megadott RSS feedekből.
-    """
     headlines = []
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:5]: # Top 5 hír forrásonként
+            for entry in feed.entries[:5]:
                 title = entry.get("title", "")
                 published = entry.get("published", "")
                 if title:
                     headlines.append(f"- {title} ({published})")
         except Exception:
             continue
-    return headlines[:10] # Összesen a legfrissebb 10 hír
+    return headlines[:10]
 
 
 # ============================================================
@@ -284,7 +280,7 @@ def fetch_btc_market_data():
 
 
 # ============================================================
-# 6. HISTORICAL PATTERN MATCHING ENGINE
+# 6. HISTORICAL PATTERN MATCHING & DERIVATIVES MATH ENGINE
 # ============================================================
 
 def fetch_deep_btc_candles(timeframe, limit=2000):
@@ -334,10 +330,10 @@ def find_similar_historical_patterns(df, window_size=15):
     if best_correlation > 0.75 and subsequent_movements:
         avg_future_move = np.mean(subsequent_movements)
         if avg_future_move > 0.5:
-            score_modifier = 25
+            score_modifier = 20
             desc = f"🟢 Múltbeli minták alapján BIKA folytatás (Hasonlóság: {best_correlation*100:.1f}%)"
         elif avg_future_move < -0.5:
-            score_modifier = -25
+            score_modifier = -20
             desc = f"🔴 Múltbeli minták alapján MEDVE esés (Hasonlóság: {best_correlation*100:.1f}%)"
         else:
             desc = f"⚖️ Oldalazó múltbeli minta (Hasonlóság: {best_correlation*100:.1f}%)"
@@ -362,26 +358,67 @@ def analyze_btc_structure(df):
     status = "Normál S/R sáv"
     modifier = 0
     if last_close >= resistance:
-        status, modifier = "🚀 ELLENÁLLÁS ÁTTÖRÉS", +20
+        status, modifier = "🚀 ELLENÁLLÁS ÁTTÖRÉS", +15
     elif last_close <= support:
-        status, modifier = "⚠️ TÁMASZ ÁTTÖRÉS", -20
+        status, modifier = "⚠️ TÁMASZ ÁTTÖRÉS", -15
 
     return {"support": support, "resistance": resistance, "status": status, "modifier": modifier}
 
-def analyze_btc_timeframe(timeframe, lookback_limit):
+def calculate_derivatives_score_modifier(market_data):
+    """
+    Kiszámolja a derivatív mutatókból (Open Interest, Funding Rate, Delta, Orderbook)
+    jövő matematikai pontszám-módosítót, hogy MINDEN bekerüljön a kalkulációba.
+    """
+    if not market_data or market_data.get("error"):
+        return 0
+
+    mod = 0
+    # 1. Open Interest változás (Ha nő az OI és az ár is emelkedik, az erős bika)
+    oi_chg = market_data.get("oi_change")
+    if oi_chg is not None:
+        if oi_chg > 1.0: mod += 15
+        elif oi_chg < -1.0: mod -= 15
+
+    # 2. Funding Rate (Ha extrém pozitív, túl sok a long; ha negatív, short squeeze jöhet)
+    f_rate = market_data.get("funding_rate")
+    if f_rate is not None:
+        if f_rate < 0: mod += 10 # Negatív funding bika (short squeeze veszély)
+        elif f_rate > 0.0005: mod -= 5 # Túlfűtött longok
+
+    # 3. Delta % (Vevők vs Eladók aránya a legutóbbi ügyletekben)
+    delta = market_data.get("delta_percent")
+    if delta is not None:
+        if delta > 5.0: mod += 15
+        elif delta < -5.0: mod -= 15
+
+    # 4. Order Book Imbalance (Ajánlati könyv egyensúly)
+    imbalance = market_data.get("orderbook_imbalance")
+    if imbalance is not None:
+        if imbalance > 10.0: mod += 10
+        elif imbalance < -10.0: mod -= 10
+
+    return mod
+
+def analyze_btc_timeframe(timeframe, lookback_limit, market_data):
     df = fetch_deep_btc_candles(timeframe, limit=lookback_limit)
     if df is None:
         return {"direction": "WAIT", "score": 0}
 
     last_close = df["close"].iloc[-1]
-    score = 0
-
+    
+    # 1. Múltbeli minta-egyezés pontszáma
     pattern_match = find_similar_historical_patterns(df, window_size=15)
-    score += pattern_match["score_modifier"]
+    score = pattern_match["score_modifier"]
 
+    # 2. Támasz / Ellenállás áttörés pontszáma
     sr = analyze_btc_structure(df)
     score += sr["modifier"]
 
+    # 3. TELJES DERIVATÍV ÉS PIACI ÁRAMLÁS belekalkulálása a pontszámba!
+    derivatives_mod = calculate_derivatives_score_modifier(market_data)
+    score += derivatives_mod
+
+    # Végleges irány meghatározása a küszöbértékek alapján
     direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "WAIT")
 
     return {
@@ -389,12 +426,13 @@ def analyze_btc_timeframe(timeframe, lookback_limit):
         "score": score,
         "price": last_close,
         "sr": sr,
-        "pattern_match": pattern_match
+        "pattern_match": pattern_match,
+        "derivatives_modifier": derivatives_mod
     }
 
 
 # ============================================================
-# 7. GROQ AI INTEGRÁCIÓ (AUTOMATIKUS HÍREKKEL)
+# 7. GROQ AI INTEGRÁCIÓ
 # ============================================================
 
 def run_groq_btc_analysis(market_data, tf_data, auto_news):
@@ -406,13 +444,13 @@ def run_groq_btc_analysis(market_data, tf_data, auto_news):
 
     payload = {
         "derivatives_market": market_data,
-        "historical_pattern_matching": tf_data,
+        "timeframe_analysis_with_all_metrics": tf_data,
         "automatically_fetched_news": auto_news
     }
 
     system_prompt = """
 You are SALIGA AI PRO, an elite Bitcoin (BTC) intelligence analyst.
-Analyze OKX derivatives, support/resistance, historical pattern matching across thousands of candles, and the automatically fetched live crypto news headlines.
+Analyze OKX derivatives (OI, funding rate, delta, orderbook), support/resistance, historical pattern matching across thousands of candles, and automatically fetched live crypto news headlines.
 Provide a concise, professional trading intelligence report in valid JSON format only.
 
 Required JSON structure:
@@ -420,7 +458,7 @@ Required JSON structure:
   "bias": "BULLISH / BEARISH / NEUTRAL",
   "confidence_score": 85,
   "executive_summary": "Professional summary combining historical patterns, derivatives, and live news sentiment.",
-  "news_and_macro_impact": "Detailed breakdown of how the automatically fetched live headlines affect BTC price action.",
+  "news_and_macro_impact": "Detailed breakdown of how live headlines and market derivatives affect BTC price action.",
   "actionable_insight": "Specific recommendation on long/short positioning or waiting.",
   "risks": ["Risk 1", "Risk 2"]
 }
@@ -444,18 +482,15 @@ Required JSON structure:
 
 def run_full_cycle(lookback_candles):
     market = fetch_btc_market_data()
+    
     tf_results = {}
     for tf_key in TIMEFRAMES.keys():
-        tf_results[tf_key] = analyze_btc_timeframe(tf_key, lookback_candles)
+        tf_results[tf_key] = analyze_btc_timeframe(tf_key, lookback_candles, market)
     
-    # Hírek automatikus lekérése minden ciklusban
     news = fetch_latest_crypto_news()
     st.session_state["latest_news"] = news
 
-    # Automatikus AI elemzés frissítés a háttérben is
-    market_data = market
-    tf_data = tf_results
-    ai_res, ai_err = run_groq_btc_analysis(market_data, tf_data, news)
+    ai_res, ai_err = run_groq_btc_analysis(market, tf_results, news)
     st.session_state["ai_result"] = ai_res
     st.session_state["ai_error"] = ai_err
 
@@ -470,8 +505,8 @@ def run_full_cycle(lookback_candles):
 # 8. STREAMLIT UI
 # ============================================================
 
-st.title("⚡ SALIGA AI PRO 18.2 — FULL AUTO RADAR")
-st.caption("OKX OI + FUNDING + VISSZAMENŐLEGES MINTAKERESÉS + AUTOMATIKUS RSS HÍREK + GROQ AI")
+st.title("⚡ SALIGA AI PRO 18.3 — FULL MATH & DERIVATIVES RADAR")
+st.caption("OKX OI + FUNDING + DELTA + ORDERBOOK + VISSZAMENŐLEGES MINTÁK + RSS HÍREK + GROQ AI (MINDEN A MATEMATIKÁBAN!)")
 
 if exchange_error:
     st.error(f"OKX Hiba: {exchange_error}")
@@ -530,11 +565,11 @@ with m_col4:
 
 
 # ============================================================
-# 10. HISTORICAL PATTERN MATCHING RADAR PANEL
+# 10. TELJES RENDSZER RADAR PANEL (MINTA + S/R + DERIVATÍV)
 # ============================================================
 
 st.markdown("---")
-st.header(f"🎯 TÖRTÉNELMI MINTA-ÖSSZEHASONLÍTÓ RADAR (Visszanézve: {lookback_candles} gyertya)")
+st.header(f"🎯 TELJES MATEMATIKAI JELZÉS RADAR (Visszanézve: {lookback_candles} gyertya)")
 
 h1_info = data.get("timeframes", {}).get("H1", {})
 sr = h1_info.get("sr", {})
@@ -553,12 +588,13 @@ with col_a:
         st.warning("### 🟡 BTC JELZÉS: KIVÁRÁS (WAIT)")
 
     st.metric("Élő BTC Árfolyam", fmt(price, 2))
-    st.metric("H1 Minta Pontszám", h1_info.get("score", 0))
+    st.metric("H1 Teljes Matematikai Pontszám", h1_info.get("score", 0))
 
 with col_b:
     st.info(
-        f"🔍 **Múltbeli Minta Elemzés (H1):**\n"
-        f"{pattern_match.get('matched_pattern_desc', 'N/A')}\n\n"
+        f"🔍 **H1 Elemzés Részletei:**\n"
+        f"• {pattern_match.get('matched_pattern_desc', 'N/A')}\n"
+        f"• Derivatív Hatás Módosító: `{h1_info.get('derivatives_modifier', 0)} pont`\n\n"
         f"🧱 **H1 Ellenállás:** `{fmt(sr.get('resistance'), 2)}`\n\n"
         f"🛡️ **H1 Támasz:** `{fmt(sr.get('support'), 2)}`"
     )
@@ -572,7 +608,6 @@ st.markdown("---")
 
 st.header("🧠 GROQ AI ÖNMKÖDŐ ELEMZÉS & LEGFRISSEBB HÍREK")
 
-# Megmutatjuk a legfrissebb automatikusan leszedett híreket
 with st.expander("📰 Automatikusan lekért legfrissebb kripto hírek listája"):
     news_list = st.session_state.get("latest_news", [])
     if news_list:
@@ -590,7 +625,7 @@ if ai_err:
 if ai_res:
     st.subheader(f"AI Piaci Irány: {ai_res.get('bias', 'N/A')} (Bizalom: {ai_res.get('confidence_score', 'N/A')}%)")
     st.write(f"**Összegzés:** {ai_res.get('executive_summary', '')}")
-    st.info(f"**Hírek & Minta Hatás Értékelés:** {ai_res.get('news_and_macro_impact', '')}")
+    st.info(f"**Piaci & Derivatív Hatás Értékelés:** {ai_res.get('news_and_macro_impact', '')}")
     st.success(f"**Ajánlott Művelet:** {ai_res.get('actionable_insight', '')}")
     
     with st.expander("⚠️ Kockázatok"):
@@ -605,7 +640,7 @@ else:
 # ============================================================
 
 st.markdown("---")
-st.subheader("🧭 BTC Időkeretek & Minta-egyezési Összegzés")
+st.subheader("🧭 BTC Időkeretek & Teljes Pontszámok Összegzése")
 
 tf_rows = []
 for tf_name in TIMEFRAMES.keys():
@@ -614,9 +649,10 @@ for tf_name in TIMEFRAMES.keys():
     tf_rows.append({
         "Időkeret": tf_name,
         "Irány": res.get("direction", "WAIT"),
-        "Pontszám": res.get("score", 0),
-        "Múltbeli Minta Eredmény": pm.get("matched_pattern_desc", "N/A"),
-        "Hasonlóság (Korreláció)": f"{pm.get('similarity', 0)*100:.1f}%"
+        "Összpontszám": res.get("score", 0),
+        "Derivatív Módosító": f"{res.get('derivatives_modifier', 0):+d}",
+        "Múltbeli Minta": pm.get("matched_pattern_desc", "N/A"),
+        "Hasonlóság": f"{pm.get('similarity', 0)*100:.1f}%"
     })
 
 st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
