@@ -1,6 +1,7 @@
 # ============================================================
-# SALIGA AI PRO 18.3 (FULL DERIVATIVES + PATTERNS + AUTO NEWS)
-# BTC-CENTRIC + ALL METRICS IN MATH + AUTO RSS + GROQ AI
+# SALIGA AI PRO 19.0
+# INSTITUTIONAL MARKET INTELLIGENCE
+# BTC DERIVATIVES + PATTERN AI + NEWS + GROQ
 # ============================================================
 
 import streamlit as st
@@ -14,7 +15,7 @@ import os
 import time
 import feedparser
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from openai import OpenAI
 
 
@@ -23,16 +24,25 @@ from openai import OpenAI
 # ============================================================
 
 st.set_page_config(
-    page_title="SALIGA AI PRO 18.3 - FULL MATH & PATTERN",
+    page_title="SALIGA AI PRO 19.0",
     page_icon="⚡",
     layout="wide"
 )
 
-APP_VERSION = "SALIGA AI PRO 18.3"
+APP_VERSION = "SALIGA AI PRO 19.0"
+
+SYMBOL = "BTC/USDT:USDT"
+
 DB_PATH = "saliga_ai.db"
 
-ASSET = "BTC"
-SYMBOL = "BTC/USDT:USDT"
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+OI_URL = "https://www.okx.com/api/v5/public/open-interest"
+
+RSS_FEEDS = [
+    "https://cointelegraph.com/rss",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/"
+]
 
 TIMEFRAMES = {
     "M15": "15m",
@@ -41,16 +51,17 @@ TIMEFRAMES = {
     "D1": "1d"
 }
 
-OI_URL = "https://www.okx.com/api/v5/public/open-interest"
-GROQ_MODEL = "openai/gpt-oss-120b"
-
-RSS_FEEDS = [
-    "https://cointelegraph.com/rss",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/"
-]
-
-DEFAULT_REFRESH_INTERVAL = 300 
 HTTP_TIMEOUT = 15
+
+DEFAULT_REFRESH = 300
+
+MAX_CANDLES = 5000
+
+PATTERN_WINDOW = 15
+
+PATTERN_HORIZON = 5
+
+TOP_MATCHES = 30
 
 
 # ============================================================
@@ -58,613 +69,1893 @@ HTTP_TIMEOUT = 15
 # ============================================================
 
 DEFAULT_STATE = {
-    "last_refresh": 0,
-    "btc_analysis": {},
+    "market": {},
+    "timeframes": {},
+    "news": [],
     "ai_result": None,
     "ai_error": None,
-    "auto_refresh_active": True,
-    "refresh_interval": DEFAULT_REFRESH_INTERVAL,
-    "lookback_candles": 2000,
-    "latest_news": []
+    "last_refresh": None,
+    "lookback": 2000,
+    "refresh_interval": DEFAULT_REFRESH
 }
 
 for key, value in DEFAULT_STATE.items():
+
     if key not in st.session_state:
         st.session_state[key] = value
 
 
 # ============================================================
-# 3. GENERAL HELPERS & AUTO NEWS
+# 3. GENERAL FUNCTIONS
 # ============================================================
 
 def now_utc():
+
     return datetime.now(timezone.utc)
 
+
 def timestamp():
+
     return now_utc().isoformat()
 
+
 def safe_float(value):
+
     try:
+
         result = float(value)
+
         if np.isfinite(result):
             return result
+
         return None
+
     except (TypeError, ValueError):
+
         return None
+
 
 def fmt(value, decimals=2):
+
+    value = safe_float(value)
+
     if value is None:
         return "N/A"
-    try:
-        return f"{float(value):,.{decimals}f}"
-    except (TypeError, ValueError):
-        return "N/A"
+
+    return f"{value:,.{decimals}f}"
+
 
 def pct_change(current, previous):
-    if current is None or previous is None or previous == 0:
+
+    current = safe_float(current)
+    previous = safe_float(previous)
+
+    if current is None or previous in (None, 0):
         return None
-    return ((current - previous) / previous) * 100
+
+    return (current / previous - 1) * 100
+
 
 def get_secret(name):
+
     try:
+
         value = st.secrets.get(name)
+
         if value:
             return str(value)
+
     except Exception:
         pass
+
     return os.getenv(name)
 
+
+# ============================================================
+# 4. DATABASE
+# ============================================================
+
 def db_connection():
-    return sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
 
-def safe_close(conn):
-    try:
-        conn.close()
-    except Exception:
-        pass
+    return sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False
+    )
 
-def fetch_latest_crypto_news():
-    headlines = []
-    for url in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:5]:
-                title = entry.get("title", "")
-                published = entry.get("published", "")
-                if title:
-                    headlines.append(f"- {title} ({published})")
-        except Exception:
-            continue
-    return headlines[:10]
-
-
-# ============================================================
-# 4. DATABASE & OI HISTORY INIT
-# ============================================================
 
 def init_db():
-    conn = db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS btc_oi_history (
+
+    with db_connection() as conn:
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS oi_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 value REAL,
                 created_at TEXT
             )
         """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_oi_time
+            ON oi_history(created_at)
+        """)
+
         conn.commit()
-    finally:
-        safe_close(conn)
 
-init_db()
 
-def save_oi_history(value):
+def save_oi(value):
+
+    value = safe_float(value)
+
     if value is None:
         return
-    conn = db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO btc_oi_history (value, created_at) VALUES (?, ?)", (value, timestamp()))
-        conn.commit()
-    finally:
-        safe_close(conn)
 
-def calculate_oi_change(current_value):
-    if current_value is None:
+    with db_connection() as conn:
+
+        conn.execute(
+            "INSERT INTO oi_history(value, created_at) VALUES (?, ?)",
+            (value, timestamp())
+        )
+
+        conn.commit()
+
+
+def get_oi_change(current):
+
+    if current is None:
         return None
-    conn = db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT value, created_at FROM btc_oi_history WHERE value IS NOT NULL ORDER BY id DESC LIMIT 50")
-        rows = cur.fetchall()
-    finally:
-        safe_close(conn)
-    if not rows:
-        return None
-    curr_t = now_utc()
-    for val, c_at in rows:
+
+    cutoff = now_utc() - timedelta(minutes=5)
+
+    with db_connection() as conn:
+
+        rows = conn.execute("""
+            SELECT value, created_at
+            FROM oi_history
+            ORDER BY id DESC
+            LIMIT 500
+        """).fetchall()
+
+    candidates = []
+
+    for value, created_at in rows:
+
         try:
-            old_t = datetime.fromisoformat(c_at)
-            if old_t.tzinfo is None:
-                old_t = old_t.replace(tzinfo=timezone.utc)
-            if (curr_t - old_t).total_seconds() >= 300:
-                return pct_change(current_value, float(val))
-        except:
+
+            dt = datetime.fromisoformat(created_at)
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            if dt <= cutoff:
+                candidates.append((value, dt))
+
+        except Exception:
             continue
-    return None
+
+    if not candidates:
+        return None
+
+    old_value, old_time = min(
+        candidates,
+        key=lambda x: abs((cutoff - x[1]).total_seconds())
+    )
+
+    return pct_change(current, old_value)
 
 
 # ============================================================
-# 5. OKX CONNECTION & MARKET METRICS
+# 5. OKX CONNECTION
 # ============================================================
 
 @st.cache_resource
 def get_exchange():
-    client = ccxt.okx({
+
+    exchange = ccxt.okx({
+
         "enableRateLimit": True,
+
         "timeout": 20000,
-        "options": {"defaultType": "swap"}
+
+        "options": {
+            "defaultType": "swap"
+        }
+
     })
-    client.load_markets()
-    return client
 
-exchange = None
-exchange_error = None
-try:
-    exchange = get_exchange()
-except Exception as e:
-    exchange_error = str(e)
+    exchange.load_markets()
 
-def fetch_btc_market_data():
-    if exchange is None:
-        return {"error": exchange_error or "OKX offline"}
-    
-    res = {"error": None}
+    return exchange
+
+
+# ============================================================
+# 6. HISTORICAL CANDLE DOWNLOAD
+# ============================================================
+
+def fetch_candles(exchange, timeframe, requested=2000):
+
+    requested = min(int(requested), MAX_CANDLES)
+
+    tf_ms = exchange.parse_timeframe(timeframe) * 1000
+
+    since = exchange.milliseconds() - requested * tf_ms
+
+    all_rows = {}
+
+    for _ in range(15):
+
+        remaining = requested - len(all_rows)
+
+        if remaining <= 0:
+            break
+
+        batch = exchange.fetch_ohlcv(
+            SYMBOL,
+            timeframe=timeframe,
+            since=since,
+            limit=min(300, remaining)
+        )
+
+        if not batch:
+            break
+
+        for row in batch:
+            all_rows[int(row[0])] = row
+
+        newest = max(int(row[0]) for row in batch)
+
+        if newest <= since:
+            break
+
+        since = newest + tf_ms
+
+    if not all_rows:
+        return None
+
+    rows = sorted(all_rows.values(), key=lambda x: x[0])
+
+    df = pd.DataFrame(
+        rows[-requested:],
+        columns=[
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume"
+        ]
+    )
+
+    for col in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume"
+    ]:
+
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        )
+
+    df = df.dropna()
+
+    # A még formálódó gyertya nem kerül az elemzésbe.
+
+    if len(df) > 1:
+        df = df.iloc[:-1]
+
+    return df.reset_index(drop=True)
+
+
+# ============================================================
+# 7. BTC MARKET DATA
+# ============================================================
+
+def fetch_market_data(exchange):
+
+    result = {
+        "source": "OKX",
+        "timestamp": timestamp(),
+        "errors": []
+    }
+
+    # PRICE
+
     try:
+
         ticker = exchange.fetch_ticker(SYMBOL)
-        res["price"] = safe_float(ticker.get("last"))
-        res["percentage"] = safe_float(ticker.get("percentage"))
-        res["high"] = safe_float(ticker.get("high"))
-        res["low"] = safe_float(ticker.get("low"))
+
+        result["price"] = safe_float(
+            ticker.get("last")
+        )
+
+        result["change_24h"] = safe_float(
+            ticker.get("percentage")
+        )
+
+        result["high_24h"] = safe_float(
+            ticker.get("high")
+        )
+
+        result["low_24h"] = safe_float(
+            ticker.get("low")
+        )
+
+        result["volume_24h"] = safe_float(
+            ticker.get("quoteVolume")
+        )
+
     except Exception as e:
-        res["error"] = "Ticker: " + str(e)
+
+        result["errors"].append(
+            "PRICE: " + str(e)
+        )
+
+    # OPEN INTEREST
 
     try:
-        market_info = exchange.market(SYMBOL)
-        params = {"instType": "SWAP", "instId": market_info["id"]}
-        response = requests.get(OI_URL, params=params, timeout=HTTP_TIMEOUT)
+
+        market = exchange.market(SYMBOL)
+
+        response = requests.get(
+            OI_URL,
+            params={
+                "instType": "SWAP",
+                "instId": market["id"]
+            },
+            timeout=HTTP_TIMEOUT
+        )
+
+        response.raise_for_status()
+
         payload = response.json()
+
         if str(payload.get("code")) == "0":
-            for rec in payload.get("data", []):
-                val = safe_float(rec.get("oiUsd"))
-                if val:
-                    res["oi_usd"] = val
-                    break
-        res["oi_change"] = calculate_oi_change(res.get("oi_usd"))
-        if res.get("oi_usd"):
-            save_oi_history(res["oi_usd"])
-    except:
-        res["oi_usd"] = None
-        res["oi_change"] = None
+
+            if payload.get("data"):
+
+                row = payload["data"][0]
+
+                result["oi_usd"] = safe_float(
+                    row.get("oiUsd")
+                )
+
+                result["oi_contracts"] = safe_float(
+                    row.get("oi")
+                )
+
+        if result.get("oi_usd") is not None:
+
+            result["oi_change"] = get_oi_change(
+                result["oi_usd"]
+            )
+
+            save_oi(result["oi_usd"])
+
+    except Exception as e:
+
+        result["errors"].append(
+            "OPEN INTEREST: " + str(e)
+        )
+
+    # FUNDING
 
     try:
-        funding = exchange.fetch_funding_rate(SYMBOL)
-        res["funding_rate"] = safe_float(funding.get("fundingRate"))
-    except:
-        res["funding_rate"] = None
+
+        funding = exchange.fetch_funding_rate(
+            SYMBOL
+        )
+
+        result["funding_rate"] = safe_float(
+            funding.get("fundingRate")
+        )
+
+        result["next_funding"] = funding.get(
+            "fundingDatetime"
+        )
+
+    except Exception as e:
+
+        result["errors"].append(
+            "FUNDING: " + str(e)
+        )
+
+    # ORDER BOOK
 
     try:
-        orderbook = exchange.fetch_order_book(SYMBOL, limit=20)
-        bids_vol = sum(float(x[0]) * float(x[1]) for x in orderbook.get("bids", []))
-        asks_vol = sum(float(x[0]) * float(x[1]) for x in orderbook.get("asks", []))
-        total_vol = bids_vol + asks_vol
-        res["orderbook_imbalance"] = ((bids_vol - asks_vol) / total_vol) * 100 if total_vol > 0 else 0.0
-    except:
-        res["orderbook_imbalance"] = None
+
+        book = exchange.fetch_order_book(
+            SYMBOL,
+            limit=50
+        )
+
+        bids = sum(
+            float(p) * float(q)
+            for p, q in book["bids"]
+        )
+
+        asks = sum(
+            float(p) * float(q)
+            for p, q in book["asks"]
+        )
+
+        total = bids + asks
+
+        result["bid_volume"] = bids
+
+        result["ask_volume"] = asks
+
+        result["orderbook_imbalance"] = (
+            (bids - asks) / total * 100
+            if total > 0 else None
+        )
+
+    except Exception as e:
+
+        result["errors"].append(
+            "ORDERBOOK: " + str(e)
+        )
+
+    # TRADE DELTA
 
     try:
-        trades = exchange.fetch_trades(SYMBOL, limit=200)
-        buy_v, sell_v = 0.0, 0.0
-        for t in trades:
-            amt = safe_float(t.get("amount"))
-            if amt:
-                if t.get("side") == "buy": buy_v += amt
-                else: sell_v += amt
-        tot_t = buy_v + sell_v
-        res["delta_percent"] = ((buy_v - sell_v) / tot_t) * 100 if tot_t > 0 else 0.0
-    except:
-        res["delta_percent"] = None
 
-    return res
+        trades = exchange.fetch_trades(
+            SYMBOL,
+            limit=500
+        )
+
+        buy_volume = 0.0
+        sell_volume = 0.0
+
+        buy_notional = 0.0
+        sell_notional = 0.0
+
+        for trade in trades:
+
+            amount = safe_float(
+                trade.get("amount")
+            ) or 0
+
+            price = safe_float(
+                trade.get("price")
+            ) or 0
+
+            if trade.get("side") == "buy":
+
+                buy_volume += amount
+
+                buy_notional += amount * price
+
+            elif trade.get("side") == "sell":
+
+                sell_volume += amount
+
+                sell_notional += amount * price
+
+        total = buy_volume + sell_volume
+
+        result["delta_percent"] = (
+            (buy_volume - sell_volume) / total * 100
+            if total > 0 else None
+        )
+
+        result["trade_delta_usd"] = (
+            buy_notional - sell_notional
+        )
+
+        result["trade_count"] = len(trades)
+
+    except Exception as e:
+
+        result["errors"].append(
+            "DELTA: " + str(e)
+        )
+
+    return result
 
 
 # ============================================================
-# 6. HISTORICAL PATTERN MATCHING & DERIVATIVES MATH ENGINE
+# 8. DERIVATIVES INTELLIGENCE
 # ============================================================
 
-def fetch_deep_btc_candles(timeframe, limit=2000):
-    if exchange is None:
-        return None
-    try:
-        data = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAMES[timeframe], limit=min(limit, 1500))
-        if not data or len(data) < 50:
-            return None
-        df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df.iloc[:-1].reset_index(drop=True)
-    except:
-        return None
+def derivatives_analysis(market):
 
-def find_similar_historical_patterns(df, window_size=15):
-    if df is None or len(df) < window_size * 3:
-        return {"matched_pattern_desc": "Nincs elegendő adat", "score_modifier": 0, "similarity": 0}
+    score = 0
+
+    notes = []
+
+    oi = market.get("oi_change")
+
+    price_change = market.get("change_24h")
+
+    funding = market.get("funding_rate")
+
+    delta = market.get("delta_percent")
+
+    imbalance = market.get("orderbook_imbalance")
+
+    # OI + PRICE
+
+    if oi is not None and price_change is not None:
+
+        if oi > 0.5 and price_change > 0:
+
+            score += 10
+
+            notes.append(
+                "Árfolyam emelkedik és OI növekszik: új pozíciók épülhetnek."
+            )
+
+        elif oi > 0.5 and price_change < 0:
+
+            score -= 10
+
+            notes.append(
+                "Árfolyam esik és OI növekszik: új short pozíciók épülhetnek."
+            )
+
+        elif oi < -0.5 and price_change > 0:
+
+            score += 4
+
+            notes.append(
+                "Árfolyam emelkedik, OI csökken: shortzárások is hajthatják."
+            )
+
+        elif oi < -0.5 and price_change < 0:
+
+            score -= 4
+
+            notes.append(
+                "Árfolyam esik, OI csökken: longzárások is történhetnek."
+            )
+
+    # FUNDING
+
+    if funding is not None:
+
+        if funding > 0.0008:
+
+            score -= 4
+
+            notes.append(
+                "Magas pozitív funding: zsúfolt long pozicionáltság lehet."
+            )
+
+        elif funding < -0.0003:
+
+            score += 4
+
+            notes.append(
+                "Negatív funding: short pozicionáltság lehet."
+            )
+
+    # DELTA
+
+    if delta is not None:
+
+        if delta > 8:
+
+            score += 8
+
+            notes.append(
+                "A végrehajtott ügyletek deltaértéke vételi nyomást mutat."
+            )
+
+        elif delta < -8:
+
+            score -= 8
+
+            notes.append(
+                "A végrehajtott ügyletek deltaértéke eladási nyomást mutat."
+            )
+
+    # ORDER BOOK
+
+    if imbalance is not None:
+
+        if imbalance > 15:
+
+            score += 4
+
+            notes.append(
+                "Az ajánlati könyv pillanatnyilag vételi túlsúlyt mutat."
+            )
+
+        elif imbalance < -15:
+
+            score -= 4
+
+            notes.append(
+                "Az ajánlati könyv pillanatnyilag eladói túlsúlyt mutat."
+            )
+
+    return {
+        "score": score,
+        "notes": notes
+    }
+
+
+# ============================================================
+# 9. MARKET STRUCTURE
+# ============================================================
+
+def analyze_structure(df):
+
+    if df is None or len(df) < 30:
+
+        return {
+            "score": 0,
+            "status": "N/A",
+            "support": None,
+            "resistance": None
+        }
+
+    last = df.iloc[-1]
+
+    previous = df.iloc[-21:-1]
+
+    support = float(
+        previous["low"].min()
+    )
+
+    resistance = float(
+        previous["high"].max()
+    )
+
+    close = float(last["close"])
+
+    score = 0
+
+    if close > resistance:
+
+        score = 18
+
+        status = "BULLISH BREAKOUT"
+
+    elif close < support:
+
+        score = -18
+
+        status = "BEARISH BREAKDOWN"
+
+    else:
+
+        status = "RANGE / CONSOLIDATION"
+
+    return {
+        "score": score,
+        "status": status,
+        "support": support,
+        "resistance": resistance
+    }
+
+
+# ============================================================
+# 10. MOMENTUM ENGINE
+# ============================================================
+
+def analyze_momentum(df):
+
+    if df is None or len(df) < 30:
+
+        return {
+            "score": 0,
+            "return_5": None,
+            "return_20": None
+        }
+
+    close = df["close"]
+
+    r5 = pct_change(
+        close.iloc[-1],
+        close.iloc[-6]
+    )
+
+    r20 = pct_change(
+        close.iloc[-1],
+        close.iloc[-21]
+    )
+
+    score = 0
+
+    if r5 is not None:
+
+        if r5 > 0.15:
+            score += 8
+
+        elif r5 < -0.15:
+            score -= 8
+
+    if r20 is not None:
+
+        if r20 > 0.35:
+            score += 12
+
+        elif r20 < -0.35:
+            score -= 12
+
+    return {
+        "score": score,
+        "return_5": r5,
+        "return_20": r20
+    }
+
+
+# ============================================================
+# 11. HISTORICAL PATTERN INTELLIGENCE
+# ============================================================
+
+def find_historical_patterns(
+    df,
+    window=PATTERN_WINDOW,
+    horizon=PATTERN_HORIZON
+):
+
+    empty = {
+        "score": 0,
+        "similarity": None,
+        "matches": 0,
+        "up_rate": None,
+        "down_rate": None,
+        "flat_rate": None,
+        "average_move": None,
+        "description": "Nincs elegendő adat"
+    }
+
+    if df is None or len(df) < window * 4 + horizon:
+
+        return empty
 
     closes = df["close"].values
-    recent_window = closes[-window_size:]
-    recent_normalized = (recent_window - recent_window[0]) / recent_window[0]
 
-    best_correlation = -1.0
-    subsequent_movements = []
+    recent = closes[-window:]
 
-    for i in range(window_size, len(df) - window_size - 5):
-        historical_window = closes[i : i + window_size]
-        hist_normalized = (historical_window - historical_window[0]) / historical_window[0]
+    recent = recent / recent[0] - 1
 
-        correlation = np.corrcoef(recent_normalized, hist_normalized)[0, 1]
-        
-        if np.isnan(correlation):
+    recent = recent - np.mean(recent)
+
+    std = np.std(recent)
+
+    if std == 0:
+        return empty
+
+    recent = recent / std
+
+    candidates = []
+
+    max_start = len(closes) - window - horizon - window
+
+    for i in range(max_start + 1):
+
+        historical = closes[i:i + window]
+
+        if len(historical) != window:
             continue
 
-        if correlation > best_correlation:
-            best_correlation = correlation
-            future_price_after_pattern = closes[i + window_size + 5]
-            pattern_end_price = historical_window[-1]
-            move_pct = ((future_price_after_pattern - pattern_end_price) / pattern_end_price) * 100
-            subsequent_movements.append(move_pct)
+        if historical[0] == 0:
+            continue
 
-    score_modifier = 0
-    desc = "Gyenge mintaegyezés"
-    
-    if best_correlation > 0.75 and subsequent_movements:
-        avg_future_move = np.mean(subsequent_movements)
-        if avg_future_move > 0.5:
-            score_modifier = 20
-            desc = f"🟢 Múltbeli minták alapján BIKA folytatás (Hasonlóság: {best_correlation*100:.1f}%)"
-        elif avg_future_move < -0.5:
-            score_modifier = -20
-            desc = f"🔴 Múltbeli minták alapján MEDVE esés (Hasonlóság: {best_correlation*100:.1f}%)"
+        normalized = historical / historical[0] - 1
+
+        normalized = normalized - np.mean(normalized)
+
+        hist_std = np.std(normalized)
+
+        if hist_std == 0:
+            continue
+
+        normalized = normalized / hist_std
+
+        correlation = np.corrcoef(
+            recent,
+            normalized
+        )[0, 1]
+
+        if not np.isfinite(correlation):
+            continue
+
+        end_index = i + window - 1
+
+        future_index = end_index + horizon
+
+        future_move = pct_change(
+            closes[future_index],
+            closes[end_index]
+        )
+
+        if future_move is None:
+            continue
+
+        candidates.append(
+            (correlation, future_move)
+        )
+
+    if not candidates:
+        return empty
+
+    candidates.sort(
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    selected = candidates[:TOP_MATCHES]
+
+    returns = np.array([
+        x[1] for x in selected
+        if x[0] >= 0.60
+    ])
+
+    similarities = [
+        x[0] for x in selected
+    ]
+
+    if len(returns) < 3:
+
+        returns = np.array([
+            x[1] for x in selected[:5]
+        ])
+
+    if len(returns) == 0:
+        return empty
+
+    up = np.mean(returns > 0.15) * 100
+
+    down = np.mean(returns < -0.15) * 100
+
+    flat = 100 - up - down
+
+    average = np.mean(returns)
+
+    similarity = similarities[0]
+
+    score = 0
+
+    if len(returns) >= 5 and similarity >= 0.65:
+
+        if up >= 60 and average > 0:
+
+            score = 12
+
+            description = (
+                "BULLISH HISTORICAL PATTERN"
+            )
+
+        elif down >= 60 and average < 0:
+
+            score = -12
+
+            description = (
+                "BEARISH HISTORICAL PATTERN"
+            )
+
         else:
-            desc = f"⚖️ Oldalazó múltbeli minta (Hasonlóság: {best_correlation*100:.1f}%)"
+
+            description = (
+                "MIXED HISTORICAL PATTERN"
+            )
+
     else:
-        desc = f"Nincs erős történelmi egyezés (Korreláció: {best_correlation*100:.1f}%)"
+
+        description = (
+            "WEAK HISTORICAL MATCH"
+        )
 
     return {
-        "matched_pattern_desc": desc,
-        "score_modifier": score_modifier,
-        "similarity": float(best_correlation) if not np.isnan(best_correlation) else 0.0
-    }
 
-def analyze_btc_structure(df):
-    if df is None or len(df) < 30:
-        return {"support": 0, "resistance": 0, "status": "N/A", "modifier": 0}
-
-    last_close = df["close"].iloc[-1]
-    recent = df.iloc[-20:]
-    resistance = float(recent["high"].max())
-    support = float(recent["low"].min())
-    
-    status = "Normál S/R sáv"
-    modifier = 0
-    if last_close >= resistance:
-        status, modifier = "🚀 ELLENÁLLÁS ÁTTÖRÉS", +15
-    elif last_close <= support:
-        status, modifier = "⚠️ TÁMASZ ÁTTÖRÉS", -15
-
-    return {"support": support, "resistance": resistance, "status": status, "modifier": modifier}
-
-def calculate_derivatives_score_modifier(market_data):
-    """
-    Kiszámolja a derivatív mutatókból (Open Interest, Funding Rate, Delta, Orderbook)
-    jövő matematikai pontszám-módosítót, hogy MINDEN bekerüljön a kalkulációba.
-    """
-    if not market_data or market_data.get("error"):
-        return 0
-
-    mod = 0
-    # 1. Open Interest változás (Ha nő az OI és az ár is emelkedik, az erős bika)
-    oi_chg = market_data.get("oi_change")
-    if oi_chg is not None:
-        if oi_chg > 1.0: mod += 15
-        elif oi_chg < -1.0: mod -= 15
-
-    # 2. Funding Rate (Ha extrém pozitív, túl sok a long; ha negatív, short squeeze jöhet)
-    f_rate = market_data.get("funding_rate")
-    if f_rate is not None:
-        if f_rate < 0: mod += 10 # Negatív funding bika (short squeeze veszély)
-        elif f_rate > 0.0005: mod -= 5 # Túlfűtött longok
-
-    # 3. Delta % (Vevők vs Eladók aránya a legutóbbi ügyletekben)
-    delta = market_data.get("delta_percent")
-    if delta is not None:
-        if delta > 5.0: mod += 15
-        elif delta < -5.0: mod -= 15
-
-    # 4. Order Book Imbalance (Ajánlati könyv egyensúly)
-    imbalance = market_data.get("orderbook_imbalance")
-    if imbalance is not None:
-        if imbalance > 10.0: mod += 10
-        elif imbalance < -10.0: mod -= 10
-
-    return mod
-
-def analyze_btc_timeframe(timeframe, lookback_limit, market_data):
-    df = fetch_deep_btc_candles(timeframe, limit=lookback_limit)
-    if df is None:
-        return {"direction": "WAIT", "score": 0}
-
-    last_close = df["close"].iloc[-1]
-    
-    # 1. Múltbeli minta-egyezés pontszáma
-    pattern_match = find_similar_historical_patterns(df, window_size=15)
-    score = pattern_match["score_modifier"]
-
-    # 2. Támasz / Ellenállás áttörés pontszáma
-    sr = analyze_btc_structure(df)
-    score += sr["modifier"]
-
-    # 3. TELJES DERIVATÍV ÉS PIACI ÁRAMLÁS belekalkulálása a pontszámba!
-    derivatives_mod = calculate_derivatives_score_modifier(market_data)
-    score += derivatives_mod
-
-    # Végleges irány meghatározása a küszöbértékek alapján
-    direction = "LONG" if score >= 25 else ("SHORT" if score <= -25 else "WAIT")
-
-    return {
-        "direction": direction,
         "score": score,
-        "price": last_close,
-        "sr": sr,
-        "pattern_match": pattern_match,
-        "derivatives_modifier": derivatives_mod
+
+        "similarity": float(similarity),
+
+        "matches": len(returns),
+
+        "up_rate": float(up),
+
+        "down_rate": float(down),
+
+        "flat_rate": float(flat),
+
+        "average_move": float(average),
+
+        "description": description
     }
 
 
 # ============================================================
-# 7. GROQ AI INTEGRÁCIÓ
+# 12. ATR / VOLATILITY
 # ============================================================
 
-def run_groq_btc_analysis(market_data, tf_data, auto_news):
-    key = get_secret("GROQ_API_KEY")
-    if not key:
-        return None, "GROQ_API_KEY hiányzik a Secrets-ből!"
+def calculate_atr(df, period=14):
 
-    client = OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1")
+    if df is None or len(df) < period + 1:
+        return None
+
+    high = df["high"]
+
+    low = df["low"]
+
+    previous_close = df["close"].shift(1)
+
+    tr = pd.concat([
+
+        high - low,
+
+        abs(high - previous_close),
+
+        abs(low - previous_close)
+
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(period).mean().iloc[-1]
+
+    close = df["close"].iloc[-1]
+
+    if pd.isna(atr) or close == 0:
+        return None
+
+    return float(atr / close * 100)
+
+
+# ============================================================
+# 13. POSITION FLOW INTERPRETATION
+# ============================================================
+
+def analyze_position_flow(market):
+
+    oi = market.get("oi_change")
+
+    price = market.get("change_24h")
+
+    delta = market.get("delta_percent")
+
+    if oi is None or price is None:
+
+        return "INSUFFICIENT DATA"
+
+    if oi > 0.5 and price > 0:
+
+        if delta is not None and delta > 5:
+
+            return "LONG POSITION BUILDING"
+
+        return "OPEN INTEREST GROWING WITH PRICE"
+
+    if oi > 0.5 and price < 0:
+
+        if delta is not None and delta < -5:
+
+            return "SHORT POSITION BUILDING"
+
+        return "OPEN INTEREST GROWING DURING DECLINE"
+
+    if oi < -0.5 and price > 0:
+
+        return "POSSIBLE SHORT CLOSING"
+
+    if oi < -0.5 and price < 0:
+
+        return "POSSIBLE LONG CLOSING"
+
+    return "NO CLEAR POSITION FLOW"
+
+
+# ============================================================
+# 14. TIMEFRAME ANALYSIS
+# ============================================================
+
+def analyze_timeframe(
+    exchange,
+    name,
+    timeframe,
+    lookback,
+    derivatives
+):
+
+    df = fetch_candles(
+        exchange,
+        timeframe,
+        lookback
+    )
+
+    if df is None:
+
+        return {
+            "direction": "WAIT",
+            "score": 0,
+            "error": "Insufficient data"
+        }
+
+    structure = analyze_structure(df)
+
+    momentum = analyze_momentum(df)
+
+    pattern = find_historical_patterns(df)
+
+    deriv_score = (
+        derivatives["score"]
+        if name == "H1"
+        else 0
+    )
+
+    score = (
+        structure["score"]
+        + momentum["score"]
+        + pattern["score"]
+        + deriv_score
+    )
+
+    direction = (
+        "LONG" if score >= 20
+        else "SHORT" if score <= -20
+        else "WAIT"
+    )
+
+    return {
+
+        "direction": direction,
+
+        "score": int(score),
+
+        "price": float(df["close"].iloc[-1]),
+
+        "candles_loaded": len(df),
+
+        "structure": structure,
+
+        "momentum": momentum,
+
+        "pattern": pattern,
+
+        "derivatives_score": deriv_score,
+
+        "atr_percent": calculate_atr(df),
+
+        "error": None
+    }
+
+
+# ============================================================
+# 15. AUTOMATIC NEWS ENGINE
+# ============================================================
+
+def fetch_news():
+
+    headlines = []
+
+    for url in RSS_FEEDS:
+
+        try:
+
+            feed = feedparser.parse(url)
+
+            for entry in feed.entries[:15]:
+
+                title = entry.get("title", "")
+
+                if not title:
+                    continue
+
+                headlines.append({
+
+                    "title": title,
+
+                    "published": (
+                        entry.get("published")
+                        or entry.get("updated")
+                        or ""
+                    ),
+
+                    "source": feed.feed.get(
+                        "title",
+                        url
+                    ),
+
+                    "link": entry.get("link", ""),
+
+                    "summary": (
+                        entry.get("summary", "")[:500]
+                    )
+                })
+
+        except Exception:
+            continue
+
+    unique = {}
+
+    for item in headlines:
+
+        key = item["title"].lower().strip()
+
+        unique[key] = item
+
+    return list(unique.values())[:20]
+
+
+# ============================================================
+# 16. GROQ AI INTELLIGENCE
+# ============================================================
+
+def run_groq_analysis(
+    market,
+    timeframe_data,
+    news
+):
+
+    key = get_secret("GROQ_API_KEY")
+
+    if not key:
+
+        return None, "GROQ_API_KEY MISSING"
+
+    client = OpenAI(
+
+        api_key=key,
+
+        base_url="https://api.groq.com/openai/v1"
+    )
 
     payload = {
-        "derivatives_market": market_data,
-        "timeframe_analysis_with_all_metrics": tf_data,
-        "automatically_fetched_news": auto_news
+
+        "market_data": market,
+
+        "timeframe_analysis": timeframe_data,
+
+        "news": news,
+
+        "position_flow": analyze_position_flow(market)
     }
 
     system_prompt = """
-You are SALIGA AI PRO, an elite Bitcoin (BTC) intelligence analyst.
-Analyze OKX derivatives (OI, funding rate, delta, orderbook), support/resistance, historical pattern matching across thousands of candles, and automatically fetched live crypto news headlines.
-Provide a concise, professional trading intelligence report in valid JSON format only.
 
-Required JSON structure:
+You are SALIGA AI PRO.
+
+You are an advanced Bitcoin market intelligence analyst.
+
+Analyze:
+
+1. Open Interest
+2. Funding Rate
+3. Trade Delta
+4. Order Book
+5. Position Flow
+6. Historical Patterns
+7. Support and Resistance
+8. Momentum
+9. Volatility
+10. Multi-Timeframe Structure
+11. Crypto News
+
+IMPORTANT:
+
+Only use supplied data.
+
+Never invent market data.
+
+Never invent liquidation levels.
+
+Never claim that an order book snapshot is a liquidation heatmap.
+
+Never invent macroeconomic releases.
+
+Distinguish facts from interpretations.
+
+Do not treat historical correlations as guaranteed predictions.
+
+If data conflicts, explain the conflict.
+
+If evidence is weak, recommend WAIT.
+
+Return valid JSON only.
+
+Required format:
+
 {
-  "bias": "BULLISH / BEARISH / NEUTRAL",
-  "confidence_score": 85,
-  "executive_summary": "Professional summary combining historical patterns, derivatives, and live news sentiment.",
-  "news_and_macro_impact": "Detailed breakdown of how live headlines and market derivatives affect BTC price action.",
-  "actionable_insight": "Specific recommendation on long/short positioning or waiting.",
-  "risks": ["Risk 1", "Risk 2"]
+ "bias": "BULLISH / BEARISH / NEUTRAL",
+ "confidence_score": 0,
+ "executive_summary": "",
+ "derivatives_analysis": "",
+ "position_flow_analysis": "",
+ "historical_pattern_analysis": "",
+ "news_impact": "",
+ "timeframe_analysis": "",
+ "actionable_insight": "",
+ "risks": []
 }
+
 """
 
     try:
+
         response = client.chat.completions.create(
+
             model=GROQ_MODEL,
+
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}
+
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        default=str
+                    )
+                }
+
             ],
-            temperature=0.2,
+
+            temperature=0.15,
+
             max_tokens=1800,
-            response_format={"type": "json_object"}
+
+            response_format={
+                "type": "json_object"
+            }
         )
+
         content = response.choices[0].message.content
+
         return json.loads(content), None
+
     except Exception as e:
+
         return None, str(e)
 
-def run_full_cycle(lookback_candles):
-    market = fetch_btc_market_data()
-    
-    tf_results = {}
-    for tf_key in TIMEFRAMES.keys():
-        tf_results[tf_key] = analyze_btc_timeframe(tf_key, lookback_candles, market)
-    
-    news = fetch_latest_crypto_news()
-    st.session_state["latest_news"] = news
-
-    ai_res, ai_err = run_groq_btc_analysis(market, tf_results, news)
-    st.session_state["ai_result"] = ai_res
-    st.session_state["ai_error"] = ai_err
-
-    return {
-        "timestamp": timestamp(),
-        "market": market,
-        "timeframes": tf_results
-    }
-
 
 # ============================================================
-# 8. STREAMLIT UI
+# 17. COMPLETE ANALYSIS CYCLE
 # ============================================================
 
-st.title("⚡ SALIGA AI PRO 18.3 — FULL MATH & DERIVATIVES RADAR")
-st.caption("OKX OI + FUNDING + DELTA + ORDERBOOK + VISSZAMENŐLEGES MINTÁK + RSS HÍREK + GROQ AI (MINDEN A MATEMATIKÁBAN!)")
+def run_full_cycle(lookback):
 
-if exchange_error:
-    st.error(f"OKX Hiba: {exchange_error}")
+    exchange = get_exchange()
 
-lookback_candles = st.sidebar.slider("Visszamenőleges gyertyák száma a mintákhoz", min_value=500, max_value=5000, value=st.session_state["lookback_candles"], step=500)
-st.session_state["lookback_candles"] = lookback_candles
+    market = fetch_market_data(exchange)
 
-c_ctrl1, c_ctrl2, c_ctrl3, c_ctrl4 = st.columns(4)
-with c_ctrl1:
-    if st.button("🔄 AZONNALI FRISSÍTÉS", use_container_width=True):
-        st.session_state["btc_analysis"] = run_full_cycle(lookback_candles)
-        st.session_state["last_refresh"] = time.time()
-with c_ctrl2:
-    auto_refresh_active = st.checkbox("🟢 Automatikus Háttérfrissítés", value=st.session_state["auto_refresh_active"])
-    st.session_state["auto_refresh_active"] = auto_refresh_active
-with c_ctrl3:
-    refresh_mins = st.selectbox("Frissítési Időköz", [1, 3, 5, 10, 15], index=2)
-    st.session_state["refresh_interval"] = refresh_mins * 60
-with c_ctrl4:
-    st.metric("Utolsó frissítés", datetime.now().strftime("%H:%M:%S"))
+    derivatives = derivatives_analysis(market)
 
-if not st.session_state["btc_analysis"]:
-    st.session_state["btc_analysis"] = run_full_cycle(lookback_candles)
-    st.session_state["last_refresh"] = time.time()
+    timeframe_data = {}
 
-data = st.session_state["btc_analysis"]
+    for name, timeframe in TIMEFRAMES.items():
 
+        timeframe_data[name] = analyze_timeframe(
 
-# ============================================================
-# 9. DERIVATÍV METRIKÁK PANEL
-# ============================================================
+            exchange,
 
-st.markdown("---")
-st.header("📊 BITCOIN DERIVATÍV & POZÍCIÓ ÁRAMLÁS")
+            name,
 
-market = data.get("market", {})
-m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+            timeframe,
 
-with m_col1:
-    oi_val = market.get("oi_usd")
-    oi_chg = market.get("oi_change")
-    st.metric("Open Interest (USD)", f"${oi_val:,.0f}" if oi_val else "N/A")
-    st.metric("OI Változás", f"{oi_chg:+.2f}%" if oi_chg is not None else "Adatgyűjtés...")
+            lookback,
 
-with m_col2:
-    f_rate = market.get("funding_rate")
-    st.metric("Funding Rate", f"{f_rate * 100:.4f}%" if f_rate is not None else "N/A")
+            derivatives
+        )
 
-with m_col3:
-    delta = market.get("delta_percent")
-    st.metric("Becsült Delta %", f"{delta:+.2f}%" if delta is not None else "N/A")
+    news = fetch_news()
 
-with m_col4:
-    imbalance = market.get("orderbook_imbalance")
-    st.metric("Order Book Imbalance", f"{imbalance:+.2f}%" if imbalance is not None else "N/A")
+    ai_result, ai_error = run_groq_analysis(
 
+        market,
 
-# ============================================================
-# 10. TELJES RENDSZER RADAR PANEL (MINTA + S/R + DERIVATÍV)
-# ============================================================
+        timeframe_data,
 
-st.markdown("---")
-st.header(f"🎯 TELJES MATEMATIKAI JELZÉS RADAR (Visszanézve: {lookback_candles} gyertya)")
-
-h1_info = data.get("timeframes", {}).get("H1", {})
-sr = h1_info.get("sr", {})
-pattern_match = h1_info.get("pattern_match", {})
-price = market.get("price")
-direction = h1_info.get("direction", "WAIT")
-
-col_a, col_b = st.columns([1, 1])
-
-with col_a:
-    if direction == "LONG":
-        st.success("### 🟢 BTC JELZÉS: LONG POZÍCIÓ AKTÍV")
-    elif direction == "SHORT":
-        st.error("### 🔴 BTC JELZÉS: SHORT POZÍCIÓ AKTÍV")
-    else:
-        st.warning("### 🟡 BTC JELZÉS: KIVÁRÁS (WAIT)")
-
-    st.metric("Élő BTC Árfolyam", fmt(price, 2))
-    st.metric("H1 Teljes Matematikai Pontszám", h1_info.get("score", 0))
-
-with col_b:
-    st.info(
-        f"🔍 **H1 Elemzés Részletei:**\n"
-        f"• {pattern_match.get('matched_pattern_desc', 'N/A')}\n"
-        f"• Derivatív Hatás Módosító: `{h1_info.get('derivatives_modifier', 0)} pont`\n\n"
-        f"🧱 **H1 Ellenállás:** `{fmt(sr.get('resistance'), 2)}`\n\n"
-        f"🛡️ **H1 Támasz:** `{fmt(sr.get('support'), 2)}`"
+        news
     )
 
+    st.session_state["market"] = market
+
+    st.session_state["timeframes"] = timeframe_data
+
+    st.session_state["news"] = news
+
+    st.session_state["ai_result"] = ai_result
+
+    st.session_state["ai_error"] = ai_error
+
+    st.session_state["last_refresh"] = timestamp()
+
+
+# ============================================================
+# 18. APPLICATION START
+# ============================================================
+
+init_db()
+
+st.title(
+    "⚡ SALIGA AI PRO 19.0"
+)
+
+st.caption(
+    "INSTITUTIONAL MARKET INTELLIGENCE | "
+    "DERIVATIVES | POSITION FLOW | "
+    "HISTORICAL PATTERNS | NEWS AI"
+)
+
+
+# ============================================================
+# 19. SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.header("SYSTEM CONTROL")
+
+    lookback = st.slider(
+
+        "Historical Candles",
+
+        500,
+
+        5000,
+
+        st.session_state["lookback"],
+
+        500
+    )
+
+    st.session_state["lookback"] = lookback
+
+    refresh_minutes = st.selectbox(
+
+        "Refresh Interval",
+
+        [1, 3, 5, 10, 15],
+
+        index=2
+    )
+
+    st.session_state["refresh_interval"] = (
+        refresh_minutes * 60
+    )
+
+    auto_refresh = st.checkbox(
+        "Automatic Refresh",
+        value=True
+    )
+
+    if st.button(
+        "🔄 REFRESH NOW",
+        use_container_width=True
+    ):
+
+        with st.spinner("Analyzing BTC market..."):
+
+            run_full_cycle(lookback)
+
+
+# ============================================================
+# 20. INITIAL DATA
+# ============================================================
+
+if st.session_state["last_refresh"] is None:
+
+    with st.spinner("Loading market intelligence..."):
+
+        try:
+
+            run_full_cycle(lookback)
+
+        except Exception as e:
+
+            st.error(str(e))
+
+
+market = st.session_state["market"]
+
+timeframes = st.session_state["timeframes"]
+
+news = st.session_state["news"]
+
+ai = st.session_state["ai_result"]
+
+
+# ============================================================
+# 21. MARKET DASHBOARD
+# ============================================================
+
 st.markdown("---")
 
+st.header("📊 BTC MARKET DATA")
+
+
+c1, c2, c3, c4, c5 = st.columns(5)
+
+with c1:
+
+    st.metric(
+        "BTC PRICE",
+        "$" + fmt(market.get("price"))
+    )
+
+with c2:
+
+    st.metric(
+        "24H CHANGE",
+        fmt(market.get("change_24h")) + "%"
+    )
+
+with c3:
+
+    st.metric(
+        "OPEN INTEREST",
+        "$" + fmt(market.get("oi_usd"), 0)
+    )
+
+with c4:
+
+    st.metric(
+        "OI CHANGE",
+        fmt(market.get("oi_change"), 3) + "%"
+    )
+
+with c5:
+
+    funding = market.get("funding_rate")
+
+    st.metric(
+        "FUNDING RATE",
+        fmt(funding * 100, 4) + "%"
+        if funding is not None
+        else "N/A"
+    )
+
+
+c6, c7, c8 = st.columns(3)
+
+with c6:
+
+    st.metric(
+        "TRADE DELTA",
+        fmt(market.get("delta_percent")) + "%"
+    )
+
+with c7:
+
+    st.metric(
+        "ORDER BOOK",
+        fmt(market.get("orderbook_imbalance")) + "%"
+    )
+
+with c8:
+
+    st.metric(
+        "24H VOLUME",
+        fmt(market.get("volume_24h"), 0)
+    )
+
+
+if market.get("errors"):
+
+    with st.expander("DATA WARNINGS"):
+
+        for error in market["errors"]:
+
+            st.warning(error)
+
 
 # ============================================================
-# 11. AUTOMATIKUS HÍREK & GROQ AI JELENTÉS
+# 22. POSITION FLOW
 # ============================================================
 
-st.header("🧠 GROQ AI ÖNMKÖDŐ ELEMZÉS & LEGFRISSEBB HÍREK")
+st.markdown("---")
 
-with st.expander("📰 Automatikusan lekért legfrissebb kripto hírek listája"):
-    news_list = st.session_state.get("latest_news", [])
-    if news_list:
-        for n in news_list:
-            st.write(n)
-    else:
-        st.info("Hírek betöltése folyamatban...")
+st.header("🏦 POSITION FLOW INTELLIGENCE")
 
-ai_res = st.session_state["ai_result"]
-ai_err = st.session_state["ai_error"]
+position_flow = analyze_position_flow(market)
 
-if ai_err:
-    st.error(f"AI Hiba: {ai_err}")
+st.info(
+    "CURRENT POSITION FLOW: "
+    + position_flow
+)
 
-if ai_res:
-    st.subheader(f"AI Piaci Irány: {ai_res.get('bias', 'N/A')} (Bizalom: {ai_res.get('confidence_score', 'N/A')}%)")
-    st.write(f"**Összegzés:** {ai_res.get('executive_summary', '')}")
-    st.info(f"**Piaci & Derivatív Hatás Értékelés:** {ai_res.get('news_and_macro_impact', '')}")
-    st.success(f"**Ajánlott Művelet:** {ai_res.get('actionable_insight', '')}")
-    
-    with st.expander("⚠️ Kockázatok"):
-        for risk in ai_res.get("risks", []):
-            st.write(f"• {risk}")
+deriv = derivatives_analysis(market)
+
+st.metric(
+    "DERIVATIVES SCORE",
+    deriv["score"]
+)
+
+for note in deriv["notes"]:
+
+    st.write("• " + note)
+
+
+# ============================================================
+# 23. MAIN BTC RADAR
+# ============================================================
+
+st.markdown("---")
+
+st.header("🎯 BTC INTELLIGENCE RADAR")
+
+h1 = timeframes.get("H1", {})
+
+direction = h1.get("direction", "WAIT")
+
+score = h1.get("score", 0)
+
+if direction == "LONG":
+
+    st.success(
+        "🟢 BTC LONG BIAS"
+    )
+
+elif direction == "SHORT":
+
+    st.error(
+        "🔴 BTC SHORT BIAS"
+    )
+
 else:
-    st.info("Az AI elemzés generálása folyamatban...")
+
+    st.warning(
+        "🟡 BTC WAIT / NEUTRAL"
+    )
+
+
+left, right = st.columns(2)
+
+with left:
+
+    st.metric(
+        "H1 SCORE",
+        score
+    )
+
+    st.metric(
+        "BTC PRICE",
+        fmt(market.get("price"))
+    )
+
+    st.metric(
+        "H1 VOLATILITY (ATR)",
+        fmt(h1.get("atr_percent")) + "%"
+    )
+
+
+with right:
+
+    structure = h1.get("structure", {})
+
+    st.write(
+        "**MARKET STRUCTURE:** "
+        + str(structure.get("status", "N/A"))
+    )
+
+    st.write(
+        "**SUPPORT:** "
+        + fmt(structure.get("support"))
+    )
+
+    st.write(
+        "**RESISTANCE:** "
+        + fmt(structure.get("resistance"))
+    )
 
 
 # ============================================================
-# 12. MULTI-TIMEFRAME TÁBLÁZAT
+# 24. HISTORICAL PATTERN STATISTICS
 # ============================================================
 
 st.markdown("---")
-st.subheader("🧭 BTC Időkeretek & Teljes Pontszámok Összegzése")
 
-tf_rows = []
-for tf_name in TIMEFRAMES.keys():
-    res = data["timeframes"].get(tf_name, {})
-    pm = res.get("pattern_match", {})
-    tf_rows.append({
-        "Időkeret": tf_name,
-        "Irány": res.get("direction", "WAIT"),
-        "Összpontszám": res.get("score", 0),
-        "Derivatív Módosító": f"{res.get('derivatives_modifier', 0):+d}",
-        "Múltbeli Minta": pm.get("matched_pattern_desc", "N/A"),
-        "Hasonlóság": f"{pm.get('similarity', 0)*100:.1f}%"
+st.header("🧩 HISTORICAL PATTERN INTELLIGENCE")
+
+pattern = h1.get("pattern", {})
+
+p1, p2, p3, p4 = st.columns(4)
+
+with p1:
+
+    st.metric(
+        "BULLISH OUTCOMES",
+        fmt(pattern.get("up_rate")) + "%"
+    )
+
+with p2:
+
+    st.metric(
+        "BEARISH OUTCOMES",
+        fmt(pattern.get("down_rate")) + "%"
+    )
+
+with p3:
+
+    st.metric(
+        "SIDEWAYS OUTCOMES",
+        fmt(pattern.get("flat_rate")) + "%"
+    )
+
+with p4:
+
+    st.metric(
+        "AVERAGE MOVE",
+        fmt(pattern.get("average_move"), 3) + "%"
+    )
+
+st.write(
+    pattern.get("description", "N/A")
+)
+
+st.write(
+    "Similar historical cases: "
+    + str(pattern.get("matches", 0))
+)
+
+st.write(
+    "Pattern similarity: "
+    + fmt(
+        (pattern.get("similarity") or 0) * 100,
+        2
+    )
+    + "%"
+)
+
+
+# ============================================================
+# 25. MULTI-TIMEFRAME ANALYSIS
+# ============================================================
+
+st.markdown("---")
+
+st.header("🧭 MULTI-TIMEFRAME INTELLIGENCE")
+
+rows = []
+
+for name in TIMEFRAMES:
+
+    data = timeframes.get(name, {})
+
+    structure = data.get("structure", {})
+
+    momentum = data.get("momentum", {})
+
+    pattern_data = data.get("pattern", {})
+
+    rows.append({
+
+        "TIMEFRAME": name,
+
+        "DIRECTION": data.get("direction", "WAIT"),
+
+        "SCORE": data.get("score", 0),
+
+        "CANDLES": data.get("candles_loaded", 0),
+
+        "STRUCTURE": structure.get("status", "N/A"),
+
+        "MOMENTUM 5": momentum.get("return_5"),
+
+        "MOMENTUM 20": momentum.get("return_20"),
+
+        "PATTERN SCORE": pattern_data.get("score", 0),
+
+        "ATR %": data.get("atr_percent")
+
     })
 
-st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
+st.dataframe(
+
+    pd.DataFrame(rows),
+
+    use_container_width=True,
+
+    hide_index=True
+)
 
 
 # ============================================================
-# 13. AUTOMATIKUS HÁTTÉRFISSÍTÉSI LOGIKA
+# 26. GROQ AI REPORT
 # ============================================================
 
-if st.session_state["auto_refresh_active"]:
-    interval = st.session_state["refresh_interval"]
-    time.sleep(interval)
-    st.session_state["btc_analysis"] = run_full_cycle(lookback_candles)
-    st.session_state["last_refresh"] = time.time()
-    st.rerun()
+st.markdown("---")
+
+st.header("🤖 GROQ AI INTELLIGENCE REPORT")
+
+if st.session_state["ai_error"]:
+
+    st.error(
+        st.session_state["ai_error"]
+    )
+
+if ai:
+
+    st.subheader(
+
+        "MARKET BIAS: "
+        + str(ai.get("bias", "N/A"))
+
+        + " | CONFIDENCE: "
+
+        + str(ai.get("confidence_score", "N/A"))
+
+        + "%"
+    )
+
+    st.write("### EXECUTIVE SUMMARY")
+
+    st.write(
+        ai.get("executive_summary", "")
+    )
+
+    st.write("### DERIVATIVES ANALYSIS")
+
+    st.info(
+        ai.get("derivatives_analysis", "")
+    )
+
+    st.write("### POSITION FLOW")
+
+    st.write(
+        ai.get("position_flow_analysis", "")
+    )
+
+    st.write("### HISTORICAL PATTERNS")
+
+    st.write(
+        ai.get("historical_pattern_analysis", "")
+    )
+
+    st.write("### NEWS IMPACT")
+
+    st.write(
+        ai.get("news_impact", "")
+    )
+
+    st.write("### MULTI-TIMEFRAME ANALYSIS")
+
+    st.write(
+        ai.get("timeframe_analysis", "")
+    )
+
+    st.success(
+        ai.get("actionable_insight", "")
+    )
+
+    with st.expander("RISKS"):
+
+        for risk in ai.get("risks", []):
+
+            st.write("• " + str(risk))
+
+
+# ============================================================
+# 27. AUTOMATIC NEWS
+# ============================================================
+
+st.markdown("---")
+
+st.header("📰 AUTOMATIC CRYPTO NEWS")
+
+if news:
+
+    for item in news:
+
+        st.write(
+            "### " + item["title"]
+        )
+
+        st.caption(
+            item["source"]
+            + " | "
+            + item["published"]
+        )
+
+        if item.get("link"):
+
+            st.markdown(
+                "[OPEN NEWS](" + item["link"] + ")"
+            )
+
+else:
+
+    st.info(
+        "No news available."
+    )
+
+
+# ============================================================
+# 28. DATA QUALITY
+# ============================================================
+
+st.markdown("---")
+
+st.header("🛡️ DATA QUALITY MONITOR")
+
+st.write(
+    "**Primary exchange:** OKX"
+)
+
+st.write(
+    "**Symbol:** " + SYMBOL
+)
+
+st.write(
+    "**Last successful refresh:** "
+    + str(st.session_state["last_refresh"])
+)
+
+st.write(
+    "**Market data errors:** "
+    + str(len(market.get("errors", [])))
+)
+
+st.write(
+    "**Historical pattern engine:** ACTIVE"
+)
+
+st.write(
+    "**Derivatives engine:** ACTIVE"
+)
+
+st.write(
+    "**News engine:** "
+    + ("ACTIVE" if news else "NO DATA")
+)
+
+st.write(
+    "**Groq AI:** "
+    + ("ACTIVE" if ai else "NOT AVAILABLE")
+)
+
+
+# ============================================================
+# 29. AUTOMATIC REFRESH
+# ============================================================
+
+if auto_refresh:
+
+    try:
+
+        from streamlit_autorefresh import st_autorefresh
+
+        st_autorefresh(
+
+            interval=(
+                st.session_state["refresh_interval"] * 1000
+            ),
+
+            key="saliga_refresh"
+        )
+
+        if (
+            st.session_state["last_refresh"]
+            and time.time() - st.session_state.get(
+                "_last_refresh_epoch", 0
+            ) >= st.session_state["refresh_interval"]
+        ):
+
+            st.session_state["_last_refresh_epoch"] = time.time()
+
+            run_full_cycle(lookback)
+
+            st.rerun()
+
+    except ImportError:
+
+        st.sidebar.warning(
+            "Install streamlit-autorefresh: "
+            "pip install streamlit-autorefresh"
+        )
+
+
+# ============================================================
+# 30. FOOTER
+# ============================================================
+
+st.markdown("---")
+
+st.caption(
+    "⚡ SALIGA AI PRO 19.0 | "
+    "INSTITUTIONAL MARKET INTELLIGENCE | "
+    "DATA-DRIVEN ANALYSIS | "
+    "NOT FINANCIAL ADVICE"
+)
