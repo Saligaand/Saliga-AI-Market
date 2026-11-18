@@ -1,5 +1,5 @@
 # ============================================================
-# SALIGA AI PRO 20.0
+# SALIGA AI PRO 20.1
 # MARKET INTELLIGENCE + AUTOMATIC SIGNAL JOURNAL
 # OKX | DERIVATIVES | PATTERNS | NEWS | GROQ AI
 # ============================================================
@@ -15,6 +15,7 @@ import os
 import time
 import feedparser
 
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from openai import OpenAI
 
@@ -24,19 +25,22 @@ from openai import OpenAI
 # ============================================================
 
 st.set_page_config(
-    page_title="SALIGA AI PRO 20.0",
+    page_title="SALIGA AI PRO 20.1",
     page_icon="⚡",
     layout="wide"
 )
 
-APP_VERSION = "20.0"
+APP_VERSION = "20.1"
 
 SYMBOL = "BTC/USDT:USDT"
 INST_ID = "BTC-USDT-SWAP"
 
 OKX_BASE = "https://www.okx.com"
 
-DB_PATH = "saliga_ai.db"
+# Stabil adatbázisútvonal az app.py könyvtárában.
+DB_PATH = str(
+    Path(__file__).resolve().parent / "saliga_ai.db"
+)
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
@@ -75,10 +79,12 @@ defaults = {
     "last_refresh": None,
     "last_refresh_epoch": 0,
     "lookback": 2000,
-    "refresh_count": 0
+    "refresh_count": 0,
+    "last_cycle_error": None
 }
 
 for key, value in defaults.items():
+
     if key not in st.session_state:
         st.session_state[key] = value
 
@@ -96,7 +102,9 @@ def timestamp():
 
 
 def safe_float(value):
+
     try:
+
         if value is None:
             return None
 
@@ -112,6 +120,7 @@ def safe_float(value):
 
 
 def fmt(value, decimals=2):
+
     value = safe_float(value)
 
     if value is None:
@@ -121,6 +130,7 @@ def fmt(value, decimals=2):
 
 
 def pct_change(current, previous):
+
     current = safe_float(current)
     previous = safe_float(previous)
 
@@ -131,7 +141,9 @@ def pct_change(current, previous):
 
 
 def get_secret(name):
+
     try:
+
         value = st.secrets.get(name)
 
         if value:
@@ -148,6 +160,7 @@ def get_secret(name):
 # ============================================================
 
 def db_connection():
+
     return sqlite3.connect(
         DB_PATH,
         timeout=30,
@@ -156,6 +169,14 @@ def db_connection():
 
 
 def init_db():
+
+    """
+    Adatbázis inicializálása és sémafrissítés.
+
+    A régebbi signal_history táblákat is kezeli.
+    A signal_state táblában tároljuk az utoljára
+    feldolgozott H1 gyertya időbélyegét.
+    """
 
     with db_connection() as conn:
 
@@ -189,6 +210,44 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_signal_status
             ON signal_history(status)
         """)
+
+        # Jelállapot és deduplikáció.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signal_state (
+                state_key TEXT PRIMARY KEY,
+                state_value TEXT
+            )
+        """)
+
+        # A régebbi adatbázisokhoz szükséges
+        # oszlopok automatikus ellenőrzése.
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(signal_history)"
+            ).fetchall()
+        }
+
+        if "result_pct" not in columns:
+
+            conn.execute("""
+                ALTER TABLE signal_history
+                ADD COLUMN result_pct REAL
+            """)
+
+        if "exit_price" not in columns:
+
+            conn.execute("""
+                ALTER TABLE signal_history
+                ADD COLUMN exit_price REAL
+            """)
+
+        if "exit_time" not in columns:
+
+            conn.execute("""
+                ALTER TABLE signal_history
+                ADD COLUMN exit_time TEXT
+            """)
 
         conn.commit()
 
@@ -244,10 +303,16 @@ def get_oi_change(current):
             dt = datetime.fromisoformat(created_at)
 
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+
+                dt = dt.replace(
+                    tzinfo=timezone.utc
+                )
 
             if dt <= target:
-                candidates.append((value, dt))
+
+                candidates.append(
+                    (value, dt)
+                )
 
         except Exception:
             continue
@@ -262,7 +327,10 @@ def get_oi_change(current):
         )
     )
 
-    return pct_change(current, old_value)
+    return pct_change(
+        current,
+        old_value
+    )
 
 
 # ============================================================
@@ -274,7 +342,11 @@ def get_open_signal():
     with db_connection() as conn:
 
         row = conn.execute("""
-            SELECT id, direction, entry_price, entry_time
+            SELECT
+                id,
+                direction,
+                entry_price,
+                entry_time
             FROM signal_history
             WHERE status = 'OPEN'
             ORDER BY id DESC
@@ -366,61 +438,247 @@ def close_signal(
         conn.commit()
 
 
-def update_signal_history(direction, price):
+def get_last_processed_signal_time(conn):
 
-    if direction not in ("LONG", "SHORT"):
+    row = conn.execute("""
+        SELECT state_value
+        FROM signal_state
+        WHERE state_key = 'last_h1_candle'
+    """).fetchone()
+
+    if not row:
+        return None
+
+    return row[0]
+
+
+def save_last_processed_signal_time(conn, candle_time):
+
+    conn.execute("""
+        INSERT INTO signal_state (
+            state_key,
+            state_value
+        )
+        VALUES (
+            'last_h1_candle',
+            ?
+        )
+        ON CONFLICT(state_key)
+        DO UPDATE SET
+            state_value = excluded.state_value
+    """, (
+        str(candle_time),
+    ))
+
+
+def update_signal_history(
+    direction,
+    price,
+    candle_time
+):
+
+    """
+    H1 jelnapló.
+
+    - Egy lezárt H1 gyertyát csak egyszer dolgoz fel.
+    - WAIT nem zár pozíciót.
+    - Azonos irányú jel nem nyit újabb pozíciót.
+    - Ellentétes irány esetén zár és újranyit.
+    - A zárás és nyitás egy tranzakcióban történik.
+    """
+
+    if direction not in (
+        "LONG",
+        "SHORT",
+        "WAIT"
+    ):
+        return
+
+    if candle_time is None:
         return
 
     price = safe_float(price)
 
-    if price is None or price <= 0:
-        return
+    if direction in ("LONG", "SHORT"):
 
-    active = get_open_signal()
+        if price is None or price <= 0:
+            return
 
-    # Nincs nyitott pozíció.
-    if active is None:
+    try:
 
-        open_signal(direction, price)
+        with db_connection() as conn:
 
-        return
+            conn.execute("BEGIN IMMEDIATE")
 
-    signal_id, old_direction, entry_price, entry_time = active
+            last_time = get_last_processed_signal_time(
+                conn
+            )
 
-    # Már ugyanabba az irányba van nyitott pozíció.
-    if old_direction == direction:
-        return
+            current_time = str(candle_time)
 
-    # Ellentétes jelzés: régi pozíció lezárása.
-    close_signal(
-        signal_id,
-        old_direction,
-        entry_price,
-        price
-    )
+            # Ugyanazt a lezárt H1 gyertyát
+            # nem dolgozzuk fel újra.
+            if (
+                last_time is not None
+                and current_time <= str(last_time)
+            ):
 
-    # Új pozíció nyitása.
-    open_signal(
-        direction,
-        price
-    )
+                conn.rollback()
+                return
+
+            active = conn.execute("""
+                SELECT
+                    id,
+                    direction,
+                    entry_price
+                FROM signal_history
+                WHERE status = 'OPEN'
+                ORDER BY id DESC
+                LIMIT 1
+            """).fetchone()
+
+            # WAIT esetén csak a gyertyát jelöljük
+            # feldolgozottnak. A pozíció nyitva marad.
+            if direction == "WAIT":
+
+                save_last_processed_signal_time(
+                    conn,
+                    current_time
+                )
+
+                conn.commit()
+                return
+
+            # Nincs nyitott pozíció.
+            if active is None:
+
+                conn.execute("""
+                    INSERT INTO signal_history (
+                        direction,
+                        entry_price,
+                        entry_time,
+                        status
+                    )
+                    VALUES (?, ?, ?, 'OPEN')
+                """, (
+                    direction,
+                    price,
+                    timestamp()
+                ))
+
+            else:
+
+                signal_id = active[0]
+                old_direction = active[1]
+                entry_price = safe_float(active[2])
+
+                # Azonos irány esetén nem nyitunk
+                # újabb pozíciót.
+                if old_direction == direction:
+
+                    save_last_processed_signal_time(
+                        conn,
+                        current_time
+                    )
+
+                    conn.commit()
+                    return
+
+                # Ellentétes jelzés:
+                # előző pozíció lezárása.
+                if (
+                    entry_price is not None
+                    and entry_price > 0
+                    and price > 0
+                ):
+
+                    if old_direction == "LONG":
+
+                        result = (
+                            price / entry_price - 1
+                        ) * 100
+
+                    else:
+
+                        result = (
+                            entry_price / price - 1
+                        ) * 100
+
+                    conn.execute("""
+                        UPDATE signal_history
+
+                        SET
+                            exit_price = ?,
+                            exit_time = ?,
+                            result_pct = ?,
+                            status = 'CLOSED'
+
+                        WHERE id = ?
+                          AND status = 'OPEN'
+                    """, (
+                        price,
+                        timestamp(),
+                        result,
+                        signal_id
+                    ))
+
+                # Új pozíció nyitása.
+                conn.execute("""
+                    INSERT INTO signal_history (
+                        direction,
+                        entry_price,
+                        entry_time,
+                        status
+                    )
+                    VALUES (?, ?, ?, 'OPEN')
+                """, (
+                    direction,
+                    price,
+                    timestamp()
+                ))
+
+            save_last_processed_signal_time(
+                conn,
+                current_time
+            )
+
+            conn.commit()
+
+    except sqlite3.Error as e:
+
+        st.error(
+            "SIGNAL JOURNAL DATABASE ERROR: "
+            + str(e)
+        )
 
 
 def get_signal_statistics():
 
+    # Az adatbázis meglétét minden lekérdezés
+    # előtt biztosítjuk.
+    init_db()
+
     with db_connection() as conn:
 
         rows = conn.execute("""
-            SELECT direction, result_pct
+            SELECT
+                direction,
+                result_pct
             FROM signal_history
             WHERE status = 'CLOSED'
         """).fetchall()
 
-    results = [
-        (direction, float(result))
-        for direction, result in rows
-        if result is not None
-    ]
+    results = []
+
+    for direction, result in rows:
+
+        result = safe_float(result)
+
+        if result is not None:
+
+            results.append(
+                (direction, result)
+            )
 
     if not results:
 
@@ -464,17 +722,22 @@ def get_signal_statistics():
             return 0
 
         return (
-            sum(1 for x in values if x > 0)
-            / len(values)
+            sum(
+                1 for x in values
+                if x > 0
+            ) / len(values)
         ) * 100
 
     return {
         "total": len(results),
         "wins": wins,
         "losses": losses,
-        "win_rate": wins / len(results) * 100,
+        "win_rate": (
+            wins / len(results) * 100
+        ),
         "total_result": sum(
-            result for _, result in results
+            result
+            for _, result in results
         ),
         "long_win_rate": calculate_win_rate(
             long_results
@@ -488,6 +751,8 @@ def get_signal_statistics():
 
 
 def get_signal_history():
+
+    init_db()
 
     with db_connection() as conn:
 
@@ -528,6 +793,7 @@ def get_exchange():
 
 
 def get_market_info(exchange):
+
     return exchange.market(SYMBOL)
 
 
@@ -551,6 +817,7 @@ def okx_request(endpoint, params=None):
     response.raise_for_status()
 
     try:
+
         payload = response.json()
 
     except Exception:
@@ -588,13 +855,17 @@ def parse_book_levels(levels):
         price = safe_float(level[0])
         size = safe_float(level[1])
 
-        if price is None or size is None:
+        if (
+            price is None
+            or size is None
+            or price <= 0
+            or size <= 0
+        ):
             continue
 
-        if price <= 0 or size <= 0:
-            continue
-
-        result.append((price, size))
+        result.append(
+            (price, size)
+        )
 
     return result
 
@@ -618,13 +889,22 @@ def calculate_book_values(
     total = bid_value + ask_value
 
     if total <= 0:
-        return None, bid_value, ask_value
+
+        return (
+            None,
+            bid_value,
+            ask_value
+        )
 
     imbalance = (
         (bid_value - ask_value) / total
     ) * 100
 
-    return imbalance, bid_value, ask_value
+    return (
+        imbalance,
+        bid_value,
+        ask_value
+    )
 
 
 def fetch_orderbook_direct(exchange):
@@ -638,12 +918,16 @@ def fetch_orderbook_direct(exchange):
     data = okx_request(
         "/api/v5/market/books",
         {
-            "instId": market.get("id", INST_ID),
+            "instId": market.get(
+                "id",
+                INST_ID
+            ),
             "sz": "50"
         }
     )
 
     if not data:
+
         raise RuntimeError(
             "Az OKX üres order book választ adott."
         )
@@ -659,11 +943,13 @@ def fetch_orderbook_direct(exchange):
     )
 
     if not bids:
+
         raise RuntimeError(
             "Nincs feldolgozható BID adat."
         )
 
     if not asks:
+
         raise RuntimeError(
             "Nincs feldolgozható ASK adat."
         )
@@ -677,6 +963,7 @@ def fetch_orderbook_direct(exchange):
     )
 
     if imbalance is None:
+
         raise RuntimeError(
             "Az order book összértéke nulla."
         )
@@ -715,6 +1002,7 @@ def fetch_orderbook_ccxt(exchange):
     )
 
     if not bids or not asks:
+
         raise RuntimeError(
             "A CCXT order book üres."
         )
@@ -728,6 +1016,7 @@ def fetch_orderbook_ccxt(exchange):
     )
 
     if imbalance is None:
+
         raise RuntimeError(
             "A CCXT order book értéke nulla."
         )
@@ -749,17 +1038,25 @@ def fetch_orderbook(exchange):
     errors = []
 
     try:
-        return fetch_orderbook_direct(exchange)
+
+        return fetch_orderbook_direct(
+            exchange
+        )
 
     except Exception as e:
+
         errors.append(
             "DIRECT REST: " + str(e)
         )
 
     try:
-        return fetch_orderbook_ccxt(exchange)
+
+        return fetch_orderbook_ccxt(
+            exchange
+        )
 
     except Exception as e:
+
         errors.append(
             "CCXT FALLBACK: " + str(e)
         )
@@ -782,7 +1079,9 @@ def fetch_orderbook(exchange):
 
 def fetch_price_data(exchange):
 
-    ticker = exchange.fetch_ticker(SYMBOL)
+    ticker = exchange.fetch_ticker(
+        SYMBOL
+    )
 
     market = get_market_info(exchange)
 
@@ -824,25 +1123,43 @@ def fetch_price_data(exchange):
         volume_usdt = quote_volume
         volume_source = "OKX volCcyQuote24h"
 
-    elif base_volume is not None and price is not None:
+    elif (
+        base_volume is not None
+        and price is not None
+    ):
 
         volume_usdt = base_volume * price
-        volume_source = "OKX volCcy24h * price"
+
+        volume_source = (
+            "OKX volCcy24h * price"
+        )
 
     elif unified_quote is not None:
 
         volume_usdt = unified_quote
+
         volume_source = "CCXT quoteVolume"
 
-    elif unified_base is not None and price is not None:
+    elif (
+        unified_base is not None
+        and price is not None
+    ):
 
         volume_usdt = unified_base * price
-        volume_source = "CCXT baseVolume * price"
 
-    elif contract_volume is not None and price is not None:
+        volume_source = (
+            "CCXT baseVolume * price"
+        )
+
+    elif (
+        contract_volume is not None
+        and price is not None
+    ):
 
         volume_usdt = (
-            contract_volume * contract_size * price
+            contract_volume
+            * contract_size
+            * price
         )
 
         volume_source = (
@@ -882,6 +1199,7 @@ def fetch_open_interest(exchange):
     )
 
     if not data:
+
         raise RuntimeError(
             "Nincs Open Interest adat."
         )
@@ -977,7 +1295,9 @@ def fetch_trade_delta(exchange):
 
     return {
         "delta_percent": delta,
-        "trade_delta_usd": buy_usd - sell_usd,
+        "trade_delta_usd": (
+            buy_usd - sell_usd
+        ),
         "buy_volume": buy_amount,
         "sell_volume": sell_amount,
         "trade_count": len(trades)
@@ -1011,6 +1331,7 @@ def fetch_market_data(exchange):
             data = function(exchange)
 
             if isinstance(data, dict):
+
                 result.update(data)
 
         except Exception as e:
@@ -1023,7 +1344,9 @@ def fetch_market_data(exchange):
 
     if oi is not None:
 
-        result["oi_change"] = get_oi_change(oi)
+        result["oi_change"] = get_oi_change(
+            oi
+        )
 
         save_oi(oi)
 
@@ -1047,7 +1370,9 @@ def derivatives_analysis(market):
     price = market.get("change_24h")
     funding = market.get("funding_rate")
     delta = market.get("delta_percent")
-    imbalance = market.get("orderbook_imbalance")
+    imbalance = market.get(
+        "orderbook_imbalance"
+    )
 
     if oi is not None and price is not None:
 
@@ -1056,7 +1381,8 @@ def derivatives_analysis(market):
             score += 10
 
             notes.append(
-                "Ár emelkedik + OI nő: új pozíciók épülhetnek."
+                "Ár emelkedik + OI nő: "
+                "új pozíciók épülhetnek."
             )
 
         elif oi > 0.5 and price < 0:
@@ -1064,7 +1390,8 @@ def derivatives_analysis(market):
             score -= 10
 
             notes.append(
-                "Ár esik + OI nő: új short pozíciók épülhetnek."
+                "Ár esik + OI nő: "
+                "új short pozíciók épülhetnek."
             )
 
         elif oi < -0.5 and price > 0:
@@ -1072,7 +1399,8 @@ def derivatives_analysis(market):
             score += 4
 
             notes.append(
-                "Emelkedő ár + csökkenő OI: shortzárás lehetséges."
+                "Emelkedő ár + csökkenő OI: "
+                "shortzárás lehetséges."
             )
 
         elif oi < -0.5 and price < 0:
@@ -1080,7 +1408,8 @@ def derivatives_analysis(market):
             score -= 4
 
             notes.append(
-                "Eső ár + csökkenő OI: longzárás lehetséges."
+                "Eső ár + csökkenő OI: "
+                "longzárás lehetséges."
             )
 
     if funding is not None:
@@ -1269,14 +1598,20 @@ def find_historical_patterns(
         "description": "Nincs elegendő adat"
     }
 
-    if df is None or len(df) < window * 4 + horizon:
+    if (
+        df is None
+        or len(df) < window * 4 + horizon
+    ):
+
         return empty
 
     closes = df["close"].values
 
     recent = closes[-window:]
 
-    recent = recent / recent[0] - 1
+    recent = (
+        recent / recent[0] - 1
+    )
 
     recent = recent - np.mean(recent)
 
@@ -1290,12 +1625,17 @@ def find_historical_patterns(
     candidates = []
 
     max_start = (
-        len(closes) - window - horizon - window
+        len(closes)
+        - window
+        - horizon
+        - window
     )
 
     for i in range(max_start + 1):
 
-        historical = closes[i:i + window]
+        historical = closes[
+            i:i + window
+        ]
 
         if len(historical) != window:
             continue
@@ -1326,7 +1666,9 @@ def find_historical_patterns(
 
         end_index = i + window - 1
 
-        future_index = end_index + horizon
+        future_index = (
+            end_index + horizon
+        )
 
         future_move = pct_change(
             closes[future_index],
@@ -1353,6 +1695,7 @@ def find_historical_patterns(
     ][:TOP_MATCHES]
 
     if len(selected) < 3:
+
         selected = candidates[:5]
 
     returns = np.array([
@@ -1444,7 +1787,9 @@ def calculate_atr(df, period=14):
         abs(low - previous_close)
     ], axis=1).max(axis=1)
 
-    atr = tr.rolling(period).mean().iloc[-1]
+    atr = tr.rolling(
+        period
+    ).mean().iloc[-1]
 
     close = df["close"].iloc[-1]
 
@@ -1467,26 +1812,35 @@ def analyze_position_flow(market):
     delta = market.get("delta_percent")
 
     if oi is None or price is None:
+
         return "INSUFFICIENT DATA"
 
     if oi > 0.5 and price > 0:
 
         if delta is not None and delta > 5:
+
             return "LONG POSITION BUILDING"
 
-        return "OPEN INTEREST GROWING WITH PRICE"
+        return (
+            "OPEN INTEREST GROWING WITH PRICE"
+        )
 
     if oi > 0.5 and price < 0:
 
         if delta is not None and delta < -5:
+
             return "SHORT POSITION BUILDING"
 
-        return "OPEN INTEREST GROWING DURING DECLINE"
+        return (
+            "OPEN INTEREST GROWING DURING DECLINE"
+        )
 
     if oi < -0.5 and price > 0:
+
         return "POSSIBLE SHORT CLOSING"
 
     if oi < -0.5 and price < 0:
+
         return "POSSIBLE LONG CLOSING"
 
     return "NO CLEAR POSITION FLOW"
@@ -1496,7 +1850,11 @@ def analyze_position_flow(market):
 # 21. CANDLE DOWNLOAD
 # ============================================================
 
-def fetch_candles(exchange, timeframe, requested):
+def fetch_candles(
+    exchange,
+    timeframe,
+    requested
+):
 
     requested = min(
         int(requested),
@@ -1504,7 +1862,8 @@ def fetch_candles(exchange, timeframe, requested):
     )
 
     tf_ms = (
-        exchange.parse_timeframe(timeframe) * 1000
+        exchange.parse_timeframe(timeframe)
+        * 1000
     )
 
     since = (
@@ -1516,7 +1875,9 @@ def fetch_candles(exchange, timeframe, requested):
 
     for _ in range(25):
 
-        remaining = requested - len(all_rows)
+        remaining = (
+            requested - len(all_rows)
+        )
 
         if remaining <= 0:
             break
@@ -1532,10 +1893,12 @@ def fetch_candles(exchange, timeframe, requested):
             break
 
         for row in batch:
+
             all_rows[int(row[0])] = row
 
         newest = max(
-            int(row[0]) for row in batch
+            int(row[0])
+            for row in batch
         )
 
         if newest <= since:
@@ -1580,9 +1943,12 @@ def fetch_candles(exchange, timeframe, requested):
 
     # A még nyitott gyertyát nem használjuk.
     if len(df) > 1:
+
         df = df.iloc[:-1]
 
-    return df.reset_index(drop=True)
+    return df.reset_index(
+        drop=True
+    )
 
 
 # ============================================================
@@ -1603,12 +1969,13 @@ def analyze_timeframe(
         lookback
     )
 
-    if df is None:
+    if df is None or len(df) < 30:
 
         return {
             "direction": "WAIT",
             "score": 0,
-            "error": "Insufficient data"
+            "error": "Insufficient data",
+            "candle_time": None
         }
 
     structure = analyze_structure(df)
@@ -1642,11 +2009,20 @@ def analyze_timeframe(
 
         direction = "WAIT"
 
+    # A naplózás a legutolsó lezárt gyertya
+    # időbélyegét használja.
+    candle_time = int(
+        df["timestamp"].iloc[-1]
+    )
+
     return {
         "direction": direction,
         "score": int(score),
-        "price": float(df["close"].iloc[-1]),
+        "price": float(
+            df["close"].iloc[-1]
+        ),
         "candles_loaded": len(df),
+        "candle_time": candle_time,
         "structure": structure,
         "momentum": momentum,
         "pattern": pattern,
@@ -1672,27 +2048,39 @@ def fetch_news():
 
             for entry in feed.entries[:15]:
 
-                title = entry.get("title", "")
+                title = entry.get(
+                    "title",
+                    ""
+                )
 
                 if not title:
                     continue
 
                 headlines.append({
+
                     "title": title,
+
                     "published": (
                         entry.get("published")
                         or entry.get("updated")
                         or ""
                     ),
+
                     "source": feed.feed.get(
                         "title",
                         url
                     ),
-                    "link": entry.get("link", ""),
+
+                    "link": entry.get(
+                        "link",
+                        ""
+                    ),
+
                     "summary": entry.get(
                         "summary",
                         ""
                     )[:500]
+
                 })
 
         except Exception:
@@ -1706,7 +2094,9 @@ def fetch_news():
             item["title"].lower().strip()
         ] = item
 
-    return list(unique.values())[:20]
+    return list(
+        unique.values()
+    )[:20]
 
 
 # ============================================================
@@ -1719,10 +2109,16 @@ def run_groq_analysis(
     news
 ):
 
-    key = get_secret("GROQ_API_KEY")
+    key = get_secret(
+        "GROQ_API_KEY"
+    )
 
     if not key:
-        return None, "GROQ_API_KEY MISSING"
+
+        return (
+            None,
+            "GROQ_API_KEY MISSING"
+        )
 
     client = OpenAI(
         api_key=key,
@@ -1733,7 +2129,9 @@ def run_groq_analysis(
         "market_data": market,
         "timeframe_analysis": timeframe_data,
         "news": news,
-        "position_flow": analyze_position_flow(market)
+        "position_flow": analyze_position_flow(
+            market
+        )
     }
 
     system_prompt = """
@@ -1761,6 +2159,13 @@ Do not invent macroeconomic releases.
 Distinguish facts from interpretations.
 If evidence conflicts, explain the conflict.
 If evidence is weak, recommend WAIT.
+
+Analyze the news headlines and summaries.
+Explain whether the supplied news may influence
+BTC market sentiment.
+Distinguish confirmed information from speculation.
+Do not claim that a headline caused a price movement
+unless the supplied data supports that interpretation.
 
 The confidence score is an AI assessment,
 not a statistically calibrated probability.
@@ -1807,14 +2212,21 @@ Return valid JSON only:
         )
 
         content = (
-            response.choices[0].message.content
+            response.choices[0]
+            .message.content
         )
 
-        return json.loads(content), None
+        return (
+            json.loads(content),
+            None
+        )
 
     except Exception as e:
 
-        return None, str(e)
+        return (
+            None,
+            str(e)
+        )
 
 
 # ============================================================
@@ -1825,9 +2237,13 @@ def run_full_cycle(lookback):
 
     exchange = get_exchange()
 
-    market = fetch_market_data(exchange)
+    market = fetch_market_data(
+        exchange
+    )
 
-    derivatives = derivatives_analysis(market)
+    derivatives = derivatives_analysis(
+        market
+    )
 
     timeframe_data = {}
 
@@ -1835,12 +2251,14 @@ def run_full_cycle(lookback):
 
         try:
 
-            timeframe_data[name] = analyze_timeframe(
-                exchange,
-                name,
-                timeframe,
-                lookback,
-                derivatives
+            timeframe_data[name] = (
+                analyze_timeframe(
+                    exchange,
+                    name,
+                    timeframe,
+                    lookback,
+                    derivatives
+                )
             )
 
         except Exception as e:
@@ -1848,11 +2266,14 @@ def run_full_cycle(lookback):
             timeframe_data[name] = {
                 "direction": "WAIT",
                 "score": 0,
-                "error": str(e)
+                "error": str(e),
+                "candle_time": None
             }
 
+    # Hírek lekérése.
     news = fetch_news()
 
+    # Groq AI teljes piaci és hírelemzés.
     ai, ai_error = run_groq_analysis(
         market,
         timeframe_data,
@@ -1861,28 +2282,42 @@ def run_full_cycle(lookback):
 
     # --------------------------------------------------------
     # AUTOMATIC SIGNAL JOURNAL
-    # H1 signal controls virtual position tracking.
+    # Csak érvényes, lezárt H1 gyertyából naplóz.
     # --------------------------------------------------------
 
-    h1 = timeframe_data.get("H1", {})
+    h1 = timeframe_data.get(
+        "H1",
+        {}
+    )
 
     signal_direction = h1.get(
         "direction",
         "WAIT"
     )
 
-    current_price = market.get("price")
-
-    update_signal_history(
-        signal_direction,
-        current_price
+    signal_candle_time = h1.get(
+        "candle_time"
     )
+
+    current_price = market.get(
+        "price"
+    )
+
+    if signal_candle_time is not None:
+
+        update_signal_history(
+            signal_direction,
+            current_price,
+            signal_candle_time
+        )
 
     # --------------------------------------------------------
 
     st.session_state["market"] = market
 
-    st.session_state["timeframes"] = timeframe_data
+    st.session_state["timeframes"] = (
+        timeframe_data
+    )
 
     st.session_state["news"] = news
 
@@ -1890,18 +2325,28 @@ def run_full_cycle(lookback):
 
     st.session_state["ai_error"] = ai_error
 
-    st.session_state["last_refresh"] = timestamp()
+    st.session_state["last_refresh"] = (
+        timestamp()
+    )
 
-    st.session_state["last_refresh_epoch"] = time.time()
+    st.session_state["last_refresh_epoch"] = (
+        time.time()
+    )
+
+    st.session_state["last_cycle_error"] = None
 
 
 # ============================================================
 # 26. INITIALIZE
 # ============================================================
 
+# Az adatbázis létrehozása minden más
+# adatbázis-lekérdezés előtt.
 init_db()
 
-st.title("⚡ SALIGA AI PRO 20.0")
+st.title(
+    "⚡ SALIGA AI PRO 20.1"
+)
 
 st.caption(
     "MARKET INTELLIGENCE | DERIVATIVES | "
@@ -1916,7 +2361,9 @@ st.caption(
 
 with st.sidebar:
 
-    st.header("SYSTEM CONTROL")
+    st.header(
+        "SYSTEM CONTROL"
+    )
 
     lookback = st.slider(
         "Historical Candles",
@@ -1926,7 +2373,9 @@ with st.sidebar:
         500
     )
 
-    st.session_state["lookback"] = lookback
+    st.session_state["lookback"] = (
+        lookback
+    )
 
     refresh_minutes = st.selectbox(
         "Refresh Interval",
@@ -1960,9 +2409,15 @@ if (
 
         try:
 
-            run_full_cycle(lookback)
+            run_full_cycle(
+                lookback
+            )
 
         except Exception as e:
+
+            st.session_state[
+                "last_cycle_error"
+            ] = str(e)
 
             st.error(
                 "Analysis error: " + str(e)
@@ -1984,7 +2439,9 @@ ai = st.session_state["ai"]
 
 st.markdown("---")
 
-st.header("📊 BTC MARKET DATA")
+st.header(
+    "📊 BTC MARKET DATA"
+)
 
 c1, c2, c3, c4, c5 = st.columns(5)
 
@@ -1992,12 +2449,16 @@ with c1:
 
     st.metric(
         "BTC PRICE",
-        "$" + fmt(market.get("price"))
+        "$" + fmt(
+            market.get("price")
+        )
     )
 
 with c2:
 
-    value = market.get("change_24h")
+    value = market.get(
+        "change_24h"
+    )
 
     st.metric(
         "24H CHANGE",
@@ -2018,7 +2479,9 @@ with c3:
 
 with c4:
 
-    value = market.get("oi_change")
+    value = market.get(
+        "oi_change"
+    )
 
     st.metric(
         "OI CHANGE",
@@ -2029,7 +2492,9 @@ with c4:
 
 with c5:
 
-    value = market.get("funding_rate")
+    value = market.get(
+        "funding_rate"
+    )
 
     st.metric(
         "FUNDING RATE",
@@ -2043,7 +2508,9 @@ c6, c7, c8 = st.columns(3)
 
 with c6:
 
-    value = market.get("delta_percent")
+    value = market.get(
+        "delta_percent"
+    )
 
     st.metric(
         "TRADE DELTA",
@@ -2054,7 +2521,9 @@ with c6:
 
 with c7:
 
-    value = market.get("orderbook_imbalance")
+    value = market.get(
+        "orderbook_imbalance"
+    )
 
     st.metric(
         "ORDER BOOK",
@@ -2065,7 +2534,9 @@ with c7:
 
 with c8:
 
-    value = market.get("volume_24h")
+    value = market.get(
+        "volume_24h"
+    )
 
     st.metric(
         "24H VOLUME",
@@ -2081,7 +2552,9 @@ with c8:
 
 st.markdown("---")
 
-st.header("📚 ORDER BOOK DIAGNOSTICS")
+st.header(
+    "📚 ORDER BOOK DIAGNOSTICS"
+)
 
 if market.get("orderbook_imbalance") is not None:
 
@@ -2091,27 +2564,39 @@ if market.get("orderbook_imbalance") is not None:
 
     st.write(
         "Source: "
-        + str(market.get("orderbook_source"))
+        + str(
+            market.get("orderbook_source")
+        )
     )
 
     st.write(
         "Bid levels: "
-        + str(market.get("orderbook_bid_levels"))
+        + str(
+            market.get("orderbook_bid_levels")
+        )
     )
 
     st.write(
         "Ask levels: "
-        + str(market.get("orderbook_ask_levels"))
+        + str(
+            market.get("orderbook_ask_levels")
+        )
     )
 
     st.write(
         "Bid notional: $"
-        + fmt(market.get("bid_volume"), 0)
+        + fmt(
+            market.get("bid_volume"),
+            0
+        )
     )
 
     st.write(
         "Ask notional: $"
-        + fmt(market.get("ask_volume"), 0)
+        + fmt(
+            market.get("ask_volume"),
+            0
+        )
     )
 
 else:
@@ -2128,7 +2613,9 @@ else:
     )
 
 
-st.subheader("24H VOLUME SOURCE")
+st.subheader(
+    "24H VOLUME SOURCE"
+)
 
 st.write(
     market.get(
@@ -2140,9 +2627,12 @@ st.write(
 
 if market.get("errors"):
 
-    with st.expander("ALL DATA ERRORS"):
+    with st.expander(
+        "ALL DATA ERRORS"
+    ):
 
         for error in market["errors"]:
+
             st.warning(error)
 
 
@@ -2152,13 +2642,17 @@ if market.get("errors"):
 
 st.markdown("---")
 
-st.header("🏦 POSITION FLOW INTELLIGENCE")
+st.header(
+    "🏦 POSITION FLOW INTELLIGENCE"
+)
 
 st.info(
     analyze_position_flow(market)
 )
 
-derivatives = derivatives_analysis(market)
+derivatives = derivatives_analysis(
+    market
+)
 
 st.metric(
     "DERIVATIVES SCORE",
@@ -2167,7 +2661,9 @@ st.metric(
 
 for note in derivatives["notes"]:
 
-    st.write("• " + note)
+    st.write(
+        "• " + note
+    )
 
 
 # ============================================================
@@ -2176,9 +2672,14 @@ for note in derivatives["notes"]:
 
 st.markdown("---")
 
-st.header("🎯 BTC INTELLIGENCE RADAR")
+st.header(
+    "🎯 BTC INTELLIGENCE RADAR"
+)
 
-h1 = timeframes.get("H1", {})
+h1 = timeframes.get(
+    "H1",
+    {}
+)
 
 direction = h1.get(
     "direction",
@@ -2192,15 +2693,21 @@ score = h1.get(
 
 if direction == "LONG":
 
-    st.success("🟢 BTC LONG BIAS")
+    st.success(
+        "🟢 BTC LONG BIAS"
+    )
 
 elif direction == "SHORT":
 
-    st.error("🔴 BTC SHORT BIAS")
+    st.error(
+        "🔴 BTC SHORT BIAS"
+    )
 
 else:
 
-    st.warning("🟡 BTC WAIT / NEUTRAL")
+    st.warning(
+        "🟡 BTC WAIT / NEUTRAL"
+    )
 
 
 left, right = st.columns(2)
@@ -2214,12 +2721,16 @@ with left:
 
     st.metric(
         "BTC PRICE",
-        fmt(market.get("price"))
+        fmt(
+            market.get("price")
+        )
     )
 
     st.metric(
         "H1 ATR",
-        fmt(h1.get("atr_percent")) + "%"
+        fmt(
+            h1.get("atr_percent")
+        ) + "%"
         if h1.get("atr_percent") is not None
         else "N/A"
     )
@@ -2234,18 +2745,25 @@ with right:
     st.write(
         "STRUCTURE: "
         + str(
-            structure.get("status", "N/A")
+            structure.get(
+                "status",
+                "N/A"
+            )
         )
     )
 
     st.write(
         "SUPPORT: "
-        + fmt(structure.get("support"))
+        + fmt(
+            structure.get("support")
+        )
     )
 
     st.write(
         "RESISTANCE: "
-        + fmt(structure.get("resistance"))
+        + fmt(
+            structure.get("resistance")
+        )
     )
 
 
@@ -2255,7 +2773,9 @@ with right:
 
 st.markdown("---")
 
-st.header("🧩 HISTORICAL PATTERN INTELLIGENCE")
+st.header(
+    "🧩 HISTORICAL PATTERN INTELLIGENCE"
+)
 
 pattern = h1.get(
     "pattern",
@@ -2266,7 +2786,9 @@ p1, p2, p3, p4 = st.columns(4)
 
 with p1:
 
-    value = pattern.get("up_rate")
+    value = pattern.get(
+        "up_rate"
+    )
 
     st.metric(
         "BULLISH OUTCOMES",
@@ -2277,7 +2799,9 @@ with p1:
 
 with p2:
 
-    value = pattern.get("down_rate")
+    value = pattern.get(
+        "down_rate"
+    )
 
     st.metric(
         "BEARISH OUTCOMES",
@@ -2288,7 +2812,9 @@ with p2:
 
 with p3:
 
-    value = pattern.get("flat_rate")
+    value = pattern.get(
+        "flat_rate"
+    )
 
     st.metric(
         "SIDEWAYS OUTCOMES",
@@ -2299,7 +2825,9 @@ with p3:
 
 with p4:
 
-    value = pattern.get("average_move")
+    value = pattern.get(
+        "average_move"
+    )
 
     st.metric(
         "AVERAGE MOVE",
@@ -2317,10 +2845,14 @@ st.write(
 
 st.write(
     "Similar cases: "
-    + str(pattern.get("matches", 0))
+    + str(
+        pattern.get("matches", 0)
+    )
 )
 
-similarity = pattern.get("similarity")
+similarity = pattern.get(
+    "similarity"
+)
 
 st.write(
     "Similarity: "
@@ -2338,7 +2870,9 @@ st.write(
 
 st.markdown("---")
 
-st.header("🧭 MULTI-TIMEFRAME INTELLIGENCE")
+st.header(
+    "🧭 MULTI-TIMEFRAME INTELLIGENCE"
+)
 
 rows = []
 
@@ -2421,10 +2955,13 @@ st.dataframe(
 
 st.markdown("---")
 
-st.header("📒 SALIGA AI – SIGNAL PERFORMANCE HISTORY")
+st.header(
+    "📒 SALIGA AI – SIGNAL PERFORMANCE HISTORY"
+)
 
 st.caption(
-    "Automatikusan naplózott virtuális H1 pozíciók."
+    "Automatikusan naplózott virtuális H1 pozíciók. "
+    "A százalékos eredmény díjak és slippage nélkül értendő."
 )
 
 stats = get_signal_statistics()
@@ -2484,21 +3021,31 @@ with g:
     )
 
 
-# Aktuális nyitott virtuális pozíció
+# Aktuális nyitott virtuális pozíció.
 
 active = get_open_signal()
 
-st.subheader("AKTUÁLIS POZÍCIÓ")
+st.subheader(
+    "AKTUÁLIS POZÍCIÓ"
+)
 
 if active:
 
-    signal_id, active_direction, entry_price, entry_time = active
+    (
+        signal_id,
+        active_direction,
+        entry_price,
+        entry_time
+    ) = active
 
     current_price = safe_float(
         market.get("price")
     )
 
-    if current_price and entry_price > 0:
+    if (
+        current_price
+        and entry_price > 0
+    ):
 
         if active_direction == "LONG":
 
@@ -2551,9 +3098,11 @@ else:
     )
 
 
-# Korábbi pozíciók
+# Korábbi pozíciók.
 
-st.subheader("KORÁBBI POZÍCIÓK")
+st.subheader(
+    "KORÁBBI POZÍCIÓK"
+)
 
 history = get_signal_history()
 
@@ -2607,7 +3156,9 @@ else:
 
 st.markdown("---")
 
-st.header("🤖 GROQ AI INTELLIGENCE")
+st.header(
+    "🤖 GROQ AI INTELLIGENCE"
+)
 
 if st.session_state["ai_error"]:
 
@@ -2627,7 +3178,10 @@ if ai:
     st.metric(
         "AI CONFIDENCE ASSESSMENT",
         str(
-            ai.get("confidence_score", "N/A")
+            ai.get(
+                "confidence_score",
+                "N/A"
+            )
         ) + "%"
     )
 
@@ -2637,19 +3191,40 @@ if ai:
 
     for title, key in [
 
-        ("EXECUTIVE SUMMARY", "executive_summary"),
+        (
+            "EXECUTIVE SUMMARY",
+            "executive_summary"
+        ),
 
-        ("DERIVATIVES", "derivatives_analysis"),
+        (
+            "DERIVATIVES",
+            "derivatives_analysis"
+        ),
 
-        ("POSITION FLOW", "position_flow_analysis"),
+        (
+            "POSITION FLOW",
+            "position_flow_analysis"
+        ),
 
-        ("HISTORICAL PATTERNS", "historical_pattern_analysis"),
+        (
+            "HISTORICAL PATTERNS",
+            "historical_pattern_analysis"
+        ),
 
-        ("NEWS IMPACT", "news_impact"),
+        (
+            "NEWS IMPACT",
+            "news_impact"
+        ),
 
-        ("TIMEFRAME ANALYSIS", "timeframe_analysis"),
+        (
+            "TIMEFRAME ANALYSIS",
+            "timeframe_analysis"
+        ),
 
-        ("ACTIONABLE INSIGHT", "actionable_insight")
+        (
+            "ACTIONABLE INSIGHT",
+            "actionable_insight"
+        )
 
     ]:
 
@@ -2661,11 +3236,22 @@ if ai:
 
     with st.expander("RISKS"):
 
-        for risk in ai.get("risks", []):
+        for risk in ai.get(
+            "risks",
+            []
+        ):
 
             st.write(
                 "• " + str(risk)
             )
+
+else:
+
+    st.warning(
+        "A Groq AI elemzés jelenleg nem érhető el. "
+        "Ellenőrizd a GROQ_API_KEY beállítását "
+        "és az AI-hívás hibáját."
+    )
 
 
 # ============================================================
@@ -2674,7 +3260,9 @@ if ai:
 
 st.markdown("---")
 
-st.header("📰 AUTOMATIC CRYPTO NEWS")
+st.header(
+    "📰 AUTOMATIC CRYPTO NEWS"
+)
 
 if news:
 
@@ -2699,7 +3287,9 @@ if news:
         if item.get("link"):
 
             st.markdown(
-                "[OPEN NEWS](" + item["link"] + ")"
+                "[OPEN NEWS]("
+                + item["link"]
+                + ")"
             )
 
 else:
@@ -2715,7 +3305,9 @@ else:
 
 st.markdown("---")
 
-st.header("🛡️ SYSTEM STATUS")
+st.header(
+    "🛡️ SYSTEM STATUS"
+)
 
 st.write(
     "VERSION: " + APP_VERSION
@@ -2788,11 +3380,22 @@ st.write(
 )
 
 st.write(
+    "DATABASE: "
+    + DB_PATH
+)
+
+st.write(
     "LAST REFRESH: "
     + str(
         st.session_state["last_refresh"]
     )
 )
+
+if st.session_state["last_cycle_error"]:
+
+    st.error(
+        st.session_state["last_cycle_error"]
+    )
 
 
 # ============================================================
@@ -2803,10 +3406,14 @@ if auto_refresh:
 
     try:
 
-        from streamlit_autorefresh import st_autorefresh
+        from streamlit_autorefresh import (
+            st_autorefresh
+        )
 
         refresh_count = st_autorefresh(
-            interval=refresh_minutes * 60 * 1000,
+            interval=(
+                refresh_minutes * 60 * 1000
+            ),
             key="saliga_auto_refresh"
         )
 
@@ -2815,32 +3422,38 @@ if auto_refresh:
             != st.session_state["refresh_count"]
         ):
 
-            st.session_state["refresh_count"] = (
-                refresh_count
-            )
+            st.session_state[
+                "refresh_count"
+            ] = refresh_count
 
-            if (
-                st.session_state["last_refresh"]
-                is not None
-            ):
-
-                if (
+            should_refresh = (
+                st.session_state["last_refresh"] is None
+                or (
                     time.time()
                     - st.session_state["last_refresh_epoch"]
                     >= refresh_minutes * 60
-                ):
+                )
+            )
 
-                    try:
+            if should_refresh:
 
-                        run_full_cycle(lookback)
+                try:
 
-                    except Exception as e:
-
-                        st.error(
-                            "Refresh error: " + str(e)
-                        )
+                    run_full_cycle(
+                        lookback
+                    )
 
                     st.rerun()
+
+                except Exception as e:
+
+                    st.session_state[
+                        "last_cycle_error"
+                    ] = str(e)
+
+                    st.error(
+                        "Refresh error: " + str(e)
+                    )
 
     except ImportError:
 
@@ -2856,8 +3469,9 @@ if auto_refresh:
 st.markdown("---")
 
 st.caption(
-    "⚡ SALIGA AI PRO 20.0 | "
+    "⚡ SALIGA AI PRO 20.1 | "
     "MARKET INTELLIGENCE | "
+    "GROQ AI | CRYPTO NEWS ANALYSIS | "
     "AUTOMATIC VIRTUAL SIGNAL JOURNAL | "
     "NOT FINANCIAL ADVICE"
 )
