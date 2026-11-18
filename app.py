@@ -1,6 +1,6 @@
 # ============================================================
-# SALIGA AI PRO 17.9 (NEWS, MACRO & PATTERN INTELLIGENCE)
-# BTC-CENTRIC + MACRO & NEWS SENTIMENT + PATTERNS + OI/FUNDING + GROQ AI
+# SALIGA AI PRO 18.0 (AUTO-REFRESH SIGNAL EDITION)
+# BTC-CENTRIC + AUTO-REFRESH (5 MINS) + MACRO & NEWS + PATTERNS + OI/FUNDING + GROQ AI
 # ============================================================
 
 import streamlit as st
@@ -22,12 +22,12 @@ from openai import OpenAI
 # ============================================================
 
 st.set_page_config(
-    page_title="SALIGA AI PRO 17.9 - MACRO & NEWS BTC",
+    page_title="SALIGA AI PRO 18.0 - AUTO BTC",
     page_icon="⚡",
     layout="wide"
 )
 
-APP_VERSION = "SALIGA AI PRO 17.9"
+APP_VERSION = "SALIGA AI PRO 18.0"
 DB_PATH = "saliga_ai.db"
 
 ASSET = "BTC"
@@ -43,13 +43,15 @@ TIMEFRAMES = {
 OI_URL = "https://www.okx.com/api/v5/public/open-interest"
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-MARKET_REFRESH = 30
+# Alapértelmezett automatikus frissítési időköz (másodpercben). 
+# 300 mp = 5 perc, de a vezérlőpulton átállíthatod.
+DEFAULT_REFRESH_INTERVAL = 300 
 MIN_SIGNAL_SCORE = 65
 HTTP_TIMEOUT = 15
 
 
 # ============================================================
-# 2. SESSION STATE
+# 2. SESSION STATE (IDŐZÍTÉS ÉS ÁLLAPOTOK)
 # ============================================================
 
 DEFAULT_STATE = {
@@ -57,7 +59,8 @@ DEFAULT_STATE = {
     "btc_analysis": {},
     "ai_result": None,
     "ai_error": None,
-    "auto_refresh": False
+    "auto_refresh_active": True,
+    "refresh_interval": DEFAULT_REFRESH_INTERVAL
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -371,7 +374,7 @@ def analyze_btc_timeframe(timeframe):
 
 
 # ============================================================
-# 7. GROQ AI INTEGRÁCIÓ (HÍREK ÉS MAKRO ELEMZÉSSEL KIEGÉSZÍTVE)
+# 7. GROQ AI INTEGRÁCIÓ
 # ============================================================
 
 def run_groq_btc_analysis(market_data, tf_data, user_news_input):
@@ -384,13 +387,12 @@ def run_groq_btc_analysis(market_data, tf_data, user_news_input):
     payload = {
         "derivatives_market": market_data,
         "technical_timeframes": tf_data,
-        "macro_and_news_input": user_news_input if user_news_input else "Nincs megadva egyedi hír, értékeld a jelenlegi makro piaci hangulatot (pl. kamatdöntések, infláció, ETF beáramlások)."
+        "macro_and_news_input": user_news_input if user_news_input else "Nincs megadva egyedi hír, értékeld a jelenlegi makro piaci hangulatot."
     }
 
     system_prompt = """
-You are SALIGA AI PRO, an elite Bitcoin (BTC) market intelligence, macroeconomics, and news sentiment analyst.
-Analyze OKX derivatives (OI, funding rate, delta), S/R levels, chart patterns, AND the provided macro/news inputs.
-Determine whether the macroeconomic and news environment is BULLISH, BEARISH, or NEUTRAL for Bitcoin.
+You are SALIGA AI PRO, an elite Bitcoin (BTC) market intelligence and news sentiment analyst.
+Analyze OKX derivatives (OI, funding rate, delta), S/R levels, chart patterns, and macro inputs.
 Provide a concise, professional trading intelligence report in valid JSON format only.
 
 Required JSON structure:
@@ -434,49 +436,55 @@ def run_full_cycle():
 
 
 # ============================================================
-# 8. STREAMLIT UI (MAKRO HÍREK + ALAKZATOK + DERIVATÍV)
+# 8. STREAMLIT UI (AUTOMATIKUS HÁTTÉRFISSÍTÉSSEL)
 # ============================================================
 
-st.title("⚡ SALIGA AI PRO — BITCOIN (BTC) MAKRO & HÍR ELEMZŐ")
-st.caption("OKX OI + FUNDING + ALAKZATOK + MAKROGAZDASÁGI HÍREK & SENTIMENT + GROQ AI")
+st.title("⚡ SALIGA AI PRO — BITCOIN (BTC) AUTO-REFRESH RADAR")
+st.caption("OKX OI + FUNDING + ALAKZATOK + MAKRO HÍREK + GROQ AI | AUTOMATIKUS 5 PERCES FRISSÍTÉS")
 
 if exchange_error:
     st.error(f"OKX Hiba: {exchange_error}")
 
-# Hírbeviteli mező a felhasználónak (ahová beírhatja az aktuális nap híreit / makro adatait)
-st.markdown("### 📰 Napi Makro & Hír Bevitele (Opcionális)")
-user_news_input = st.text_area(
-    "Írd be ide a mai legfontosabb híreket, makro adatokat (pl. 'CPI alacsonyabb lett mint várták', 'Fed kamatvágás lesz', 'ETF kiáramlás van'):",
-    placeholder="Pl.: Ma érkezik az US CPI adat, a várakozás 3.1%, a piacon feszültség van..."
-)
-
-# Vezérlők
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    if st.button("🔄 ADATOK FRISSÍTÉSE", use_container_width=True):
+# Vezérlő sáv az automatikus frissítéshez
+c_ctrl1, c_ctrl2, c_ctrl3, c_ctrl4 = st.columns(4)
+with c_ctrl1:
+    if st.button("🔄 AZONNALI FRISSÍTÉS", use_container_width=True):
         st.session_state["btc_analysis"] = run_full_cycle()
         st.session_state["last_refresh"] = time.time()
-with c2:
-    if st.button("🧠 GROQ AI MAKRO & HÍR ELEMZÉS", use_container_width=True):
-        if st.session_state["btc_analysis"]:
-            with st.spinner("Groq AI elemzi a híreket, makro adatokat és a technikai szintet..."):
-                res, err = run_groq_btc_analysis(
-                    st.session_state["btc_analysis"]["market"],
-                    st.session_state["btc_analysis"]["timeframes"],
-                    user_news_input
-                )
-                st.session_state["ai_result"] = res
-                st.session_state["ai_error"] = err
-        else:
-            st.warning("Előbb frissítsd az adatokat!")
-with c3:
-    auto_refresh = st.checkbox("🟢 Élő frissítés (30mp)", value=st.session_state["auto_refresh"])
-    st.session_state["auto_refresh"] = auto_refresh
-with c4:
+with c_ctrl2:
+    auto_refresh_active = st.checkbox("🟢 Automatikus Háttérfrissítés", value=st.session_state["auto_refresh_active"])
+    st.session_state["auto_refresh_active"] = auto_refresh_active
+with c_ctrl3:
+    # Kiválaszthatod, hogy hány percenként frissítsen (alapból 5 perc = 300 mp)
+    refresh_mins = st.selectbox("Frissítési Időköz", [1, 3, 5, 10, 15], index=2)
+    st.session_state["refresh_interval"] = refresh_mins * 60
+with c_ctrl4:
     st.metric("Utolsó frissítés", datetime.now().strftime("%H:%M:%S"))
+
+# Hírbeviteli mező
+st.markdown("### 📰 Napi Makro & Hír Bevitele (Opcionális)")
+user_news_input = st.text_area(
+    "Írd be ide a mai legfontosabb híreket, makro adatokat:",
+    placeholder="Pl.: CPI adatok érkeznek ma, a piaci hangulat feszült..."
+)
+
+# Gomb az AI elemzéshez
+if st.button("🧠 GROQ AI MAKRO & HÍR ELEMZÉS Futtatása", use_container_width=True):
+    if st.session_state["btc_analysis"]:
+        with st.spinner("Groq AI elemzi a legfrissebb adatokat..."):
+            res, err = run_groq_btc_analysis(
+                st.session_state["btc_analysis"]["market"],
+                st.session_state["btc_analysis"]["timeframes"],
+                user_news_input
+            )
+            st.session_state["ai_result"] = res
+            st.session_state["ai_error"] = err
+    else:
+        st.warning("Előbb töltsd be az adatokat!")
 
 if not st.session_state["btc_analysis"]:
     st.session_state["btc_analysis"] = run_full_cycle()
+    st.session_state["last_refresh"] = time.time()
 
 data = st.session_state["btc_analysis"]
 
@@ -527,9 +535,9 @@ col_a, col_b = st.columns([1, 1])
 
 with col_a:
     if direction == "LONG":
-        st.success("### 🟢 BTC JELZÉS: LONG POZÍCIÓ")
+        st.success("### 🟢 BTC JELZÉS: LONG POZÍCIÓ AKTÍV")
     elif direction == "SHORT":
-        st.error("### 🔴 BTC JELZÉS: SHORT POZÍCIÓ")
+        st.error("### 🔴 BTC JELZÉS: SHORT POZÍCIÓ AKTÍV")
     else:
         st.warning("### 🟡 BTC JELZÉS: KIVÁRÁS (WAIT)")
 
@@ -549,7 +557,7 @@ st.markdown("---")
 
 
 # ============================================================
-# 11. GROQ AI MAKRO & HÍR ELEMZÉS EREDMÉNYE
+# 11. GROQ AI JELENTÉS
 # ============================================================
 
 st.header("🧠 GROQ AI MAKRO & HÍR JELENTÉS")
@@ -570,7 +578,7 @@ if ai_res:
         for risk in ai_res.get("risks", []):
             st.write(f"• {risk}")
 else:
-    st.info("Írd be fent a híreket (vagy hagyd üresen az általános makro helyzethez), majd kattints a **'GROQ AI MAKRO & HÍR ELEMZÉS'** gombra.")
+    st.info("Írd be fent a híreket, majd kattints a Groq AI elemzés gombra.")
 
 
 # ============================================================
@@ -597,10 +605,12 @@ st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
 
 
 # ============================================================
-# 13. AUTOMATIKUS FRISSÍTÉS LOGIKA
+# 13. AUTOMATIKUS HÁTTÉRFISSÍTÉSI LOGIKA (IDŐZÍTŐ)
 # ============================================================
 
-if st.session_state["auto_refresh"]:
-    time.sleep(MARKET_REFRESH)
+if st.session_state["auto_refresh_active"]:
+    interval = st.session_state["refresh_interval"]
+    time.sleep(interval)
     st.session_state["btc_analysis"] = run_full_cycle()
+    st.session_state["last_refresh"] = time.time()
     st.rerun()
