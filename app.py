@@ -1930,14 +1930,16 @@ def call_groq(payload):
         ]
     }
 
-        response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json=request_data,
-        timeout=45
+                response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=request_data,
+            timeout=45
+        )
+
     )
 
     )
