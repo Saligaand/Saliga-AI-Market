@@ -11,8 +11,8 @@ from datetime import datetime, timezone
 from openai import OpenAI
 
 # ============================================================
-# SALIGA AI PRO 15.0
-# OKX DIRECT OI API + GROQ AI
+# SALIGA AI PRO 16.0
+# OKX ONLY | DIRECT OPEN INTEREST | GROQ AI
 # ============================================================
 
 st.set_page_config(
@@ -21,7 +21,7 @@ st.set_page_config(
     layout="wide"
 )
 
-APP_VERSION = "SALIGA AI PRO 15.0"
+APP_VERSION = "SALIGA AI PRO 16.0"
 DB_PATH = "saliga_ai.db"
 
 SYMBOLS = {
@@ -66,6 +66,7 @@ DEFAULTS = {
     "groq_cooldown_until": 0,
     "last_data": None,
     "last_refresh": 0,
+    "chat_answer": None,
     "force_ai": False
 }
 
@@ -120,14 +121,32 @@ GROQ_API_KEY = get_secret("GROQ_API_KEY")
 
 # ============================================================
 # DATABASE
+# AUTOMATIKUS RÉGI ADATBÁZIS JAVÍTÁS
 # ============================================================
 
 def get_db():
     return sqlite3.connect(
         DB_PATH,
         check_same_thread=False,
-        timeout=20
+        timeout=30
     )
+
+
+def ensure_columns(cur, table, required_columns):
+
+    cur.execute(f"PRAGMA table_info({table})")
+    existing = {
+        row[1] for row in cur.fetchall()
+    }
+
+    for column, definition in required_columns.items():
+
+        if column not in existing:
+
+            cur.execute(
+                f"ALTER TABLE {table} "
+                f"ADD COLUMN {column} {definition}"
+            )
 
 
 def init_db():
@@ -135,6 +154,7 @@ def init_db():
     con = get_db()
     cur = con.cursor()
 
+    # SIGNALS
     cur.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,6 +174,7 @@ def init_db():
         )
     """)
 
+    # SIGNAL EVENTS
     cur.execute("""
         CREATE TABLE IF NOT EXISTS signal_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,6 +185,7 @@ def init_db():
         )
     """)
 
+    # OPEN INTEREST HISTORY
     cur.execute("""
         CREATE TABLE IF NOT EXISTS oi_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,6 +195,60 @@ def init_db():
             price REAL,
             created_at REAL
         )
+    """)
+
+    # Régi adatbázisok automatikus bővítése
+    ensure_columns(
+        cur,
+        "oi_history",
+        {
+            "asset": "TEXT",
+            "oi_value": "REAL",
+            "oi_unit": "TEXT DEFAULT 'N/A'",
+            "price": "REAL",
+            "created_at": "REAL"
+        }
+    )
+
+    ensure_columns(
+        cur,
+        "signals",
+        {
+            "signal_key": "TEXT",
+            "asset": "TEXT",
+            "timeframe": "TEXT",
+            "direction": "TEXT",
+            "entry": "REAL",
+            "sl": "REAL",
+            "tp1": "REAL",
+            "tp2": "REAL",
+            "tp3": "REAL",
+            "score": "REAL",
+            "ai_direction": "TEXT",
+            "status": "TEXT DEFAULT 'OPEN'",
+            "created_at": "TEXT"
+        }
+    )
+
+    ensure_columns(
+        cur,
+        "signal_events",
+        {
+            "signal_key": "TEXT",
+            "event": "TEXT",
+            "price": "REAL",
+            "created_at": "TEXT"
+        }
+    )
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_oi_asset_time
+        ON oi_history(asset, created_at)
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_signals_status
+        ON signals(status)
     """)
 
     con.commit()
@@ -206,15 +282,14 @@ exchange = get_exchange()
 
 
 # ============================================================
-# OKX DIRECT OPEN INTEREST
+# OKX OPEN INTEREST
 # ============================================================
 
 def fetch_okx_oi(asset):
 
-    symbol = SYMBOLS[asset]
-
     try:
 
+        symbol = SYMBOLS[asset]
         market = exchange.market(symbol)
         inst_id = market["id"]
 
@@ -236,18 +311,19 @@ def fetch_okx_oi(asset):
         payload = response.json()
 
         if str(payload.get("code")) != "0":
+
             raise Exception(
-                "OKX API: " + str(payload.get("msg"))
+                f"OKX API {payload.get('code')}: "
+                f"{payload.get('msg')}"
             )
 
         records = payload.get("data", [])
 
         if not records:
-            raise Exception("Az OKX üres OI-választ adott.")
+            raise Exception("Az OKX nem adott vissza OI-adatot.")
 
         record = records[0]
 
-        # USD érték előnyben
         fields = [
             ("oiUsd", "USD"),
             ("oiCcy", "BASE"),
@@ -263,12 +339,11 @@ def fetch_okx_oi(asset):
                 return {
                     "value": value,
                     "unit": unit,
-                    "error": None,
-                    "raw": record
+                    "error": None
                 }
 
         raise Exception(
-            "Nincs használható OI-mező a válaszban: "
+            "Nem található használható OI-mező: "
             + json.dumps(record, ensure_ascii=False)
         )
 
@@ -277,8 +352,7 @@ def fetch_okx_oi(asset):
         return {
             "value": None,
             "unit": "N/A",
-            "error": str(e),
-            "raw": None
+            "error": str(e)
         }
 
 
@@ -292,37 +366,49 @@ def save_oi_history(asset, value, unit, price):
         return
 
     con = get_db()
-    cur = con.cursor()
 
-    cur.execute("""
-        SELECT created_at
-        FROM oi_history
-        WHERE asset = ?
-        ORDER BY created_at DESC
-        LIMIT 1
-    """, (asset,))
+    try:
 
-    row = cur.fetchone()
-    now = time.time()
+        cur = con.cursor()
+        now = time.time()
 
-    if row and now - row[0] < OI_SAMPLE_SECONDS:
+        cur.execute("""
+            SELECT created_at
+            FROM oi_history
+            WHERE asset = ?
+            AND oi_unit = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (asset, unit))
+
+        row = cur.fetchone()
+
+        if row and row[0] is not None:
+
+            if now - float(row[0]) < OI_SAMPLE_SECONDS:
+                return
+
+        cur.execute("""
+            INSERT INTO oi_history (
+                asset,
+                oi_value,
+                oi_unit,
+                price,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            asset,
+            value,
+            unit,
+            price,
+            now
+        ))
+
+        con.commit()
+
+    finally:
         con.close()
-        return
-
-    cur.execute("""
-        INSERT INTO oi_history
-        (asset, oi_value, oi_unit, price, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        asset,
-        value,
-        unit,
-        price,
-        now
-    ))
-
-    con.commit()
-    con.close()
 
 
 def calculate_oi_change(asset, current_value, unit):
@@ -331,26 +417,32 @@ def calculate_oi_change(asset, current_value, unit):
         return None
 
     con = get_db()
-    cur = con.cursor()
 
-    target = time.time() - OI_SAMPLE_SECONDS
+    try:
 
-    cur.execute("""
-        SELECT oi_value
-        FROM oi_history
-        WHERE asset = ?
-        AND oi_unit = ?
-        AND created_at <= ?
-        ORDER BY created_at DESC
-        LIMIT 1
-    """, (
-        asset,
-        unit,
-        target
-    ))
+        cur = con.cursor()
 
-    row = cur.fetchone()
-    con.close()
+        target = time.time() - OI_SAMPLE_SECONDS
+
+        cur.execute("""
+            SELECT oi_value
+            FROM oi_history
+            WHERE asset = ?
+            AND oi_unit = ?
+            AND created_at <= ?
+            AND oi_value > 0
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (
+            asset,
+            unit,
+            target
+        ))
+
+        row = cur.fetchone()
+
+    finally:
+        con.close()
 
     if not row:
         return None
@@ -383,13 +475,11 @@ def fetch_market_data(asset):
         "errors": []
     }
 
-    # TICKER
     try:
         result["ticker"] = exchange.fetch_ticker(symbol)
     except Exception as e:
         result["errors"].append("Ticker: " + str(e))
 
-    # ORDER BOOK
     try:
         result["orderbook"] = exchange.fetch_order_book(
             symbol,
@@ -398,13 +488,11 @@ def fetch_market_data(asset):
     except Exception as e:
         result["errors"].append("Order book: " + str(e))
 
-    # FUNDING
     try:
         result["funding"] = exchange.fetch_funding_rate(symbol)
     except Exception as e:
         result["errors"].append("Funding: " + str(e))
 
-    # TRADES
     try:
         result["trades"] = exchange.fetch_trades(
             symbol,
@@ -413,7 +501,6 @@ def fetch_market_data(asset):
     except Exception as e:
         result["errors"].append("Trades: " + str(e))
 
-    # OPEN INTEREST DIRECTLY FROM OKX
     result["oi"] = fetch_okx_oi(asset)
 
     if result["oi"]["error"]:
@@ -435,7 +522,7 @@ def fetch_candles(symbol, timeframe):
 
 
 # ============================================================
-# ORDER BOOK ANALYSIS
+# ORDER BOOK
 # ============================================================
 
 def analyze_orderbook(orderbook):
@@ -464,6 +551,7 @@ def analyze_orderbook(orderbook):
     imbalance = None
 
     if total > 0:
+
         imbalance = (
             (bid_volume - ask_volume) / total
         ) * 100
@@ -519,6 +607,7 @@ def analyze_delta(trades):
     delta = None
 
     if total > 0:
+
         delta = (
             (buy - sell) / total
         ) * 100
@@ -561,6 +650,7 @@ def analyze_candles(raw):
         "close",
         "volume"
     ]:
+
         df[col] = pd.to_numeric(
             df[col],
             errors="coerce"
@@ -577,10 +667,10 @@ def analyze_candles(raw):
     volume = df["volume"]
 
     # RSI
-    delta = close.diff()
+    price_change = close.diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = price_change.clip(lower=0)
+    loss = -price_change.clip(upper=0)
 
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
@@ -611,17 +701,16 @@ def analyze_candles(raw):
         volume_sum.replace(0, np.nan)
     )
 
-    # Volume ratio
     volume_reference = volume.iloc[-21:-1].mean()
 
     volume_ratio = None
 
-    if volume_reference and volume_reference > 0:
+    if pd.notna(volume_reference) and volume_reference > 0:
+
         volume_ratio = (
             volume.iloc[-1] / volume_reference
         )
 
-    # Momentum
     momentum_5 = (
         close.iloc[-1] / close.iloc[-6] - 1
     ) * 100
@@ -630,7 +719,6 @@ def analyze_candles(raw):
         close.iloc[-1] / close.iloc[-21] - 1
     ) * 100
 
-    # Market structure
     recent_high = high.iloc[-21:-1].max()
     recent_low = low.iloc[-21:-1].min()
 
@@ -647,22 +735,15 @@ def analyze_candles(raw):
     elif current_close < previous_low:
         structure = "BEARISH BREAK"
 
-    # Liquidity sweep
     last_high = high.iloc[-1]
     last_low = low.iloc[-1]
 
     sweep = "NONE"
 
-    if (
-        last_high > recent_high
-        and current_close < recent_high
-    ):
+    if last_high > recent_high and current_close < recent_high:
         sweep = "BUY-SIDE SWEEP"
 
-    elif (
-        last_low < recent_low
-        and current_close > recent_low
-    ):
+    elif last_low < recent_low and current_close > recent_low:
         sweep = "SELL-SIDE SWEEP"
 
     return {
@@ -742,10 +823,7 @@ def calculate_score(candle, market, threshold):
         short_score += 1
         reasons.append("Buy-side liquidity sweep")
 
-    if (
-        volume_ratio is not None
-        and volume_ratio > 1.3
-    ):
+    if volume_ratio is not None and volume_ratio > 1.3:
 
         if momentum is not None and momentum > 0:
             long_score += 0.5
@@ -866,7 +944,7 @@ def create_trade_plan(direction, candle):
 
 
 # ============================================================
-# BUILD MARKET ANALYSIS
+# BUILD ANALYSIS
 # ============================================================
 
 def build_analysis():
@@ -895,6 +973,8 @@ def build_analysis():
         oi_value = oi["value"]
         oi_unit = oi["unit"]
 
+        # Először a korábbi minta alapján számolunk,
+        # majd elmentjük az aktuális mintát.
         oi_change = calculate_oi_change(
             asset,
             oi_value,
@@ -914,6 +994,7 @@ def build_analysis():
         funding = None
 
         if raw["funding"]:
+
             funding = safe_float(
                 raw["funding"].get("fundingRate")
             )
@@ -1039,14 +1120,13 @@ def groq_analyze(asset, data):
     system_prompt = """
 Te vagy a SALIGA AI PRO kriptopiaci elemzője.
 
-Feladatod:
-- Több idősík összehasonlítása.
-- Open Interest változás elemzése.
-- Becsült delta értékelése.
-- Order book pillanatkép értékelése.
-- Funding értékelése.
-- Piaci struktúra és likviditási sweep vizsgálata.
-- LONG, SHORT vagy WAIT irány meghatározása.
+Elemezd:
+- Több idősík irányát.
+- Open Interest változását.
+- Becsült deltát.
+- Order book pillanatképet.
+- Funding értékét.
+- Piaci struktúrát és likviditási sweepet.
 
 Fontos:
 Az OI emelkedése önmagában nem bizonyítja,
@@ -1060,7 +1140,6 @@ Magyarul válaszolj.
 Kizárólag érvényes JSON-t adj vissza.
 
 Formátum:
-
 {
  "overall_bias":"LONG vagy SHORT vagy WAIT",
  "confidence":0,
@@ -1105,6 +1184,9 @@ Formátum:
 
         content = response.choices[0].message.content
 
+        if not content:
+            raise Exception("A Groq üres választ adott.")
+
         return json.loads(content), None
 
     except Exception as e:
@@ -1137,7 +1219,6 @@ def get_ai_result(asset, data, force=False):
 
     previous = cache.get(asset)
 
-    # Globális Groq cooldown
     if (
         not force
         and now < st.session_state.groq_cooldown_until
@@ -1148,7 +1229,6 @@ def get_ai_result(asset, data, force=False):
             "Groq korlátozás: várakozás."
         )
 
-    # 15 perces korlátozás eszközönként
     last_attempt = attempts.get(asset, 0)
 
     if (
@@ -1162,7 +1242,7 @@ def get_ai_result(asset, data, force=False):
             previous.get("error")
         )
 
-    # Hívási idő rögzítése, hogy hiba esetén se próbálkozzon percenként
+    # A hívás időpontját előre rögzítjük.
     attempts[asset] = now
     st.session_state.last_ai_attempt = attempts
 
@@ -1199,11 +1279,15 @@ def apply_ai_validation(data, ai_result):
         ai_tf = {}
 
         if ai_result:
-            ai_tf = (
-                ai_result.get("timeframes", {}).get(tf, {})
-            )
+
+            ai_tf = ai_result.get(
+                "timeframes", {}
+            ).get(tf, {})
 
         ai_direction = ai_tf.get("bias", "WAIT")
+
+        if ai_direction not in ["LONG", "SHORT", "WAIT"]:
+            ai_direction = "WAIT"
 
         item["ai"] = ai_tf
         item["ai_direction"] = ai_direction
@@ -1242,43 +1326,48 @@ def save_signal(asset, tf, item):
     )
 
     con = get_db()
-    cur = con.cursor()
 
-    cur.execute("""
-        INSERT OR IGNORE INTO signals (
+    try:
+
+        cur = con.cursor()
+
+        cur.execute("""
+            INSERT OR IGNORE INTO signals (
+                signal_key,
+                asset,
+                timeframe,
+                direction,
+                entry,
+                sl,
+                tp1,
+                tp2,
+                tp3,
+                score,
+                ai_direction,
+                status,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
             signal_key,
             asset,
-            timeframe,
+            tf,
             direction,
-            entry,
-            sl,
-            tp1,
-            tp2,
-            tp3,
-            score,
-            ai_direction,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        signal_key,
-        asset,
-        tf,
-        direction,
-        plan["entry"],
-        plan["sl"],
-        plan["tp1"],
-        plan["tp2"],
-        plan["tp3"],
-        score["score"],
-        item.get("ai_direction"),
-        "OPEN",
-        now_utc()
-    ))
+            plan["entry"],
+            plan["sl"],
+            plan["tp1"],
+            plan["tp2"],
+            plan["tp3"],
+            score["score"],
+            item.get("ai_direction"),
+            "OPEN",
+            now_utc()
+        ))
 
-    con.commit()
-    con.close()
+        con.commit()
+
+    finally:
+        con.close()
 
 
 # ============================================================
@@ -1288,109 +1377,114 @@ def save_signal(asset, tf, item):
 def track_signals(prices):
 
     con = get_db()
-    cur = con.cursor()
 
-    cur.execute("""
-        SELECT
-            signal_key,
-            asset,
-            direction,
-            sl,
-            tp1,
-            tp2,
-            tp3,
-            status
-        FROM signals
-        WHERE status IN ('OPEN', 'TP1', 'TP2')
-    """)
+    try:
 
-    rows = cur.fetchall()
+        cur = con.cursor()
 
-    for row in rows:
+        cur.execute("""
+            SELECT
+                signal_key,
+                asset,
+                direction,
+                sl,
+                tp1,
+                tp2,
+                tp3,
+                status
+            FROM signals
+            WHERE status IN ('OPEN', 'TP1', 'TP2')
+        """)
 
-        (
-            key,
-            asset,
-            direction,
-            sl,
-            tp1,
-            tp2,
-            tp3,
-            status
-        ) = row
+        rows = cur.fetchall()
 
-        price = prices.get(asset)
+        for row in rows:
 
-        if price is None:
-            continue
+            (
+                key,
+                asset,
+                direction,
+                sl,
+                tp1,
+                tp2,
+                tp3,
+                status
+            ) = row
 
-        event = None
-        new_status = status
+            price = prices.get(asset)
 
-        if direction == "LONG":
+            if price is None:
+                continue
 
-            if price <= sl:
-                event = "STOP LOSS"
-                new_status = "STOP"
+            event = None
+            new_status = status
 
-            elif price >= tp3:
-                event = "TP3"
-                new_status = "TP3"
+            if direction == "LONG":
 
-            elif price >= tp2 and status != "TP2":
-                event = "TP2"
-                new_status = "TP2"
+                if price <= sl:
+                    event = "STOP LOSS"
+                    new_status = "STOP"
 
-            elif price >= tp1 and status == "OPEN":
-                event = "TP1"
-                new_status = "TP1"
+                elif price >= tp3:
+                    event = "TP3"
+                    new_status = "TP3"
 
-        elif direction == "SHORT":
+                elif price >= tp2 and status != "TP2":
+                    event = "TP2"
+                    new_status = "TP2"
 
-            if price >= sl:
-                event = "STOP LOSS"
-                new_status = "STOP"
+                elif price >= tp1 and status == "OPEN":
+                    event = "TP1"
+                    new_status = "TP1"
 
-            elif price <= tp3:
-                event = "TP3"
-                new_status = "TP3"
+            elif direction == "SHORT":
 
-            elif price <= tp2 and status != "TP2":
-                event = "TP2"
-                new_status = "TP2"
+                if price >= sl:
+                    event = "STOP LOSS"
+                    new_status = "STOP"
 
-            elif price <= tp1 and status == "OPEN":
-                event = "TP1"
-                new_status = "TP1"
+                elif price <= tp3:
+                    event = "TP3"
+                    new_status = "TP3"
 
-        if event:
+                elif price <= tp2 and status != "TP2":
+                    event = "TP2"
+                    new_status = "TP2"
 
-            cur.execute("""
-                INSERT INTO signal_events (
-                    signal_key,
+                elif price <= tp1 and status == "OPEN":
+                    event = "TP1"
+                    new_status = "TP1"
+
+            if event:
+
+                cur.execute("""
+                    INSERT INTO signal_events (
+                        signal_key,
+                        event,
+                        price,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    key,
                     event,
                     price,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?)
-            """, (
-                key,
-                event,
-                price,
-                now_utc()
-            ))
+                    now_utc()
+                ))
 
-            cur.execute("""
-                UPDATE signals
-                SET status = ?
-                WHERE signal_key = ?
-            """, (
-                new_status,
-                key
-            ))
+                cur.execute("""
+                    UPDATE signals
+                    SET status = ?
+                    WHERE signal_key = ?
+                """, (
+                    new_status,
+                    key
+                ))
 
-    con.commit()
-    con.close()
+        con.commit()
+
+    finally:
+        con.close()
 
 
 # ============================================================
@@ -1432,7 +1526,6 @@ def run_cycle(force_ai=False):
         for tf, item in data["timeframes"].items():
             save_signal(asset, tf, item)
 
-    # Ez nem használ Groq-tokeneket
     track_signals(prices)
 
     return {
@@ -1444,21 +1537,24 @@ def run_cycle(force_ai=False):
 
 
 # ============================================================
-# MAIN DASHBOARD
+# DASHBOARD
 # ============================================================
 
 @st.fragment(run_every=MARKET_REFRESH_SECONDS)
 def dashboard():
 
-    # Első indítás
     if st.session_state.last_data is None:
 
         with st.spinner("SALIGA AI PRO indul..."):
-            st.session_state.last_data = run_cycle()
 
-        st.session_state.last_refresh = time.time()
+            try:
+                st.session_state.last_data = run_cycle()
+                st.session_state.last_refresh = time.time()
 
-    # Automatikus frissítés
+            except Exception as e:
+                st.error("Indítási hiba: " + str(e))
+                return
+
     elif (
         time.time() - st.session_state.last_refresh
         >= MARKET_REFRESH_SECONDS
@@ -1476,9 +1572,14 @@ def dashboard():
             st.session_state.last_refresh = time.time()
 
         except Exception as e:
+
             st.error("Frissítési hiba: " + str(e))
 
     data_pack = st.session_state.last_data
+
+    if not data_pack:
+        st.error("Nincs elérhető piaci adat.")
+        return
 
     all_data = data_pack["all_data"]
     ai_results = data_pack["ai_results"]
@@ -1496,9 +1597,7 @@ def dashboard():
         "Groq AI: 15 perc"
     )
 
-    # --------------------------------------------------------
     # MANUAL AI REFRESH
-    # --------------------------------------------------------
 
     if st.button(
         "🧠 Teljes AI-elemzés most",
@@ -1506,10 +1605,6 @@ def dashboard():
     ):
 
         try:
-
-            st.session_state.ai_cache = {}
-            st.session_state.last_ai_attempt = {}
-            st.session_state.groq_cooldown_until = 0
 
             fetch_market_data.clear()
             fetch_candles.clear()
@@ -1525,11 +1620,10 @@ def dashboard():
             st.rerun()
 
         except Exception as e:
+
             st.error("AI frissítési hiba: " + str(e))
 
-    # --------------------------------------------------------
     # MARKET OVERVIEW
-    # --------------------------------------------------------
 
     st.header("🌐 PIACI ÁTTEKINTÉS")
 
@@ -1592,15 +1686,16 @@ def dashboard():
                     for error in data["errors"]:
                         st.write("⚠️ " + error)
 
-    # --------------------------------------------------------
     # AI SUMMARY
-    # --------------------------------------------------------
 
     st.header("🧠 GROQ AI – PIACI INTELLIGENCIA")
 
     for asset, ai_data in ai_results.items():
 
-        with st.expander(asset + " AI-elemzés", expanded=True):
+        with st.expander(
+            asset + " AI-elemzés",
+            expanded=True
+        ):
 
             result = ai_data["result"]
 
@@ -1649,9 +1744,7 @@ def dashboard():
                     + str(ai_data["error"])
                 )
 
-    # --------------------------------------------------------
     # MULTI TIMEFRAME
-    # --------------------------------------------------------
 
     st.header("📊 TÖBBIDŐSÍKÚ ELEMZÉS")
 
@@ -1677,25 +1770,13 @@ def dashboard():
 
                 c1, c2, c3, c4 = st.columns(4)
 
-                c1.metric(
-                    "Ár",
-                    fmt(candle["price"], 4)
-                )
-
-                c2.metric(
-                    "RSI",
-                    fmt(candle["rsi"])
-                )
-
+                c1.metric("Ár", fmt(candle["price"], 4))
+                c2.metric("RSI", fmt(candle["rsi"]))
                 c3.metric(
                     "Momentum",
                     fmt(candle["momentum_5"], 3) + "%"
                 )
-
-                c4.metric(
-                    "ATR",
-                    fmt(candle["atr"], 4)
-                )
+                c4.metric("ATR", fmt(candle["atr"], 4))
 
                 st.write(
                     "Struktúra: " + candle["structure"]
@@ -1742,7 +1823,9 @@ def dashboard():
                     and final_direction in ["LONG", "SHORT"]
                 ):
 
-                    st.markdown("**Kereskedési terv – referencia**")
+                    st.markdown(
+                        "**Kereskedési terv – referencia**"
+                    )
 
                     p1, p2, p3, p4, p5 = st.columns(5)
 
@@ -1757,9 +1840,7 @@ def dashboard():
 
                 st.divider()
 
-    # --------------------------------------------------------
     # LIVE SIGNALS
-    # --------------------------------------------------------
 
     st.header("🚨 ÉLŐ JELZÉSEK")
 
@@ -1819,36 +1900,40 @@ def dashboard():
         )
 
     else:
-        st.warning("Nincs jelenleg értékelhető jelzés.")
 
-    # --------------------------------------------------------
+        st.warning(
+            "Nincs jelenleg értékelhető jelzés."
+        )
+
     # SIGNAL JOURNAL
-    # --------------------------------------------------------
 
     st.header("📚 JELZÉSNAPLÓ")
 
     con = get_db()
 
-    history = pd.read_sql_query("""
-        SELECT
-            asset,
-            timeframe,
-            direction,
-            entry,
-            sl,
-            tp1,
-            tp2,
-            tp3,
-            score,
-            ai_direction,
-            status,
-            created_at
-        FROM signals
-        ORDER BY id DESC
-        LIMIT 100
-    """, con)
+    try:
 
-    con.close()
+        history = pd.read_sql_query("""
+            SELECT
+                asset,
+                timeframe,
+                direction,
+                entry,
+                sl,
+                tp1,
+                tp2,
+                tp3,
+                score,
+                ai_direction,
+                status,
+                created_at
+            FROM signals
+            ORDER BY id DESC
+            LIMIT 100
+        """, con)
+
+    finally:
+        con.close()
 
     if not history.empty:
 
@@ -1862,26 +1947,27 @@ def dashboard():
 
         st.info("Még nincs rögzített jelzés.")
 
-    # --------------------------------------------------------
-    # TP SL EVENTS
-    # --------------------------------------------------------
+    # TP / SL EVENTS
 
     st.header("📍 TP / SL ESEMÉNYEK")
 
     con = get_db()
 
-    events = pd.read_sql_query("""
-        SELECT
-            signal_key,
-            event,
-            price,
-            created_at
-        FROM signal_events
-        ORDER BY id DESC
-        LIMIT 100
-    """, con)
+    try:
 
-    con.close()
+        events = pd.read_sql_query("""
+            SELECT
+                signal_key,
+                event,
+                price,
+                created_at
+            FROM signal_events
+            ORDER BY id DESC
+            LIMIT 100
+        """, con)
+
+    finally:
+        con.close()
 
     if not events.empty:
 
@@ -1895,9 +1981,7 @@ def dashboard():
 
         st.info("Még nincs TP vagy SL esemény.")
 
-    # --------------------------------------------------------
     # GROQ CHAT
-    # --------------------------------------------------------
 
     st.header("💬 SALIGA AI – KÉRDEZZ A PIACRÓL")
 
@@ -2007,9 +2091,7 @@ def dashboard():
 
                 st.error("Groq hiba: " + error)
 
-    # --------------------------------------------------------
     # SYSTEM STATUS
-    # --------------------------------------------------------
 
     st.header("⚙️ RENDSZERÁLLAPOT")
 
