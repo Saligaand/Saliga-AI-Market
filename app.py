@@ -32,6 +32,7 @@
 # - Event Journal
 # - CSV Export
 # - API health monitoring
+# - No-API Macro Calendar + AI integration
 #
 # This system is for analysis and paper trading.
 # It does not guarantee profitable signals.
@@ -48,8 +49,9 @@ import hashlib
 import xml.etree.ElementTree as ET
 import os
 import math
+import calendar
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
 
 # ================================================================
@@ -205,6 +207,18 @@ def initialize_database():
             delta REAL,
             funding REAL,
             book_imbalance REAL
+        )
+    """)
+
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS macro_calendar (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_date TEXT,
+            time_utc TEXT,
+            currency TEXT,
+            event_name TEXT,
+            impact TEXT,
+            notes TEXT
         )
     """)
 
@@ -1859,19 +1873,260 @@ def calculate_news_hash(news):
 
 
 # ================================================================
-# MACRO STATUS
+# MACRO CALENDAR (NO API REQUIRED) & MACRO STATUS
 # ================================================================
 
+def _nth_weekday_of_month(year, month, weekday, n):
+    cal = calendar.monthcalendar(year, month)
+    days = [row[weekday] for row in cal if row[weekday] != 0]
+    if n > 0:
+        idx = n - 1
+        return date(year, month, days[idx]) if idx < len(days) else None
+    else:
+        idx = n
+        return date(year, month, days[idx]) if abs(idx) <= len(days) else None
+
+
+def _generate_rule_based_macro_events(start_date, end_date):
+    events = []
+    cur_year, cur_month = start_date.year, start_date.month
+    end_year, end_month = end_date.year, end_date.month
+
+    while (cur_year, cur_month) <= (end_year, end_month):
+        # 1. US Non-Farm Payrolls (NFP): 1st Friday of month, 13:30 UTC
+        nfp_day = _nth_weekday_of_month(cur_year, cur_month, calendar.FRIDAY, 1)
+        if nfp_day:
+            events.append({
+                "id": None,
+                "date": nfp_day.isoformat(),
+                "time_utc": "13:30",
+                "currency": "USD",
+                "event": "US Non-Farm Payrolls (NFP) & Unemployment",
+                "impact": "HIGH",
+                "source": "RULE_BASED",
+                "notes": "1st Friday of month (12:30/13:30 UTC depending on DST)"
+            })
+
+        # 2. US CPI: typically 2nd week (around 10th-14th, Tuesday/Wednesday/Thursday), 13:30 UTC
+        cpi_candidate = date(cur_year, cur_month, 12)
+        while cpi_candidate.weekday() >= 5:
+            cpi_candidate += timedelta(days=1)
+        events.append({
+            "id": None,
+            "date": cpi_candidate.isoformat(),
+            "time_utc": "13:30",
+            "currency": "USD",
+            "event": "US CPI Inflation (Est. Window)",
+            "impact": "HIGH",
+            "source": "RULE_BASED",
+            "notes": "Typical mid-month US CPI release window"
+        })
+
+        # 3. FOMC Rate Decision: 8 scheduled meetings per year (Jan, Mar, May, Jun, Jul, Sep, Nov, Dec)
+        if cur_month in (1, 3, 5, 6, 7, 9, 11, 12):
+            fomc_day = _nth_weekday_of_month(cur_year, cur_month, calendar.WEDNESDAY, 3)
+            if fomc_day:
+                events.append({
+                    "id": None,
+                    "date": fomc_day.isoformat(),
+                    "time_utc": "19:00",
+                    "currency": "USD",
+                    "event": "FOMC Interest Rate Decision & Press Conf. (Est.)",
+                    "impact": "HIGH",
+                    "source": "RULE_BASED",
+                    "notes": "Scheduled FOMC window (18:00/19:00 UTC)"
+                })
+
+        # 4. US Core PCE Price Index: last Friday of month, 13:30 UTC
+        pce_day = _nth_weekday_of_month(cur_year, cur_month, calendar.FRIDAY, -1)
+        if pce_day:
+            events.append({
+                "id": None,
+                "date": pce_day.isoformat(),
+                "time_utc": "13:30",
+                "currency": "USD",
+                "event": "US Core PCE Price Index",
+                "impact": "HIGH",
+                "source": "RULE_BASED",
+                "notes": "Last Friday of month Fed-preferred inflation gauge"
+            })
+
+        # 5. ECB Interest Rate Decision: typically Thursday of 2nd/3rd week in key months
+        if cur_month in (1, 3, 4, 6, 7, 9, 10, 12):
+            ecb_day = _nth_weekday_of_month(cur_year, cur_month, calendar.THURSDAY, 2)
+            if ecb_day:
+                events.append({
+                    "id": None,
+                    "date": ecb_day.isoformat(),
+                    "time_utc": "12:15",
+                    "currency": "EUR",
+                    "event": "ECB Interest Rate Decision (Est.)",
+                    "impact": "MEDIUM",
+                    "source": "RULE_BASED",
+                    "notes": "ECB governing council rate announcement"
+                })
+
+        # 6. US GDP (Advance / Second / Third): last week of Jan, Apr, Jul, Oct (approx 28th weekday)
+        if cur_month in (1, 4, 7, 10):
+            last_d = calendar.monthrange(cur_year, cur_month)[1]
+            gdp_day = date(cur_year, cur_month, min(28, last_d))
+            while gdp_day.weekday() >= 5:
+                gdp_day -= timedelta(days=1)
+            events.append({
+                "id": None,
+                "date": gdp_day.isoformat(),
+                "time_utc": "13:30",
+                "currency": "USD",
+                "event": "US GDP Advance Release (Est.)",
+                "impact": "MEDIUM",
+                "source": "RULE_BASED",
+                "notes": "Quarterly US GDP release window"
+            })
+
+        # Advance month
+        if cur_month == 12:
+            cur_year += 1
+            cur_month = 1
+        else:
+            cur_month += 1
+
+    filtered = [
+        e for e in events
+        if start_date.isoformat() <= e["date"] <= end_date.isoformat()
+    ]
+    return filtered
+
+
+def add_macro_event(event_date, time_utc, currency, event_name, impact="HIGH", notes=""):
+    connection = get_connection()
+    connection.execute(
+        """
+        INSERT INTO macro_calendar
+        (event_date, time_utc, currency, event_name, impact, notes)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(event_date),
+            str(time_utc),
+            str(currency).upper(),
+            str(event_name),
+            str(impact).upper(),
+            str(notes)
+        )
+    )
+    connection.commit()
+    connection.close()
+    add_event("MACRO CALENDAR", f"Added event: {event_date} {time_utc} UTC | {currency} {event_name} ({impact})")
+
+
+def delete_macro_event(event_id):
+    connection = get_connection()
+    connection.execute(
+        "DELETE FROM macro_calendar WHERE id = ?",
+        (int(event_id),)
+    )
+    connection.commit()
+    connection.close()
+    add_event("MACRO CALENDAR", f"Deleted custom event ID #{event_id}")
+
+
+def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
+    now = now_utc()
+    start_dt = (now - timedelta(days=lookback_days)).date()
+    end_dt = (now + timedelta(days=lookahead_days)).date()
+
+    combined = _generate_rule_based_macro_events(start_dt, end_dt)
+
+    custom_rows = database_read(
+        """
+        SELECT id, event_date, time_utc, currency, event_name, impact, notes
+        FROM macro_calendar
+        WHERE event_date BETWEEN ? AND ?
+        ORDER BY event_date ASC, time_utc ASC
+        """,
+        (start_dt.isoformat(), end_dt.isoformat())
+    )
+
+    if not custom_rows.empty:
+        for _, r in custom_rows.iterrows():
+            combined.append({
+                "id": int(r["id"]),
+                "date": str(r["event_date"]),
+                "time_utc": str(r["time_utc"]),
+                "currency": str(r["currency"]),
+                "event": str(r["event_name"]),
+                "impact": str(r["impact"]),
+                "source": "CUSTOM_DB",
+                "notes": str(r["notes"] or "")
+            })
+
+    enriched = []
+    next_high_impact = None
+    min_abs_hours = None
+
+    for ev in combined:
+        ev_date_str = ev["date"]
+        ev_time_str = (ev.get("time_utc") or "00:00").strip()
+        try:
+            hh, mm = [int(x) for x in ev_time_str.split(":")[:2]]
+        except Exception:
+            hh, mm = 0, 0
+
+        try:
+            y, m, d = [int(x) for x in ev_date_str.split("-")[:3]]
+            ev_dt = datetime(y, m, d, hh, mm, tzinfo=timezone.utc)
+        except Exception:
+            ev_dt = now
+
+        hours_until = (ev_dt - now).total_seconds() / 3600.0
+        abs_h = abs(hours_until)
+
+        if min_abs_hours is None or abs_h < min_abs_hours:
+            min_abs_hours = abs_h
+
+        if hours_until >= -1.0 and ev.get("impact") == "HIGH" and next_high_impact is None:
+            next_high_impact = {
+                **ev,
+                "hours_until": round(hours_until, 2)
+            }
+
+        enriched.append({
+            **ev,
+            "hours_until": round(hours_until, 2)
+        })
+
+    enriched.sort(key=lambda x: (x["date"], x["time_utc"]))
+
+    if min_abs_hours is not None and min_abs_hours <= 2.0:
+        risk_window = "IMMINENT / ACTIVE EVENT WINDOW (<=2h)"
+    elif min_abs_hours is not None and min_abs_hours <= 24.0:
+        risk_window = "ELEVATED MACRO DAY (<=24h)"
+    else:
+        risk_window = "NORMAL MACRO ENVIRONMENT"
+
+    return {
+        "mode": "NO_API_LOCAL_AND_RULE_ENGINE",
+        "risk_window": risk_window,
+        "next_high_impact": next_high_impact,
+        "events": enriched
+    }
+
+
 def get_macro_status():
+
+    macro_cal = get_macro_calendar_data()
 
     return {
         "available": False,
         "dxy": None,
         "us10y": None,
         "fed": None,
+        "calendar_available": True,
+        "calendar_risk_window": macro_cal["risk_window"],
+        "next_high_impact": macro_cal["next_high_impact"],
         "message": (
-            "No verified macro data provider configured. "
-            "Macro indicators are excluded from the signal score."
+            "No verified live spot macro feed configured. "
+            "No-API rule & local macro calendar is active and included in AI analysis."
         )
     }
 
@@ -1890,6 +2145,7 @@ def call_groq(payload):
     system_prompt = (
         "You are SALIGA AI PRO 31.0, an analytical BTC market intelligence engine. "
         "You MUST output valid JSON only. Do not include markdown code blocks like ```json or any conversational text. "
+        "Incorporate the provided macro_calendar events (upcoming/recent macro dates, impact levels, hours_until, and risk_window) into your assessment, especially in news_impact and risk. "
         "Your response must match this exact JSON structure:\n"
         "{\n"
         ' "direction": "LONG",\n'
@@ -1931,7 +2187,7 @@ def call_groq(payload):
     }
 
     response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
+        "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
         headers={
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json"
@@ -2698,6 +2954,7 @@ entry = calculate_entry_quality(
 )
 
 macro = get_macro_status()
+macro_calendar = get_macro_calendar_data()
 
 latest = main_df.iloc[-1]
 
@@ -2776,6 +3033,12 @@ market_payload = {
     },
 
     "macro": macro,
+
+    "macro_calendar": {
+        "risk_window": macro_calendar["risk_window"],
+        "next_high_impact": macro_calendar["next_high_impact"],
+        "upcoming_events": macro_calendar["events"][:12]
+    },
 
     "risk_levels": risk_levels
 }
@@ -3329,16 +3592,77 @@ if news_errors:
         st.write(f"- {error}")
 
 # ================================================================
-# MACRO
+# MACRO & MACRO CALENDAR (NO API)
 # ================================================================
 
 st.divider()
 
-st.subheader("Macro Intelligence")
+st.subheader("Macro Intelligence & Macro Calendar (No API)")
 
 st.warning(
     macro["message"]
 )
+
+mc1, mc2 = st.columns(2)
+
+mc1.metric(
+    "Macro Risk Window",
+    macro_calendar["risk_window"]
+)
+
+next_hi = macro_calendar["next_high_impact"]
+
+mc2.metric(
+    "Next High-Impact Event",
+    (
+        f"{next_hi['currency']} {next_hi['event']} ({next_hi['hours_until']}h)"
+        if next_hi else "None in window"
+    )
+)
+
+if macro_calendar["events"]:
+
+    st.dataframe(
+        pd.DataFrame(macro_calendar["events"]),
+        use_container_width=True,
+        hide_index=True
+    )
+
+with st.expander("Add / Manage Custom Macro Events (Saved to SQLite, No API)"):
+
+    with st.form("add_macro_event_form", clear_on_submit=True):
+        f_col1, f_col2, f_col3, f_col4 = st.columns(4)
+        ev_d = f_col1.date_input("Date (UTC)", value=now_utc().date())
+        ev_t = f_col2.text_input("Time UTC (HH:MM)", value="13:30")
+        ev_c = f_col3.selectbox("Currency", ["USD", "EUR", "BTC", "GLOBAL"])
+        ev_i = f_col4.selectbox("Impact", ["HIGH", "MEDIUM", "LOW"])
+        ev_name = st.text_input("Event Name", placeholder="e.g. Fed Chair Speech / ETF Flow / CPI")
+        ev_notes = st.text_input("Notes", placeholder="Optional note")
+        submitted_macro = st.form_submit_button("Add Macro Event")
+
+        if submitted_macro and ev_name.strip():
+            add_macro_event(
+                ev_d.isoformat(),
+                ev_t.strip(),
+                ev_c,
+                ev_name.strip(),
+                ev_i,
+                ev_notes.strip()
+            )
+            st.rerun()
+
+    custom_db_df = database_read(
+        "SELECT id, event_date, time_utc, currency, event_name, impact, notes FROM macro_calendar ORDER BY id DESC"
+    )
+
+    if not custom_db_df.empty:
+        del_id = st.selectbox(
+            "Delete custom event by ID",
+            options=custom_db_df["id"].tolist()
+        )
+        if st.button("Delete Selected Event"):
+            delete_macro_event(del_id)
+            st.rerun()
 
 # ================================================================
 # GROQ AI
