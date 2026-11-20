@@ -1,5 +1,5 @@
 # ================================================================
-# SALIGA AI PRO 31.0
+# AI PRO by Sali
 # ULTIMATE BTC INTELLIGENCE ENGINE (FIXED)
 #
 # BTC ONLY | OKX | GROQ AI
