@@ -32,7 +32,7 @@
 # - Event Journal
 # - CSV Export
 # - API health monitoring
-# - Enhanced No-API Macro Calendar + Directional Macro Engine
+# - Enhanced No-API Macro Calendar + Directional Macro Engine (HIGH + MEDIUM + LOW)
 #
 # This system is for analysis and paper trading.
 # It does not guarantee profitable signals.
@@ -1702,8 +1702,11 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
 
     enriched = []
     next_high_impact = None
+    next_minor_impact = None
     min_abs_hours = None
+    min_any_hours = None
     imminent_high_impact = None
+    imminent_medium_impact = None
 
     for ev in combined:
         ev_date_str = ev["date"]
@@ -1721,23 +1724,40 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
 
         hours_until = (ev_dt - now).total_seconds() / 3600.0
         abs_h = abs(hours_until)
+        imp = str(ev.get("impact", "LOW")).upper()
 
-        if ev.get("impact") == "HIGH":
+        if min_any_hours is None or abs_h < min_any_hours:
+            min_any_hours = abs_h
+
+        if imp == "HIGH":
             if min_abs_hours is None or abs_h < min_abs_hours:
                 min_abs_hours = abs_h
 
-        if hours_until >= -1.0 and ev.get("impact") == "HIGH" and next_high_impact is None:
-            next_high_impact = {
-                **ev,
-                "hours_until": round(hours_until, 2)
-            }
-
-        if abs_h <= 2.0 and ev.get("impact") == "HIGH":
-            if imminent_high_impact is None or abs_h < abs(imminent_high_impact["hours_until"]):
-                imminent_high_impact = {
+            if hours_until >= -1.0 and next_high_impact is None:
+                next_high_impact = {
                     **ev,
                     "hours_until": round(hours_until, 2)
                 }
+
+            if abs_h <= 2.0:
+                if imminent_high_impact is None or abs_h < abs(imminent_high_impact["hours_until"]):
+                    imminent_high_impact = {
+                        **ev,
+                        "hours_until": round(hours_until, 2)
+                    }
+        else:
+            if hours_until >= -1.0 and next_minor_impact is None:
+                next_minor_impact = {
+                    **ev,
+                    "hours_until": round(hours_until, 2)
+                }
+
+            if imp == "MEDIUM" and abs_h <= 2.0:
+                if imminent_medium_impact is None or abs_h < abs(imminent_medium_impact["hours_until"]):
+                    imminent_medium_impact = {
+                        **ev,
+                        "hours_until": round(hours_until, 2)
+                    }
 
         enriched.append({
             **ev,
@@ -1750,6 +1770,8 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
         risk_window = "IMMINENT / ACTIVE EVENT WINDOW (<=2h)"
     elif min_abs_hours is not None and min_abs_hours <= 24.0:
         risk_window = "ELEVATED MACRO DAY (<=24h)"
+    elif imminent_medium_impact is not None or (min_any_hours is not None and min_any_hours <= 12.0):
+        risk_window = "MINOR / MEDIUM MACRO ACTIVE (<=12h)"
     else:
         risk_window = "NORMAL MACRO ENVIRONMENT"
 
@@ -1757,23 +1779,35 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
         "mode": "NO_API_LOCAL_AND_RULE_ENGINE",
         "risk_window": risk_window,
         "next_high_impact": next_high_impact,
+        "next_minor_impact": next_minor_impact,
         "imminent_high_impact": imminent_high_impact,
+        "imminent_medium_impact": imminent_medium_impact,
         "min_abs_hours": round(min_abs_hours, 2) if min_abs_hours is not None else None,
+        "min_any_hours": round(min_any_hours, 2) if min_any_hours is not None else None,
         "events": enriched
     }
+
+def _lean_to_signed_tilt(lean):
+    l = str(lean or "NEUTRAL").upper()
+    if l in ("HAWKISH_RISK", "BEARISH_BTC"):
+        return -1.0
+    if l in ("DOVISH_RELIEF", "BULLISH_BTC"):
+        return 1.0
+    return 0.0
 
 def analyze_macro_signal(macro_calendar, news_analysis=None, funding=None, directional_weight=8.0):
     risk_window = macro_calendar.get("risk_window", "NORMAL MACRO ENVIRONMENT")
     next_hi = macro_calendar.get("next_high_impact")
+    next_minor = macro_calendar.get("next_minor_impact")
     imminent_hi = macro_calendar.get("imminent_high_impact")
+    imminent_med = macro_calendar.get("imminent_medium_impact")
     min_h = macro_calendar.get("min_abs_hours")
 
-    # Magnitude penalty near major events
     score_adjustment = 0.0
     block_new_trade = False
     status = "CLEAR"
     bias = "NEUTRAL"
-    directional_score = 0.0  # > 0 favors LONG, < 0 favors SHORT
+    directional_score = 0.0
     reasons = []
 
     if imminent_hi is not None and abs(safe_float(imminent_hi.get("hours_until"), 999)) <= 1.0:
@@ -1799,18 +1833,36 @@ def analyze_macro_signal(macro_calendar, news_analysis=None, funding=None, direc
                 f"Upcoming HIGH event in {next_hi.get('hours_until')}h: "
                 f"{next_hi.get('currency')} {next_hi.get('event')}."
             )
+    elif imminent_med is not None:
+        status = "MINOR MACRO WATCH - MEDIUM EVENT (<=2h)"
+        score_adjustment = -4.0
+        bias = "CAUTIOUS (MINOR MACRO)"
+        reasons.append(
+            f"MEDIUM event ({imminent_med.get('currency')} {imminent_med.get('event')}) "
+            f"within 2h ({imminent_med.get('hours_until')}h); mild caution without trade block."
+        )
     else:
         reasons.append("No immediate high-impact macro event within 24h.")
 
-    # Directional tilt from macro event lean + news sentiment + funding crowding
+    # Directional tilt from HIGH + MEDIUM + LOW events (within 36h)
     if next_hi and abs(safe_float(next_hi.get("hours_until"), 999)) <= 36.0:
-        lean = str(next_hi.get("macro_lean", "NEUTRAL")).upper()
-        if lean in ("HAWKISH_RISK", "BEARISH_BTC"):
-            directional_score -= 0.45 * directional_weight
-            reasons.append("Upcoming inflation/hawkish catalyst adds downward/cautious tilt.")
-        elif lean in ("DOVISH_RELIEF", "BULLISH_BTC"):
-            directional_score += 0.45 * directional_weight
-            reasons.append("Macro catalyst leans supportive/dovish.")
+        hi_sign = _lean_to_signed_tilt(next_hi.get("macro_lean"))
+        if hi_sign != 0.0:
+            directional_score += hi_sign * 0.45 * directional_weight
+            reasons.append(f"HIGH macro lean ({next_hi.get('macro_lean')}) applied.")
+
+    if next_minor and abs(safe_float(next_minor.get("hours_until"), 999)) <= 36.0:
+        minor_imp = str(next_minor.get("impact", "LOW")).upper()
+        minor_sign = _lean_to_signed_tilt(next_minor.get("macro_lean"))
+        minor_mult = 0.22 if minor_imp == "MEDIUM" else 0.10
+        if minor_sign != 0.0:
+            directional_score += minor_sign * minor_mult * directional_weight
+            reasons.append(
+                f"Minor ({minor_imp}) event {next_minor.get('event')} ({next_minor.get('macro_lean')}) "
+                f"adds {minor_sign * minor_mult * directional_weight:+.2f} tilt."
+            )
+        elif minor_imp == "MEDIUM":
+            reasons.append(f"Tracking upcoming {minor_imp} event: {next_minor.get('event')} ({next_minor.get('hours_until')}h).")
 
     if isinstance(news_analysis, dict):
         ns = safe_float(news_analysis.get("score", 0.0))
@@ -1843,6 +1895,7 @@ def analyze_macro_signal(macro_calendar, news_analysis=None, funding=None, direc
         "directional_score": directional_score,
         "block_new_trade": block_new_trade,
         "next_high_impact": next_hi,
+        "next_minor_impact": next_minor,
         "reason": " ".join(reasons)
     }
 
@@ -1866,9 +1919,10 @@ def get_macro_status(macro_cal=None, macro_signal=None):
         "macro_directional_score": macro_signal.get("directional_score", 0.0),
         "macro_reason": macro_signal["reason"],
         "next_high_impact": macro_cal["next_high_impact"],
+        "next_minor_impact": macro_cal.get("next_minor_impact"),
         "message": (
             "No verified live spot macro feed configured. "
-            "Enhanced No-API rule & local macro calendar + news/funding macro tilt is active."
+            "No-API HIGH/MEDIUM/LOW macro calendar + news/funding macro tilt is active."
         )
     }
 
@@ -2013,10 +2067,8 @@ def calculate_entry_quality(
         macro_signal.get("directional_score", 0.0) if isinstance(macro_signal, dict) else 0.0
     )
 
-    # 1) Directional macro tilt
     macro_component = macro_dir_score
 
-    # 2) Risk-window dampening toward 0 during high-risk macro windows
     if macro_adj < 0:
         projected = raw_score + macro_component
         if projected > 0:
@@ -2311,7 +2363,7 @@ def call_groq(payload):
     system_prompt = (
         "You are SALIGA AI PRO 31.0, an analytical BTC market intelligence engine. "
         "You MUST output valid JSON only. Do not include markdown code blocks like ```json or any conversational text. "
-        "Carefully analyze macro_signal, macro, and macro_calendar (upcoming/recent macro dates, impact levels, macro_lean, hours_until, risk_window) "
+        "Carefully analyze macro_signal, macro, and macro_calendar (upcoming/recent macro dates, HIGH/MEDIUM/LOW impact levels, macro_lean, hours_until, risk_window) "
         "and explicitly evaluate how macro conditions affect BTC direction, signal quality, and risk in macro_analysis, news_impact, and risk. "
         "If an imminent high-impact macro event is within 1 hour, lean toward WAIT or flag conflict=true unless a clear post-event move is established. "
         "Your response must match this exact JSON structure:\n"
@@ -3251,7 +3303,9 @@ market_payload = {
     "macro_calendar": {
         "risk_window": macro_calendar["risk_window"],
         "next_high_impact": macro_calendar["next_high_impact"],
+        "next_minor_impact": macro_calendar.get("next_minor_impact"),
         "imminent_high_impact": macro_calendar["imminent_high_impact"],
+        "imminent_medium_impact": macro_calendar.get("imminent_medium_impact"),
         "upcoming_events": macro_calendar["events"][:15]
     },
 
@@ -3854,6 +3908,7 @@ mc2.metric(
 )
 
 next_hi = macro_calendar["next_high_impact"]
+next_min = macro_calendar.get("next_minor_impact")
 
 mc3.metric(
     "Next High-Impact Event",
@@ -3864,9 +3919,14 @@ mc3.metric(
 )
 
 mc4.metric(
-    "Macro Directional Tilt",
-    f"{macro_signal['directional_score']:+.2f}"
+    "Next Medium/Low Event",
+    (
+        f"[{next_min['impact']}] {next_min['currency']} {next_min['event']} ({next_min['hours_until']}h)"
+        if next_min else "None in window"
+    )
 )
+
+st.write(f"**Macro directional tilt:** {macro_signal['directional_score']:+.2f}")
 
 st.write(f"**Macro signal note:** {macro_signal['reason']}")
 
