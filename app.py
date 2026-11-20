@@ -1,6 +1,6 @@
 # ================================================================
 # AI PRO by Sali
-# ULTIMATE BTC INTELLIGENCE ENGINE (FIXED + MACRO SIGNAL)
+# ULTIMATE BTC INTELLIGENCE ENGINE (FIXED + ENHANCED MACRO)
 #
 # BTC ONLY | OKX | GROQ AI
 # NO EMA | NO SMA
@@ -22,7 +22,7 @@
 # - Divergence Detection
 # - Historical Pattern Analysis
 # - News Intelligence
-# - Groq AI combined analysis (incl. Macro Analysis)
+# - Groq AI combined analysis (incl. Enhanced Macro Analysis)
 # - AI conflict & Macro gate
 # - Entry Quality Score & Unified Signal
 # - Risk Management
@@ -32,7 +32,7 @@
 # - Event Journal
 # - CSV Export
 # - API health monitoring
-# - No-API Macro Calendar + Signal & AI integration
+# - Enhanced No-API Macro Calendar + Directional Macro Engine
 #
 # This system is for analysis and paper trading.
 # It does not guarantee profitable signals.
@@ -127,7 +127,6 @@ def load_secret(name, default=""):
 
     return os.getenv(name, default)
 
-
 GROQ_API_KEY = load_secret("GROQ_API_KEY", "")
 
 GROQ_MODEL = load_secret(
@@ -149,7 +148,6 @@ def get_connection():
 
     return connection
 
-
 def _ensure_column(connection, table_name, column_name, column_def):
     cols = [
         row["name"]
@@ -159,7 +157,6 @@ def _ensure_column(connection, table_name, column_name, column_def):
         connection.execute(
             f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}"
         )
-
 
 def initialize_database():
 
@@ -236,13 +233,15 @@ def initialize_database():
             currency TEXT,
             event_name TEXT,
             impact TEXT,
+            macro_lean TEXT DEFAULT 'NEUTRAL',
             notes TEXT
         )
     """)
 
+    _ensure_column(connection, "macro_calendar", "macro_lean", "TEXT DEFAULT 'NEUTRAL'")
+
     connection.commit()
     connection.close()
-
 
 initialize_database()
 
@@ -291,6 +290,14 @@ ai_enabled = st.sidebar.toggle(
 macro_gate_enabled = st.sidebar.toggle(
     "Macro event gate (<=1h HIGH)",
     value=True
+)
+
+macro_directional_weight = st.sidebar.slider(
+    "Macro directional influence",
+    0.0,
+    15.0,
+    8.0,
+    0.5
 )
 
 auto_refresh = st.sidebar.toggle(
@@ -362,12 +369,10 @@ slippage_percent = st.sidebar.number_input(
 def now_utc():
     return datetime.now(timezone.utc)
 
-
 def now_string():
     return now_utc().strftime(
         "%Y-%m-%d %H:%M:%S UTC"
     )
-
 
 def safe_float(value, default=0.0):
     try:
@@ -381,10 +386,8 @@ def safe_float(value, default=0.0):
     except Exception:
         return default
 
-
 def clamp(value, low, high):
     return max(low, min(high, value))
-
 
 def percentage_change(current, previous):
 
@@ -394,7 +397,6 @@ def percentage_change(current, previous):
     return (
         (current / previous) - 1
     ) * 100
-
 
 def add_event(category, message):
 
@@ -416,7 +418,6 @@ def add_event(category, message):
     connection.commit()
     connection.close()
 
-
 def database_read(query, params=()):
 
     connection = get_connection()
@@ -430,7 +431,6 @@ def database_read(query, params=()):
     connection.close()
 
     return result
-
 
 # ================================================================
 # OKX API
@@ -458,7 +458,6 @@ def okx_request(endpoint, params=None):
 
     return data.get("data", [])
 
-
 # ================================================================
 # MARKET DATA
 # ================================================================
@@ -484,7 +483,6 @@ def fetch_ticker():
         "volume24h": safe_float(item.get("vol24h")),
         "timestamp": item.get("ts")
     }
-
 
 def fetch_candles(bar, limit=300):
 
@@ -526,7 +524,6 @@ def fetch_candles(bar, limit=300):
 
     return df
 
-
 def fetch_open_interest():
 
     data = okx_request(
@@ -548,7 +545,6 @@ def fetch_open_interest():
         "timestamp": item.get("ts")
     }
 
-
 def fetch_funding():
 
     data = okx_request(
@@ -565,7 +561,6 @@ def fetch_funding():
         "funding": safe_float(item.get("fundingRate")),
         "next_funding": item.get("nextFundingTime")
     }
-
 
 def fetch_order_book():
 
@@ -625,7 +620,6 @@ def fetch_order_book():
         )
     }
 
-
 def fetch_recent_trades():
 
     data = okx_request(
@@ -648,7 +642,6 @@ def fetch_recent_trades():
         })
 
     return result
-
 
 # ================================================================
 # TECHNICAL ENGINE
@@ -683,7 +676,6 @@ def calculate_rsi(series, period=14):
         100 - 100 / (1 + rs)
     ).fillna(50)
 
-
 def calculate_atr(df, period=14):
 
     previous_close = df["close"].shift(1)
@@ -704,7 +696,6 @@ def calculate_atr(df, period=14):
         adjust=False,
         min_periods=period
     ).mean()
-
 
 def add_indicators(df):
 
@@ -745,7 +736,6 @@ def add_indicators(df):
         [np.inf, -np.inf],
         np.nan
     )
-
 
 # ================================================================
 # MARKET STRUCTURE
@@ -847,7 +837,6 @@ def market_structure(df):
         "resistance": resistance
     }
 
-
 # ================================================================
 # MARKET REGIME
 # ================================================================
@@ -918,7 +907,6 @@ def market_regime(df):
         "efficiency": efficiency
     }
 
-
 # ================================================================
 # DELTA ENGINE
 # ================================================================
@@ -979,7 +967,6 @@ def calculate_delta(trades):
         "classification": classification
     }
 
-
 # ================================================================
 # ORDER BOOK ENGINE
 # ================================================================
@@ -1024,7 +1011,6 @@ def analyze_order_book(book):
         "bid_wall": bid_wall,
         "ask_wall": ask_wall
     }
-
 
 # ================================================================
 # OPEN INTEREST ENGINE
@@ -1105,7 +1091,6 @@ def analyze_open_interest(oi):
         "classification": classification
     }
 
-
 # ================================================================
 # FUNDING ENGINE
 # ================================================================
@@ -1140,7 +1125,6 @@ def analyze_funding(funding):
         "rate": rate,
         "classification": classification
     }
-
 
 # ================================================================
 # LIQUIDITY ENGINE
@@ -1197,7 +1181,6 @@ def analyze_liquidity(df):
         "previous_low": previous_low
     }
 
-
 # ================================================================
 # BREAKOUT / RETEST
 # ================================================================
@@ -1243,7 +1226,6 @@ def analyze_retest(df):
         return "BEARISH BREAKOUT RETEST"
 
     return "NO CONFIRMED RETEST"
-
 
 # ================================================================
 # POSITION FLOW
@@ -1308,7 +1290,6 @@ def analyze_position_flow(oi, delta, structure):
 
     return events
 
-
 # ================================================================
 # DIVERGENCE ENGINE
 # ================================================================
@@ -1354,7 +1335,6 @@ def analyze_divergences(df, delta):
 
     return divergences
 
-
 # ================================================================
 # MULTI TIMEFRAME ENGINE
 # ================================================================
@@ -1388,7 +1368,6 @@ def analyze_timeframes(data):
         }
 
     return result
-
 
 # ================================================================
 # HISTORICAL PATTERN ENGINE
@@ -1493,9 +1472,8 @@ def analyze_historical_patterns(df):
         )
     }
 
-
 # ================================================================
-# MACRO CALENDAR (NO API REQUIRED) & MACRO SIGNAL ENGINE
+# ENHANCED MACRO CALENDAR (NO API REQUIRED) & DIRECTIONAL MACRO ENGINE
 # ================================================================
 
 def _nth_weekday_of_month(year, month, weekday, n):
@@ -1507,7 +1485,6 @@ def _nth_weekday_of_month(year, month, weekday, n):
     else:
         idx = n
         return date(year, month, days[idx]) if abs(idx) <= len(days) else None
-
 
 def _generate_rule_based_macro_events(start_date, end_date):
     events = []
@@ -1525,11 +1502,12 @@ def _generate_rule_based_macro_events(start_date, end_date):
                 "currency": "USD",
                 "event": "US Non-Farm Payrolls (NFP) & Unemployment",
                 "impact": "HIGH",
+                "macro_lean": "VOLATILITY_RISK",
                 "source": "RULE_BASED",
-                "notes": "1st Friday of month (12:30/13:30 UTC depending on DST)"
+                "notes": "1st Friday of month; strong labor data can lift yields/USD and pressure BTC"
             })
 
-        # 2. US CPI: typically mid-month weekday, 13:30 UTC
+        # 2. US CPI Inflation: mid-month weekday, 13:30 UTC
         cpi_candidate = date(cur_year, cur_month, 12)
         while cpi_candidate.weekday() >= 5:
             cpi_candidate += timedelta(days=1)
@@ -1540,11 +1518,28 @@ def _generate_rule_based_macro_events(start_date, end_date):
             "currency": "USD",
             "event": "US CPI Inflation (Est. Window)",
             "impact": "HIGH",
+            "macro_lean": "HAWKISH_RISK",
             "source": "RULE_BASED",
-            "notes": "Typical mid-month US CPI release window"
+            "notes": "Hot CPI -> hawkish Fed / risk-off pressure; cool CPI -> liquidity relief"
         })
 
-        # 3. FOMC Rate Decision: 8 scheduled meetings per year
+        # 3. US PPI Inflation: day after CPI window, 13:30 UTC
+        ppi_candidate = cpi_candidate + timedelta(days=1)
+        while ppi_candidate.weekday() >= 5:
+            ppi_candidate += timedelta(days=1)
+        events.append({
+            "id": None,
+            "date": ppi_candidate.isoformat(),
+            "time_utc": "13:30",
+            "currency": "USD",
+            "event": "US PPI Producer Inflation (Est. Window)",
+            "impact": "MEDIUM",
+            "macro_lean": "HAWKISH_RISK",
+            "source": "RULE_BASED",
+            "notes": "Wholesale inflation follow-through for PCE expectations"
+        })
+
+        # 4. FOMC Rate Decision: 8 scheduled meetings per year
         if cur_month in (1, 3, 5, 6, 7, 9, 11, 12):
             fomc_day = _nth_weekday_of_month(cur_year, cur_month, calendar.WEDNESDAY, 3)
             if fomc_day:
@@ -1555,11 +1550,12 @@ def _generate_rule_based_macro_events(start_date, end_date):
                     "currency": "USD",
                     "event": "FOMC Interest Rate Decision & Press Conf. (Est.)",
                     "impact": "HIGH",
+                    "macro_lean": "VOLATILITY_RISK",
                     "source": "RULE_BASED",
-                    "notes": "Scheduled FOMC window (18:00/19:00 UTC)"
+                    "notes": "Fed rate path, dot plot & Powell tone drive broad liquidity regime"
                 })
 
-        # 4. US Core PCE Price Index: last Friday of month, 13:30 UTC
+        # 5. US Core PCE Price Index: last Friday of month, 13:30 UTC
         pce_day = _nth_weekday_of_month(cur_year, cur_month, calendar.FRIDAY, -1)
         if pce_day:
             events.append({
@@ -1569,11 +1565,12 @@ def _generate_rule_based_macro_events(start_date, end_date):
                 "currency": "USD",
                 "event": "US Core PCE Price Index",
                 "impact": "HIGH",
+                "macro_lean": "HAWKISH_RISK",
                 "source": "RULE_BASED",
-                "notes": "Last Friday of month Fed-preferred inflation gauge"
+                "notes": "Fed-preferred inflation gauge; major macro catalyst"
             })
 
-        # 5. ECB Interest Rate Decision
+        # 6. ECB Interest Rate Decision
         if cur_month in (1, 3, 4, 6, 7, 9, 10, 12):
             ecb_day = _nth_weekday_of_month(cur_year, cur_month, calendar.THURSDAY, 2)
             if ecb_day:
@@ -1584,11 +1581,12 @@ def _generate_rule_based_macro_events(start_date, end_date):
                     "currency": "EUR",
                     "event": "ECB Interest Rate Decision (Est.)",
                     "impact": "MEDIUM",
+                    "macro_lean": "NEUTRAL",
                     "source": "RULE_BASED",
-                    "notes": "ECB governing council rate announcement"
+                    "notes": "ECB policy stance & EUR/USD cross-asset spillover"
                 })
 
-        # 6. US GDP
+        # 7. US GDP
         if cur_month in (1, 4, 7, 10):
             last_d = calendar.monthrange(cur_year, cur_month)[1]
             gdp_day = date(cur_year, cur_month, min(28, last_d))
@@ -1601,9 +1599,27 @@ def _generate_rule_based_macro_events(start_date, end_date):
                 "currency": "USD",
                 "event": "US GDP Advance Release (Est.)",
                 "impact": "MEDIUM",
+                "macro_lean": "NEUTRAL",
                 "source": "RULE_BASED",
-                "notes": "Quarterly US GDP release window"
+                "notes": "Growth vs. recessionary risk assessment"
             })
+
+        # 8. Weekly US Initial Jobless Claims (Thursdays, 13:30 UTC)
+        d_iter = start_date
+        while d_iter <= end_date:
+            if d_iter.year == cur_year and d_iter.month == cur_month and d_iter.weekday() == calendar.THURSDAY:
+                events.append({
+                    "id": None,
+                    "date": d_iter.isoformat(),
+                    "time_utc": "13:30",
+                    "currency": "USD",
+                    "event": "US Initial Jobless Claims (Weekly)",
+                    "impact": "LOW",
+                    "macro_lean": "NEUTRAL",
+                    "source": "RULE_BASED",
+                    "notes": "Weekly US labor market pulse"
+                })
+            d_iter += timedelta(days=1)
 
         if cur_month == 12:
             cur_year += 1
@@ -1611,20 +1627,23 @@ def _generate_rule_based_macro_events(start_date, end_date):
         else:
             cur_month += 1
 
-    filtered = [
-        e for e in events
-        if start_date.isoformat() <= e["date"] <= end_date.isoformat()
-    ]
+    seen = set()
+    filtered = []
+    for e in events:
+        if start_date.isoformat() <= e["date"] <= end_date.isoformat():
+            key = (e["date"], e["time_utc"], e["event"])
+            if key not in seen:
+                seen.add(key)
+                filtered.append(e)
     return filtered
 
-
-def add_macro_event(event_date, time_utc, currency, event_name, impact="HIGH", notes=""):
+def add_macro_event(event_date, time_utc, currency, event_name, impact="HIGH", macro_lean="NEUTRAL", notes=""):
     connection = get_connection()
     connection.execute(
         """
         INSERT INTO macro_calendar
-        (event_date, time_utc, currency, event_name, impact, notes)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (event_date, time_utc, currency, event_name, impact, macro_lean, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(event_date),
@@ -1632,13 +1651,13 @@ def add_macro_event(event_date, time_utc, currency, event_name, impact="HIGH", n
             str(currency).upper(),
             str(event_name),
             str(impact).upper(),
+            str(macro_lean).upper(),
             str(notes)
         )
     )
     connection.commit()
     connection.close()
-    add_event("MACRO CALENDAR", f"Added event: {event_date} {time_utc} UTC | {currency} {event_name} ({impact})")
-
+    add_event("MACRO CALENDAR", f"Added event: {event_date} {time_utc} UTC | {currency} {event_name} ({impact}, {macro_lean})")
 
 def delete_macro_event(event_id):
     connection = get_connection()
@@ -1650,7 +1669,6 @@ def delete_macro_event(event_id):
     connection.close()
     add_event("MACRO CALENDAR", f"Deleted custom event ID #{event_id}")
 
-
 def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
     now = now_utc()
     start_dt = (now - timedelta(days=lookback_days)).date()
@@ -1660,7 +1678,7 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
 
     custom_rows = database_read(
         """
-        SELECT id, event_date, time_utc, currency, event_name, impact, notes
+        SELECT id, event_date, time_utc, currency, event_name, impact, macro_lean, notes
         FROM macro_calendar
         WHERE event_date BETWEEN ? AND ?
         ORDER BY event_date ASC, time_utc ASC
@@ -1677,6 +1695,7 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
                 "currency": str(r["currency"]),
                 "event": str(r["event_name"]),
                 "impact": str(r["impact"]),
+                "macro_lean": str(r["macro_lean"] or "NEUTRAL"),
                 "source": "CUSTOM_DB",
                 "notes": str(r["notes"] or "")
             })
@@ -1703,8 +1722,9 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
         hours_until = (ev_dt - now).total_seconds() / 3600.0
         abs_h = abs(hours_until)
 
-        if min_abs_hours is None or abs_h < min_abs_hours:
-            min_abs_hours = abs_h
+        if ev.get("impact") == "HIGH":
+            if min_abs_hours is None or abs_h < min_abs_hours:
+                min_abs_hours = abs_h
 
         if hours_until >= -1.0 and ev.get("impact") == "HIGH" and next_high_impact is None:
             next_high_impact = {
@@ -1742,55 +1762,89 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
         "events": enriched
     }
 
-
-def analyze_macro_signal(macro_calendar):
+def analyze_macro_signal(macro_calendar, news_analysis=None, funding=None, directional_weight=8.0):
     risk_window = macro_calendar.get("risk_window", "NORMAL MACRO ENVIRONMENT")
     next_hi = macro_calendar.get("next_high_impact")
     imminent_hi = macro_calendar.get("imminent_high_impact")
     min_h = macro_calendar.get("min_abs_hours")
 
-    # Pont-módosító a szignálhoz (negatív = óvatosság/kockázatcsökkentés)
+    # Magnitude penalty near major events
     score_adjustment = 0.0
     block_new_trade = False
     status = "CLEAR"
     bias = "NEUTRAL"
-    reason = "No immediate high-impact macro event; macro environment is normal."
+    directional_score = 0.0  # > 0 favors LONG, < 0 favors SHORT
+    reasons = []
 
     if imminent_hi is not None and abs(safe_float(imminent_hi.get("hours_until"), 999)) <= 1.0:
         status = "HIGH RISK - IMMINENT HIGH-IMPACT EVENT (<=1h)"
         score_adjustment = -25.0
         block_new_trade = True
         bias = "DEFENSIVE / NO NEW ENTRY"
-        reason = (
-            f"High-impact event ({imminent_hi.get('currency')} {imminent_hi.get('event')}) "
-            f"is within 1h ({imminent_hi.get('hours_until')}h)."
+        reasons.append(
+            f"HIGH impact event ({imminent_hi.get('currency')} {imminent_hi.get('event')}) "
+            f"within 1h ({imminent_hi.get('hours_until')}h)."
         )
     elif risk_window.startswith("IMMINENT"):
         status = "HIGH RISK - EVENT WINDOW (<=2h)"
         score_adjustment = -15.0
         bias = "DEFENSIVE"
-        reason = f"Macro event within 2h ({min_h}h). Expect volatility spikes and liquidity sweeps."
+        reasons.append(f"HIGH impact macro window within 2h ({min_h}h); spike & sweep risk.")
     elif risk_window.startswith("ELEVATED"):
         status = "ELEVATED MACRO (<=24h)"
         score_adjustment = -5.0
         bias = "CAUTIOUS"
         if next_hi:
-            reason = (
-                f"Upcoming HIGH impact event in {next_hi.get('hours_until')}h: "
+            reasons.append(
+                f"Upcoming HIGH event in {next_hi.get('hours_until')}h: "
                 f"{next_hi.get('currency')} {next_hi.get('event')}."
             )
-        else:
-            reason = f"Macro event within 24h ({min_h}h)."
+    else:
+        reasons.append("No immediate high-impact macro event within 24h.")
+
+    # Directional tilt from macro event lean + news sentiment + funding crowding
+    if next_hi and abs(safe_float(next_hi.get("hours_until"), 999)) <= 36.0:
+        lean = str(next_hi.get("macro_lean", "NEUTRAL")).upper()
+        if lean in ("HAWKISH_RISK", "BEARISH_BTC"):
+            directional_score -= 0.45 * directional_weight
+            reasons.append("Upcoming inflation/hawkish catalyst adds downward/cautious tilt.")
+        elif lean in ("DOVISH_RELIEF", "BULLISH_BTC"):
+            directional_score += 0.45 * directional_weight
+            reasons.append("Macro catalyst leans supportive/dovish.")
+
+    if isinstance(news_analysis, dict):
+        ns = safe_float(news_analysis.get("score", 0.0))
+        if abs(ns) > 0.2:
+            directional_score += clamp(ns * 0.35 * directional_weight, -0.45 * directional_weight, 0.45 * directional_weight)
+            reasons.append(f"News sentiment ({news_analysis.get('classification')}, {ns:+.2f}) factored into macro tilt.")
+
+    if isinstance(funding, dict) and funding.get("rate") is not None:
+        fr = safe_float(funding.get("rate"))
+        if fr > 0.0008:
+            directional_score -= 0.2 * directional_weight
+            reasons.append("Elevated positive funding adds squeeze/pullback headwind for longs.")
+        elif fr < -0.0008:
+            directional_score += 0.2 * directional_weight
+            reasons.append("Negative funding adds short-squeeze tailwind.")
+
+    max_dir = max(0.0, safe_float(directional_weight))
+    directional_score = round(clamp(directional_score, -max_dir, max_dir), 2)
+
+    if not block_new_trade:
+        if directional_score >= 2.0:
+            bias = "MACRO BULLISH TILT"
+        elif directional_score <= -2.0:
+            bias = "MACRO BEARISH / DEFENSIVE TILT"
 
     return {
         "status": status,
         "bias": bias,
         "score_adjustment": score_adjustment,
+        "directional_score": directional_score,
         "block_new_trade": block_new_trade,
         "next_high_impact": next_hi,
-        "reason": reason
+        "reason": " ".join(reasons)
     }
-
 
 def get_macro_status(macro_cal=None, macro_signal=None):
 
@@ -1809,17 +1863,17 @@ def get_macro_status(macro_cal=None, macro_signal=None):
         "calendar_risk_window": macro_cal["risk_window"],
         "macro_status": macro_signal["status"],
         "macro_bias": macro_signal["bias"],
+        "macro_directional_score": macro_signal.get("directional_score", 0.0),
         "macro_reason": macro_signal["reason"],
         "next_high_impact": macro_cal["next_high_impact"],
         "message": (
             "No verified live spot macro feed configured. "
-            "No-API rule & local macro calendar is active and integrated into Signal & AI analysis."
+            "Enhanced No-API rule & local macro calendar + news/funding macro tilt is active."
         )
     }
 
-
 # ================================================================
-# ENTRY QUALITY ENGINE (WITH MACRO INTEGRATION)
+# ENTRY QUALITY ENGINE (WITH ENHANCED MACRO INTEGRATION)
 # ================================================================
 
 def calculate_entry_quality(
@@ -1948,7 +2002,6 @@ def calculate_entry_quality(
     elif funding["classification"] == "EXTREME SHORT CROWDING":
         components["funding"] = 5
 
-    # Macro adjustment (dampens conviction toward 0 during high-risk macro windows)
     raw_score = sum(
         v for k, v in components.items() if k != "macro"
     )
@@ -1956,13 +2009,22 @@ def calculate_entry_quality(
     macro_adj = safe_float(
         macro_signal.get("score_adjustment", 0.0) if isinstance(macro_signal, dict) else 0.0
     )
+    macro_dir_score = safe_float(
+        macro_signal.get("directional_score", 0.0) if isinstance(macro_signal, dict) else 0.0
+    )
 
-    if macro_adj < 0 and raw_score != 0:
-        # Reduce magnitude of directional score by macro_adj (e.g., -25 reduces |raw_score| by 25, floored at 0)
-        reduction = min(abs(raw_score), abs(macro_adj))
-        macro_component = -reduction if raw_score > 0 else reduction
-    else:
-        macro_component = 0.0
+    # 1) Directional macro tilt
+    macro_component = macro_dir_score
+
+    # 2) Risk-window dampening toward 0 during high-risk macro windows
+    if macro_adj < 0:
+        projected = raw_score + macro_component
+        if projected > 0:
+            reduction = min(projected, abs(macro_adj))
+            macro_component -= reduction
+        elif projected < 0:
+            reduction = min(abs(projected), abs(macro_adj))
+            macro_component += reduction
 
     components["macro"] = round(macro_component, 2)
 
@@ -2004,7 +2066,6 @@ def calculate_entry_quality(
         "stage": stage,
         "components": components
     }
-
 
 # ================================================================
 # REVERSAL ENGINE
@@ -2055,7 +2116,6 @@ def analyze_reversals(
         )
 
     return signals
-
 
 # ================================================================
 # NEWS ENGINE
@@ -2130,7 +2190,6 @@ def fetch_news():
 
     return result[:20], errors
 
-
 POSITIVE_WORDS = [
     "approval",
     "adoption",
@@ -2142,7 +2201,9 @@ POSITIVE_WORDS = [
     "partnership",
     "reserve",
     "accumulation",
-    "positive"
+    "positive",
+    "rate cut",
+    "dovish"
 ]
 
 NEGATIVE_WORDS = [
@@ -2157,9 +2218,10 @@ NEGATIVE_WORDS = [
     "fraud",
     "investigation",
     "selloff",
-    "bankruptcy"
+    "bankruptcy",
+    "hawkish",
+    "hot inflation"
 ]
-
 
 def analyze_news_sentiment(news):
 
@@ -2224,7 +2286,6 @@ def analyze_news_sentiment(news):
         "articles": scored
     }
 
-
 def calculate_news_hash(news):
 
     content = "|".join(
@@ -2236,9 +2297,8 @@ def calculate_news_hash(news):
         content.encode()
     ).hexdigest()
 
-
 # ================================================================
-# GROQ AI ENGINE (FIXED + MACRO ANALYSIS)
+# GROQ AI ENGINE (FIXED + ENHANCED MACRO ANALYSIS)
 # ================================================================
 
 def call_groq(payload):
@@ -2251,7 +2311,7 @@ def call_groq(payload):
     system_prompt = (
         "You are SALIGA AI PRO 31.0, an analytical BTC market intelligence engine. "
         "You MUST output valid JSON only. Do not include markdown code blocks like ```json or any conversational text. "
-        "Carefully analyze macro_signal, macro, and macro_calendar (upcoming/recent macro dates, impact levels, hours_until, risk_window) "
+        "Carefully analyze macro_signal, macro, and macro_calendar (upcoming/recent macro dates, impact levels, macro_lean, hours_until, risk_window) "
         "and explicitly evaluate how macro conditions affect BTC direction, signal quality, and risk in macro_analysis, news_impact, and risk. "
         "If an imminent high-impact macro event is within 1 hour, lean toward WAIT or flag conflict=true unless a clear post-event move is established. "
         "Your response must match this exact JSON structure:\n"
@@ -2364,7 +2424,6 @@ def call_groq(payload):
 
     return parsed
 
-
 # ================================================================
 # AI SCHEDULER
 # ================================================================
@@ -2421,7 +2480,6 @@ def ai_due(news_id, oi, delta, liquidity, macro_signal=None):
 
     return False, "NOT DUE"
 
-
 # ================================================================
 # AI & MACRO CONFLICT GATE + UNIFIED SIGNAL
 # ================================================================
@@ -2472,7 +2530,6 @@ def check_ai_gate(entry, ai_result, macro_signal=None, macro_gate_active=True):
         "reason": "AI, technicals, and macro gate aligned."
     }
 
-
 def build_unified_signal(entry, ai_result, ai_gate, macro_signal, risk_levels):
     tech_dir = entry["direction"]
     quality = safe_float(entry["quality"])
@@ -2495,7 +2552,7 @@ def build_unified_signal(entry, ai_result, ai_gate, macro_signal, risk_levels):
     parts = [
         f"Tech: {tech_dir} ({quality:.1f}/100)",
         f"AI: {ai_dir}",
-        f"Macro: {macro_status}"
+        f"Macro: {macro_status} ({safe_float(macro_signal.get('directional_score', 0.0)):+.1f})"
     ]
 
     return {
@@ -2508,7 +2565,6 @@ def build_unified_signal(entry, ai_result, ai_gate, macro_signal, risk_levels):
         "gate_reason": ai_gate["reason"],
         "summary": " | ".join(parts)
     }
-
 
 # ================================================================
 # RISK ENGINE
@@ -2564,7 +2620,6 @@ def calculate_risk_levels(
         "tp3": tp3
     }
 
-
 # ================================================================
 # PAPER TRADING
 # ================================================================
@@ -2587,7 +2642,6 @@ def get_open_trade():
 
     return dict(row) if row else None
 
-
 def get_paper_equity():
 
     closed = database_read(
@@ -2603,7 +2657,6 @@ def get_paper_equity():
     ) if not closed.empty else 0
 
     return starting_balance + pnl
-
 
 def open_paper_trade(
     direction,
@@ -2670,7 +2723,6 @@ def open_paper_trade(
         "PAPER TRADE",
         f"Opened {direction} at {levels['entry']:.2f}"
     )
-
 
 def close_paper_trade(
     trade,
@@ -2762,7 +2814,6 @@ def close_paper_trade(
         f"Net PnL {net:.2f} USDT"
     )
 
-
 def manage_paper_trade(df, funding_rate=0):
 
     trade = get_open_trade()
@@ -2802,7 +2853,6 @@ def manage_paper_trade(df, funding_rate=0):
             "TAKE PROFIT 1",
             funding_rate
         )
-
 
 # ================================================================
 # PERFORMANCE ENGINE
@@ -2858,7 +2908,6 @@ def get_performance():
         "net_pnl": pnls.sum()
     }
 
-
 # ================================================================
 # SAVE MARKET SNAPSHOT (FIXED)
 # ================================================================
@@ -2902,7 +2951,6 @@ def save_market_snapshot(
     connection.commit()
     connection.close()
 
-
 # ================================================================
 # MAIN APPLICATION
 # ================================================================
@@ -2911,7 +2959,7 @@ st.title("₿ SALIGA AI PRO 31.0")
 
 st.caption(
     "ULTIMATE BTC INTELLIGENCE ENGINE | "
-    "OKX MARKET DATA | GROQ AI | MACRO SIGNAL"
+    "OKX MARKET DATA | GROQ AI | ENHANCED MACRO SIGNAL"
 )
 
 st.write(
@@ -3042,10 +3090,6 @@ news_id = calculate_news_hash(
 # MACRO & ANALYSIS
 # ------------------------------------------------
 
-macro_calendar = get_macro_calendar_data()
-macro_signal = analyze_macro_signal(macro_calendar)
-macro = get_macro_status(macro_calendar, macro_signal)
-
 structure = market_structure(main_df)
 
 regime = market_regime(main_df)
@@ -3065,6 +3109,15 @@ oi = analyze_open_interest(
 funding = analyze_funding(
     funding_raw
 )
+
+macro_calendar = get_macro_calendar_data()
+macro_signal = analyze_macro_signal(
+    macro_calendar,
+    news_analysis=news_analysis,
+    funding=funding,
+    directional_weight=macro_directional_weight
+)
+macro = get_macro_status(macro_calendar, macro_signal)
 
 liquidity = analyze_liquidity(
     main_df
@@ -3199,7 +3252,7 @@ market_payload = {
         "risk_window": macro_calendar["risk_window"],
         "next_high_impact": macro_calendar["next_high_impact"],
         "imminent_high_impact": macro_calendar["imminent_high_impact"],
-        "upcoming_events": macro_calendar["events"][:12]
+        "upcoming_events": macro_calendar["events"][:15]
     },
 
     "risk_levels": risk_levels
@@ -3425,7 +3478,7 @@ st.write(
 )
 
 st.write(
-    f"**Macro bias & note:** {macro_signal['bias']} — {macro_signal['reason']}"
+    f"**Macro bias & note:** {macro_signal['bias']} (Tilt: {macro_signal['directional_score']:+.2f}) — {macro_signal['reason']}"
 )
 
 st.write(
@@ -3788,7 +3841,7 @@ st.warning(
     macro["message"]
 )
 
-mc1, mc2, mc3 = st.columns(3)
+mc1, mc2, mc3, mc4 = st.columns(4)
 
 mc1.metric(
     "Macro Signal Status",
@@ -3810,6 +3863,11 @@ mc3.metric(
     )
 )
 
+mc4.metric(
+    "Macro Directional Tilt",
+    f"{macro_signal['directional_score']:+.2f}"
+)
+
 st.write(f"**Macro signal note:** {macro_signal['reason']}")
 
 if macro_calendar["events"]:
@@ -3823,11 +3881,12 @@ if macro_calendar["events"]:
 with st.expander("Add / Manage Custom Macro Events (Saved to SQLite, No API)"):
 
     with st.form("add_macro_event_form", clear_on_submit=True):
-        f_col1, f_col2, f_col3, f_col4 = st.columns(4)
+        f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns(5)
         ev_d = f_col1.date_input("Date (UTC)", value=now_utc().date())
         ev_t = f_col2.text_input("Time UTC (HH:MM)", value="13:30")
-        ev_c = f_col3.selectbox("Currency", ["USD", "EUR", "BTC", "GLOBAL"])
+        ev_c = f_col3.selectbox("Currency", ["USD", "EUR", "JPY", "BTC", "GLOBAL"])
         ev_i = f_col4.selectbox("Impact", ["HIGH", "MEDIUM", "LOW"])
+        ev_l = f_col5.selectbox("Macro Lean", ["NEUTRAL", "HAWKISH_RISK", "VOLATILITY_RISK", "DOVISH_RELIEF", "BULLISH_BTC", "BEARISH_BTC"])
         ev_name = st.text_input("Event Name", placeholder="e.g. Fed Chair Speech / ETF Flow / CPI")
         ev_notes = st.text_input("Notes", placeholder="Optional note")
         submitted_macro = st.form_submit_button("Add Macro Event")
@@ -3839,12 +3898,13 @@ with st.expander("Add / Manage Custom Macro Events (Saved to SQLite, No API)"):
                 ev_c,
                 ev_name.strip(),
                 ev_i,
+                ev_l,
                 ev_notes.strip()
             )
             st.rerun()
 
     custom_db_df = database_read(
-        "SELECT id, event_date, time_utc, currency, event_name, impact, notes FROM macro_calendar ORDER BY id DESC"
+        "SELECT id, event_date, time_utc, currency, event_name, impact, macro_lean, notes FROM macro_calendar ORDER BY id DESC"
     )
 
     if not custom_db_df.empty:
