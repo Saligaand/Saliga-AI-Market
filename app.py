@@ -56,7 +56,7 @@ from pathlib import Path
 # CONFIGURATION
 # ================================================================
 
-APP_NAME = "SALIGA AI PRO 31.0"
+APP_NAME = "AI PRO by Sali"
 
 INSTRUMENT = "BTC-USDT-SWAP"
 
