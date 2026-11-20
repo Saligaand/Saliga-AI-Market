@@ -1,13 +1,13 @@
 # ================================================================
 # AI PRO by Sali
-# ULTIMATE BTC INTELLIGENCE ENGINE (FIXED)
+# ULTIMATE BTC INTELLIGENCE ENGINE (FIXED + MACRO SIGNAL)
 #
 # BTC ONLY | OKX | GROQ AI
 # NO EMA | NO SMA
 #
 # Features:
 # - Automatic API key loading from Streamlit Secrets
-# - SQLite persistent storage
+# - SQLite persistent storage (with safe column migration)
 # - OKX BTC market data
 # - Multi-timeframe analysis
 # - Market structure
@@ -22,9 +22,9 @@
 # - Divergence Detection
 # - Historical Pattern Analysis
 # - News Intelligence
-# - Groq AI combined analysis
-# - AI conflict gate
-# - Entry Quality Score
+# - Groq AI combined analysis (incl. Macro Analysis)
+# - AI conflict & Macro gate
+# - Entry Quality Score & Unified Signal
 # - Risk Management
 # - Paper Trading
 # - Fees and slippage
@@ -32,7 +32,7 @@
 # - Event Journal
 # - CSV Export
 # - API health monitoring
-# - No-API Macro Calendar + AI integration
+# - No-API Macro Calendar + Signal & AI integration
 #
 # This system is for analysis and paper trading.
 # It does not guarantee profitable signals.
@@ -63,6 +63,8 @@ APP_NAME = "AI PRO by Sali"
 INSTRUMENT = "BTC-USDT-SWAP"
 
 BASE_URL = "https://www.okx.com"
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 GROQ_DEFAULT_MODEL = "openai/gpt-oss-120b"
 
@@ -148,6 +150,17 @@ def get_connection():
     return connection
 
 
+def _ensure_column(connection, table_name, column_name, column_def):
+    cols = [
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    ]
+    if column_name not in cols:
+        connection.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}"
+        )
+
+
 def initialize_database():
 
     connection = get_connection()
@@ -185,9 +198,14 @@ def initialize_database():
             score REAL,
             stage TEXT,
             regime TEXT,
+            macro_status TEXT,
+            signal_label TEXT,
             ai_gate INTEGER
         )
     """)
+
+    _ensure_column(connection, "signal_history", "macro_status", "TEXT DEFAULT 'UNKNOWN'")
+    _ensure_column(connection, "signal_history", "signal_label", "TEXT DEFAULT 'WAIT'")
 
     connection.execute("""
         CREATE TABLE IF NOT EXISTS event_log (
@@ -267,6 +285,11 @@ st.sidebar.caption(f"Model: {GROQ_MODEL}")
 
 ai_enabled = st.sidebar.toggle(
     "Groq AI enabled",
+    value=True
+)
+
+macro_gate_enabled = st.sidebar.toggle(
+    "Macro event gate (<=1h HIGH)",
     value=True
 )
 
@@ -1472,7 +1495,331 @@ def analyze_historical_patterns(df):
 
 
 # ================================================================
-# ENTRY QUALITY ENGINE
+# MACRO CALENDAR (NO API REQUIRED) & MACRO SIGNAL ENGINE
+# ================================================================
+
+def _nth_weekday_of_month(year, month, weekday, n):
+    cal = calendar.monthcalendar(year, month)
+    days = [row[weekday] for row in cal if row[weekday] != 0]
+    if n > 0:
+        idx = n - 1
+        return date(year, month, days[idx]) if idx < len(days) else None
+    else:
+        idx = n
+        return date(year, month, days[idx]) if abs(idx) <= len(days) else None
+
+
+def _generate_rule_based_macro_events(start_date, end_date):
+    events = []
+    cur_year, cur_month = start_date.year, start_date.month
+    end_year, end_month = end_date.year, end_date.month
+
+    while (cur_year, cur_month) <= (end_year, end_month):
+        # 1. US Non-Farm Payrolls (NFP): 1st Friday of month, 13:30 UTC
+        nfp_day = _nth_weekday_of_month(cur_year, cur_month, calendar.FRIDAY, 1)
+        if nfp_day:
+            events.append({
+                "id": None,
+                "date": nfp_day.isoformat(),
+                "time_utc": "13:30",
+                "currency": "USD",
+                "event": "US Non-Farm Payrolls (NFP) & Unemployment",
+                "impact": "HIGH",
+                "source": "RULE_BASED",
+                "notes": "1st Friday of month (12:30/13:30 UTC depending on DST)"
+            })
+
+        # 2. US CPI: typically mid-month weekday, 13:30 UTC
+        cpi_candidate = date(cur_year, cur_month, 12)
+        while cpi_candidate.weekday() >= 5:
+            cpi_candidate += timedelta(days=1)
+        events.append({
+            "id": None,
+            "date": cpi_candidate.isoformat(),
+            "time_utc": "13:30",
+            "currency": "USD",
+            "event": "US CPI Inflation (Est. Window)",
+            "impact": "HIGH",
+            "source": "RULE_BASED",
+            "notes": "Typical mid-month US CPI release window"
+        })
+
+        # 3. FOMC Rate Decision: 8 scheduled meetings per year
+        if cur_month in (1, 3, 5, 6, 7, 9, 11, 12):
+            fomc_day = _nth_weekday_of_month(cur_year, cur_month, calendar.WEDNESDAY, 3)
+            if fomc_day:
+                events.append({
+                    "id": None,
+                    "date": fomc_day.isoformat(),
+                    "time_utc": "19:00",
+                    "currency": "USD",
+                    "event": "FOMC Interest Rate Decision & Press Conf. (Est.)",
+                    "impact": "HIGH",
+                    "source": "RULE_BASED",
+                    "notes": "Scheduled FOMC window (18:00/19:00 UTC)"
+                })
+
+        # 4. US Core PCE Price Index: last Friday of month, 13:30 UTC
+        pce_day = _nth_weekday_of_month(cur_year, cur_month, calendar.FRIDAY, -1)
+        if pce_day:
+            events.append({
+                "id": None,
+                "date": pce_day.isoformat(),
+                "time_utc": "13:30",
+                "currency": "USD",
+                "event": "US Core PCE Price Index",
+                "impact": "HIGH",
+                "source": "RULE_BASED",
+                "notes": "Last Friday of month Fed-preferred inflation gauge"
+            })
+
+        # 5. ECB Interest Rate Decision
+        if cur_month in (1, 3, 4, 6, 7, 9, 10, 12):
+            ecb_day = _nth_weekday_of_month(cur_year, cur_month, calendar.THURSDAY, 2)
+            if ecb_day:
+                events.append({
+                    "id": None,
+                    "date": ecb_day.isoformat(),
+                    "time_utc": "12:15",
+                    "currency": "EUR",
+                    "event": "ECB Interest Rate Decision (Est.)",
+                    "impact": "MEDIUM",
+                    "source": "RULE_BASED",
+                    "notes": "ECB governing council rate announcement"
+                })
+
+        # 6. US GDP
+        if cur_month in (1, 4, 7, 10):
+            last_d = calendar.monthrange(cur_year, cur_month)[1]
+            gdp_day = date(cur_year, cur_month, min(28, last_d))
+            while gdp_day.weekday() >= 5:
+                gdp_day -= timedelta(days=1)
+            events.append({
+                "id": None,
+                "date": gdp_day.isoformat(),
+                "time_utc": "13:30",
+                "currency": "USD",
+                "event": "US GDP Advance Release (Est.)",
+                "impact": "MEDIUM",
+                "source": "RULE_BASED",
+                "notes": "Quarterly US GDP release window"
+            })
+
+        if cur_month == 12:
+            cur_year += 1
+            cur_month = 1
+        else:
+            cur_month += 1
+
+    filtered = [
+        e for e in events
+        if start_date.isoformat() <= e["date"] <= end_date.isoformat()
+    ]
+    return filtered
+
+
+def add_macro_event(event_date, time_utc, currency, event_name, impact="HIGH", notes=""):
+    connection = get_connection()
+    connection.execute(
+        """
+        INSERT INTO macro_calendar
+        (event_date, time_utc, currency, event_name, impact, notes)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(event_date),
+            str(time_utc),
+            str(currency).upper(),
+            str(event_name),
+            str(impact).upper(),
+            str(notes)
+        )
+    )
+    connection.commit()
+    connection.close()
+    add_event("MACRO CALENDAR", f"Added event: {event_date} {time_utc} UTC | {currency} {event_name} ({impact})")
+
+
+def delete_macro_event(event_id):
+    connection = get_connection()
+    connection.execute(
+        "DELETE FROM macro_calendar WHERE id = ?",
+        (int(event_id),)
+    )
+    connection.commit()
+    connection.close()
+    add_event("MACRO CALENDAR", f"Deleted custom event ID #{event_id}")
+
+
+def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
+    now = now_utc()
+    start_dt = (now - timedelta(days=lookback_days)).date()
+    end_dt = (now + timedelta(days=lookahead_days)).date()
+
+    combined = _generate_rule_based_macro_events(start_dt, end_dt)
+
+    custom_rows = database_read(
+        """
+        SELECT id, event_date, time_utc, currency, event_name, impact, notes
+        FROM macro_calendar
+        WHERE event_date BETWEEN ? AND ?
+        ORDER BY event_date ASC, time_utc ASC
+        """,
+        (start_dt.isoformat(), end_dt.isoformat())
+    )
+
+    if not custom_rows.empty:
+        for _, r in custom_rows.iterrows():
+            combined.append({
+                "id": int(r["id"]),
+                "date": str(r["event_date"]),
+                "time_utc": str(r["time_utc"]),
+                "currency": str(r["currency"]),
+                "event": str(r["event_name"]),
+                "impact": str(r["impact"]),
+                "source": "CUSTOM_DB",
+                "notes": str(r["notes"] or "")
+            })
+
+    enriched = []
+    next_high_impact = None
+    min_abs_hours = None
+    imminent_high_impact = None
+
+    for ev in combined:
+        ev_date_str = ev["date"]
+        ev_time_str = (ev.get("time_utc") or "00:00").strip()
+        try:
+            hh, mm = [int(x) for x in ev_time_str.split(":")[:2]]
+        except Exception:
+            hh, mm = 0, 0
+
+        try:
+            y, m, d = [int(x) for x in ev_date_str.split("-")[:3]]
+            ev_dt = datetime(y, m, d, hh, mm, tzinfo=timezone.utc)
+        except Exception:
+            ev_dt = now
+
+        hours_until = (ev_dt - now).total_seconds() / 3600.0
+        abs_h = abs(hours_until)
+
+        if min_abs_hours is None or abs_h < min_abs_hours:
+            min_abs_hours = abs_h
+
+        if hours_until >= -1.0 and ev.get("impact") == "HIGH" and next_high_impact is None:
+            next_high_impact = {
+                **ev,
+                "hours_until": round(hours_until, 2)
+            }
+
+        if abs_h <= 2.0 and ev.get("impact") == "HIGH":
+            if imminent_high_impact is None or abs_h < abs(imminent_high_impact["hours_until"]):
+                imminent_high_impact = {
+                    **ev,
+                    "hours_until": round(hours_until, 2)
+                }
+
+        enriched.append({
+            **ev,
+            "hours_until": round(hours_until, 2)
+        })
+
+    enriched.sort(key=lambda x: (x["date"], x["time_utc"]))
+
+    if imminent_high_impact is not None or (min_abs_hours is not None and min_abs_hours <= 2.0):
+        risk_window = "IMMINENT / ACTIVE EVENT WINDOW (<=2h)"
+    elif min_abs_hours is not None and min_abs_hours <= 24.0:
+        risk_window = "ELEVATED MACRO DAY (<=24h)"
+    else:
+        risk_window = "NORMAL MACRO ENVIRONMENT"
+
+    return {
+        "mode": "NO_API_LOCAL_AND_RULE_ENGINE",
+        "risk_window": risk_window,
+        "next_high_impact": next_high_impact,
+        "imminent_high_impact": imminent_high_impact,
+        "min_abs_hours": round(min_abs_hours, 2) if min_abs_hours is not None else None,
+        "events": enriched
+    }
+
+
+def analyze_macro_signal(macro_calendar):
+    risk_window = macro_calendar.get("risk_window", "NORMAL MACRO ENVIRONMENT")
+    next_hi = macro_calendar.get("next_high_impact")
+    imminent_hi = macro_calendar.get("imminent_high_impact")
+    min_h = macro_calendar.get("min_abs_hours")
+
+    # Pont-módosító a szignálhoz (negatív = óvatosság/kockázatcsökkentés)
+    score_adjustment = 0.0
+    block_new_trade = False
+    status = "CLEAR"
+    bias = "NEUTRAL"
+    reason = "No immediate high-impact macro event; macro environment is normal."
+
+    if imminent_hi is not None and abs(safe_float(imminent_hi.get("hours_until"), 999)) <= 1.0:
+        status = "HIGH RISK - IMMINENT HIGH-IMPACT EVENT (<=1h)"
+        score_adjustment = -25.0
+        block_new_trade = True
+        bias = "DEFENSIVE / NO NEW ENTRY"
+        reason = (
+            f"High-impact event ({imminent_hi.get('currency')} {imminent_hi.get('event')}) "
+            f"is within 1h ({imminent_hi.get('hours_until')}h)."
+        )
+    elif risk_window.startswith("IMMINENT"):
+        status = "HIGH RISK - EVENT WINDOW (<=2h)"
+        score_adjustment = -15.0
+        bias = "DEFENSIVE"
+        reason = f"Macro event within 2h ({min_h}h). Expect volatility spikes and liquidity sweeps."
+    elif risk_window.startswith("ELEVATED"):
+        status = "ELEVATED MACRO (<=24h)"
+        score_adjustment = -5.0
+        bias = "CAUTIOUS"
+        if next_hi:
+            reason = (
+                f"Upcoming HIGH impact event in {next_hi.get('hours_until')}h: "
+                f"{next_hi.get('currency')} {next_hi.get('event')}."
+            )
+        else:
+            reason = f"Macro event within 24h ({min_h}h)."
+
+    return {
+        "status": status,
+        "bias": bias,
+        "score_adjustment": score_adjustment,
+        "block_new_trade": block_new_trade,
+        "next_high_impact": next_hi,
+        "reason": reason
+    }
+
+
+def get_macro_status(macro_cal=None, macro_signal=None):
+
+    if macro_cal is None:
+        macro_cal = get_macro_calendar_data()
+
+    if macro_signal is None:
+        macro_signal = analyze_macro_signal(macro_cal)
+
+    return {
+        "available": False,
+        "dxy": None,
+        "us10y": None,
+        "fed": None,
+        "calendar_available": True,
+        "calendar_risk_window": macro_cal["risk_window"],
+        "macro_status": macro_signal["status"],
+        "macro_bias": macro_signal["bias"],
+        "macro_reason": macro_signal["reason"],
+        "next_high_impact": macro_cal["next_high_impact"],
+        "message": (
+            "No verified live spot macro feed configured. "
+            "No-API rule & local macro calendar is active and integrated into Signal & AI analysis."
+        )
+    }
+
+
+# ================================================================
+# ENTRY QUALITY ENGINE (WITH MACRO INTEGRATION)
 # ================================================================
 
 def calculate_entry_quality(
@@ -1485,7 +1832,8 @@ def calculate_entry_quality(
     liquidity,
     mtf,
     funding,
-    retest
+    retest,
+    macro_signal=None
 ):
 
     components = {
@@ -1495,13 +1843,15 @@ def calculate_entry_quality(
         "liquidity": 0,
         "multi_timeframe": 0,
         "breakout_retest": 0,
-        "funding": 0
+        "funding": 0,
+        "macro": 0
     }
 
     if df.empty:
 
         return {
             "direction": "WAIT",
+            "raw_score": 0,
             "score": 0,
             "quality": 0,
             "stage": "WAIT",
@@ -1564,7 +1914,6 @@ def calculate_entry_quality(
     }
 
     mtf_score = 0
-    valid_weight = 0
 
     for tf, weight in weights.items():
 
@@ -1577,14 +1926,9 @@ def calculate_entry_quality(
 
         if direction == "BULLISH":
             mtf_score += weight
-            valid_weight += weight
 
         elif direction == "BEARISH":
             mtf_score -= weight
-            valid_weight += weight
-
-        elif direction == "NEUTRAL":
-            valid_weight += weight
 
     components["multi_timeframe"] = (
         mtf_score / sum(weights.values()) * 15
@@ -1604,7 +1948,25 @@ def calculate_entry_quality(
     elif funding["classification"] == "EXTREME SHORT CROWDING":
         components["funding"] = 5
 
-    score = sum(components.values())
+    # Macro adjustment (dampens conviction toward 0 during high-risk macro windows)
+    raw_score = sum(
+        v for k, v in components.items() if k != "macro"
+    )
+
+    macro_adj = safe_float(
+        macro_signal.get("score_adjustment", 0.0) if isinstance(macro_signal, dict) else 0.0
+    )
+
+    if macro_adj < 0 and raw_score != 0:
+        # Reduce magnitude of directional score by macro_adj (e.g., -25 reduces |raw_score| by 25, floored at 0)
+        reduction = min(abs(raw_score), abs(macro_adj))
+        macro_component = -reduction if raw_score > 0 else reduction
+    else:
+        macro_component = 0.0
+
+    components["macro"] = round(macro_component, 2)
+
+    score = raw_score + components["macro"]
 
     direction = (
         "LONG" if score > 0
@@ -1629,11 +1991,14 @@ def calculate_entry_quality(
     else:
         stage = "WAIT"
 
-    if regime["volatility"] == "EXTREME":
+    if macro_signal and macro_signal.get("block_new_trade"):
+        stage = "MACRO EVENT HOLD (<=1h)"
+    elif regime["volatility"] == "EXTREME":
         stage = "HIGH VOLATILITY - CAUTION"
 
     return {
         "direction": direction,
+        "raw_score": round(raw_score, 2),
         "score": round(score, 2),
         "quality": round(quality, 2),
         "stage": stage,
@@ -1873,266 +2238,7 @@ def calculate_news_hash(news):
 
 
 # ================================================================
-# MACRO CALENDAR (NO API REQUIRED) & MACRO STATUS
-# ================================================================
-
-def _nth_weekday_of_month(year, month, weekday, n):
-    cal = calendar.monthcalendar(year, month)
-    days = [row[weekday] for row in cal if row[weekday] != 0]
-    if n > 0:
-        idx = n - 1
-        return date(year, month, days[idx]) if idx < len(days) else None
-    else:
-        idx = n
-        return date(year, month, days[idx]) if abs(idx) <= len(days) else None
-
-
-def _generate_rule_based_macro_events(start_date, end_date):
-    events = []
-    cur_year, cur_month = start_date.year, start_date.month
-    end_year, end_month = end_date.year, end_date.month
-
-    while (cur_year, cur_month) <= (end_year, end_month):
-        # 1. US Non-Farm Payrolls (NFP): 1st Friday of month, 13:30 UTC
-        nfp_day = _nth_weekday_of_month(cur_year, cur_month, calendar.FRIDAY, 1)
-        if nfp_day:
-            events.append({
-                "id": None,
-                "date": nfp_day.isoformat(),
-                "time_utc": "13:30",
-                "currency": "USD",
-                "event": "US Non-Farm Payrolls (NFP) & Unemployment",
-                "impact": "HIGH",
-                "source": "RULE_BASED",
-                "notes": "1st Friday of month (12:30/13:30 UTC depending on DST)"
-            })
-
-        # 2. US CPI: typically 2nd week (around 10th-14th, Tuesday/Wednesday/Thursday), 13:30 UTC
-        cpi_candidate = date(cur_year, cur_month, 12)
-        while cpi_candidate.weekday() >= 5:
-            cpi_candidate += timedelta(days=1)
-        events.append({
-            "id": None,
-            "date": cpi_candidate.isoformat(),
-            "time_utc": "13:30",
-            "currency": "USD",
-            "event": "US CPI Inflation (Est. Window)",
-            "impact": "HIGH",
-            "source": "RULE_BASED",
-            "notes": "Typical mid-month US CPI release window"
-        })
-
-        # 3. FOMC Rate Decision: 8 scheduled meetings per year (Jan, Mar, May, Jun, Jul, Sep, Nov, Dec)
-        if cur_month in (1, 3, 5, 6, 7, 9, 11, 12):
-            fomc_day = _nth_weekday_of_month(cur_year, cur_month, calendar.WEDNESDAY, 3)
-            if fomc_day:
-                events.append({
-                    "id": None,
-                    "date": fomc_day.isoformat(),
-                    "time_utc": "19:00",
-                    "currency": "USD",
-                    "event": "FOMC Interest Rate Decision & Press Conf. (Est.)",
-                    "impact": "HIGH",
-                    "source": "RULE_BASED",
-                    "notes": "Scheduled FOMC window (18:00/19:00 UTC)"
-                })
-
-        # 4. US Core PCE Price Index: last Friday of month, 13:30 UTC
-        pce_day = _nth_weekday_of_month(cur_year, cur_month, calendar.FRIDAY, -1)
-        if pce_day:
-            events.append({
-                "id": None,
-                "date": pce_day.isoformat(),
-                "time_utc": "13:30",
-                "currency": "USD",
-                "event": "US Core PCE Price Index",
-                "impact": "HIGH",
-                "source": "RULE_BASED",
-                "notes": "Last Friday of month Fed-preferred inflation gauge"
-            })
-
-        # 5. ECB Interest Rate Decision: typically Thursday of 2nd/3rd week in key months
-        if cur_month in (1, 3, 4, 6, 7, 9, 10, 12):
-            ecb_day = _nth_weekday_of_month(cur_year, cur_month, calendar.THURSDAY, 2)
-            if ecb_day:
-                events.append({
-                    "id": None,
-                    "date": ecb_day.isoformat(),
-                    "time_utc": "12:15",
-                    "currency": "EUR",
-                    "event": "ECB Interest Rate Decision (Est.)",
-                    "impact": "MEDIUM",
-                    "source": "RULE_BASED",
-                    "notes": "ECB governing council rate announcement"
-                })
-
-        # 6. US GDP (Advance / Second / Third): last week of Jan, Apr, Jul, Oct (approx 28th weekday)
-        if cur_month in (1, 4, 7, 10):
-            last_d = calendar.monthrange(cur_year, cur_month)[1]
-            gdp_day = date(cur_year, cur_month, min(28, last_d))
-            while gdp_day.weekday() >= 5:
-                gdp_day -= timedelta(days=1)
-            events.append({
-                "id": None,
-                "date": gdp_day.isoformat(),
-                "time_utc": "13:30",
-                "currency": "USD",
-                "event": "US GDP Advance Release (Est.)",
-                "impact": "MEDIUM",
-                "source": "RULE_BASED",
-                "notes": "Quarterly US GDP release window"
-            })
-
-        # Advance month
-        if cur_month == 12:
-            cur_year += 1
-            cur_month = 1
-        else:
-            cur_month += 1
-
-    filtered = [
-        e for e in events
-        if start_date.isoformat() <= e["date"] <= end_date.isoformat()
-    ]
-    return filtered
-
-
-def add_macro_event(event_date, time_utc, currency, event_name, impact="HIGH", notes=""):
-    connection = get_connection()
-    connection.execute(
-        """
-        INSERT INTO macro_calendar
-        (event_date, time_utc, currency, event_name, impact, notes)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            str(event_date),
-            str(time_utc),
-            str(currency).upper(),
-            str(event_name),
-            str(impact).upper(),
-            str(notes)
-        )
-    )
-    connection.commit()
-    connection.close()
-    add_event("MACRO CALENDAR", f"Added event: {event_date} {time_utc} UTC | {currency} {event_name} ({impact})")
-
-
-def delete_macro_event(event_id):
-    connection = get_connection()
-    connection.execute(
-        "DELETE FROM macro_calendar WHERE id = ?",
-        (int(event_id),)
-    )
-    connection.commit()
-    connection.close()
-    add_event("MACRO CALENDAR", f"Deleted custom event ID #{event_id}")
-
-
-def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
-    now = now_utc()
-    start_dt = (now - timedelta(days=lookback_days)).date()
-    end_dt = (now + timedelta(days=lookahead_days)).date()
-
-    combined = _generate_rule_based_macro_events(start_dt, end_dt)
-
-    custom_rows = database_read(
-        """
-        SELECT id, event_date, time_utc, currency, event_name, impact, notes
-        FROM macro_calendar
-        WHERE event_date BETWEEN ? AND ?
-        ORDER BY event_date ASC, time_utc ASC
-        """,
-        (start_dt.isoformat(), end_dt.isoformat())
-    )
-
-    if not custom_rows.empty:
-        for _, r in custom_rows.iterrows():
-            combined.append({
-                "id": int(r["id"]),
-                "date": str(r["event_date"]),
-                "time_utc": str(r["time_utc"]),
-                "currency": str(r["currency"]),
-                "event": str(r["event_name"]),
-                "impact": str(r["impact"]),
-                "source": "CUSTOM_DB",
-                "notes": str(r["notes"] or "")
-            })
-
-    enriched = []
-    next_high_impact = None
-    min_abs_hours = None
-
-    for ev in combined:
-        ev_date_str = ev["date"]
-        ev_time_str = (ev.get("time_utc") or "00:00").strip()
-        try:
-            hh, mm = [int(x) for x in ev_time_str.split(":")[:2]]
-        except Exception:
-            hh, mm = 0, 0
-
-        try:
-            y, m, d = [int(x) for x in ev_date_str.split("-")[:3]]
-            ev_dt = datetime(y, m, d, hh, mm, tzinfo=timezone.utc)
-        except Exception:
-            ev_dt = now
-
-        hours_until = (ev_dt - now).total_seconds() / 3600.0
-        abs_h = abs(hours_until)
-
-        if min_abs_hours is None or abs_h < min_abs_hours:
-            min_abs_hours = abs_h
-
-        if hours_until >= -1.0 and ev.get("impact") == "HIGH" and next_high_impact is None:
-            next_high_impact = {
-                **ev,
-                "hours_until": round(hours_until, 2)
-            }
-
-        enriched.append({
-            **ev,
-            "hours_until": round(hours_until, 2)
-        })
-
-    enriched.sort(key=lambda x: (x["date"], x["time_utc"]))
-
-    if min_abs_hours is not None and min_abs_hours <= 2.0:
-        risk_window = "IMMINENT / ACTIVE EVENT WINDOW (<=2h)"
-    elif min_abs_hours is not None and min_abs_hours <= 24.0:
-        risk_window = "ELEVATED MACRO DAY (<=24h)"
-    else:
-        risk_window = "NORMAL MACRO ENVIRONMENT"
-
-    return {
-        "mode": "NO_API_LOCAL_AND_RULE_ENGINE",
-        "risk_window": risk_window,
-        "next_high_impact": next_high_impact,
-        "events": enriched
-    }
-
-
-def get_macro_status():
-
-    macro_cal = get_macro_calendar_data()
-
-    return {
-        "available": False,
-        "dxy": None,
-        "us10y": None,
-        "fed": None,
-        "calendar_available": True,
-        "calendar_risk_window": macro_cal["risk_window"],
-        "next_high_impact": macro_cal["next_high_impact"],
-        "message": (
-            "No verified live spot macro feed configured. "
-            "No-API rule & local macro calendar is active and included in AI analysis."
-        )
-    }
-
-
-# ================================================================
-# GROQ AI ENGINE (FIXED)
+# GROQ AI ENGINE (FIXED + MACRO ANALYSIS)
 # ================================================================
 
 def call_groq(payload):
@@ -2145,7 +2251,9 @@ def call_groq(payload):
     system_prompt = (
         "You are SALIGA AI PRO 31.0, an analytical BTC market intelligence engine. "
         "You MUST output valid JSON only. Do not include markdown code blocks like ```json or any conversational text. "
-        "Incorporate the provided macro_calendar events (upcoming/recent macro dates, impact levels, hours_until, and risk_window) into your assessment, especially in news_impact and risk. "
+        "Carefully analyze macro_signal, macro, and macro_calendar (upcoming/recent macro dates, impact levels, hours_until, risk_window) "
+        "and explicitly evaluate how macro conditions affect BTC direction, signal quality, and risk in macro_analysis, news_impact, and risk. "
+        "If an imminent high-impact macro event is within 1 hour, lean toward WAIT or flag conflict=true unless a clear post-event move is established. "
         "Your response must match this exact JSON structure:\n"
         "{\n"
         ' "direction": "LONG",\n'
@@ -2155,6 +2263,7 @@ def call_groq(payload):
         ' "technical_analysis": "string",\n'
         ' "order_flow_analysis": "string",\n'
         ' "liquidity_analysis": "string",\n'
+        ' "macro_analysis": "string",\n'
         ' "news_impact": "string",\n'
         ' "risk": "string",\n'
         ' "invalidation": "string"\n'
@@ -2170,7 +2279,7 @@ def call_groq(payload):
     request_data = {
         "model": GROQ_MODEL,
         "temperature": 0.1,
-        "max_tokens": 1200,
+        "max_tokens": 1400,
         "response_format": {
             "type": "json_object"
         },
@@ -2187,7 +2296,7 @@ def call_groq(payload):
     }
 
     response = requests.post(
-        "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
+        GROQ_API_URL,
         headers={
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json"
@@ -2250,15 +2359,17 @@ def call_groq(payload):
         parsed.get("conflict", False)
     )
 
-    return parsed
+    if "macro_analysis" not in parsed or not parsed["macro_analysis"]:
+        parsed["macro_analysis"] = "No separate macro analysis returned."
 
+    return parsed
 
 
 # ================================================================
 # AI SCHEDULER
 # ================================================================
 
-def ai_due(news_id, oi, delta, liquidity):
+def ai_due(news_id, oi, delta, liquidity, macro_signal=None):
 
     current = time.time()
 
@@ -2286,6 +2397,9 @@ def ai_due(news_id, oi, delta, liquidity):
     ]:
         event_detected = True
 
+    if macro_signal and macro_signal.get("status", "").startswith("HIGH RISK"):
+        event_detected = True
+
     previous_hash = st.session_state.last_news_hash
 
     if (
@@ -2303,16 +2417,22 @@ def ai_due(news_id, oi, delta, liquidity):
         return True, "NORMAL SCHEDULE"
 
     if event_detected and cooldown_passed:
-        return True, "MARKET EVENT"
+        return True, "MARKET / MACRO EVENT"
 
     return False, "NOT DUE"
 
 
 # ================================================================
-# AI CONFLICT GATE
+# AI & MACRO CONFLICT GATE + UNIFIED SIGNAL
 # ================================================================
 
-def check_ai_gate(entry, ai_result):
+def check_ai_gate(entry, ai_result, macro_signal=None, macro_gate_active=True):
+
+    if macro_gate_active and macro_signal and macro_signal.get("block_new_trade"):
+        return {
+            "allowed": False,
+            "reason": f"Blocked by Macro Gate: {macro_signal.get('reason')}"
+        }
 
     if ai_result is None:
 
@@ -2327,7 +2447,7 @@ def check_ai_gate(entry, ai_result):
 
         return {
             "allowed": False,
-            "reason": "AI detected conflicting evidence."
+            "reason": "AI detected conflicting technical/macro/flow evidence."
         }
 
     if ai_direction == "WAIT":
@@ -2349,7 +2469,44 @@ def check_ai_gate(entry, ai_result):
 
     return {
         "allowed": True,
-        "reason": "AI and technical direction aligned."
+        "reason": "AI, technicals, and macro gate aligned."
+    }
+
+
+def build_unified_signal(entry, ai_result, ai_gate, macro_signal, risk_levels):
+    tech_dir = entry["direction"]
+    quality = safe_float(entry["quality"])
+    ai_dir = ai_result["direction"] if isinstance(ai_result, dict) else "N/A"
+    macro_status = macro_signal.get("status", "CLEAR") if isinstance(macro_signal, dict) else "CLEAR"
+
+    if ai_gate["allowed"] and tech_dir in ("LONG", "SHORT") and quality >= 75 and risk_levels is not None:
+        label = f"ACTIVE {tech_dir} SIGNAL"
+        actionable = True
+    elif tech_dir in ("LONG", "SHORT") and quality >= 65 and not ai_gate["allowed"]:
+        label = f"FILTERED {tech_dir} (GATE BLOCKED)"
+        actionable = False
+    elif tech_dir in ("LONG", "SHORT") and quality >= 50:
+        label = f"WATCH {tech_dir}"
+        actionable = False
+    else:
+        label = "NO TRADE / WAIT"
+        actionable = False
+
+    parts = [
+        f"Tech: {tech_dir} ({quality:.1f}/100)",
+        f"AI: {ai_dir}",
+        f"Macro: {macro_status}"
+    ]
+
+    return {
+        "label": label,
+        "direction": tech_dir if actionable else "WAIT",
+        "actionable": actionable,
+        "quality": quality,
+        "macro_status": macro_status,
+        "macro_bias": macro_signal.get("bias", "NEUTRAL") if isinstance(macro_signal, dict) else "NEUTRAL",
+        "gate_reason": ai_gate["reason"],
+        "summary": " | ".join(parts)
     }
 
 
@@ -2754,7 +2911,7 @@ st.title("₿ SALIGA AI PRO 31.0")
 
 st.caption(
     "ULTIMATE BTC INTELLIGENCE ENGINE | "
-    "OKX MARKET DATA | GROQ AI"
+    "OKX MARKET DATA | GROQ AI | MACRO SIGNAL"
 )
 
 st.write(
@@ -2882,8 +3039,12 @@ news_id = calculate_news_hash(
 )
 
 # ------------------------------------------------
-# ANALYSIS
+# MACRO & ANALYSIS
 # ------------------------------------------------
+
+macro_calendar = get_macro_calendar_data()
+macro_signal = analyze_macro_signal(macro_calendar)
+macro = get_macro_status(macro_calendar, macro_signal)
 
 structure = market_structure(main_df)
 
@@ -2950,11 +3111,9 @@ entry = calculate_entry_quality(
     liquidity,
     mtf,
     funding,
-    retest
+    retest,
+    macro_signal=macro_signal
 )
-
-macro = get_macro_status()
-macro_calendar = get_macro_calendar_data()
 
 latest = main_df.iloc[-1]
 
@@ -2982,7 +3141,7 @@ save_market_snapshot(
 )
 
 # ------------------------------------------------
-# GROQ AI PAYLOAD
+# GROQ AI PAYLOAD (WITH MACRO)
 # ------------------------------------------------
 
 market_payload = {
@@ -2992,6 +3151,7 @@ market_payload = {
 
     "technical": {
         "direction": entry["direction"],
+        "raw_score": entry["raw_score"],
         "score": entry["score"],
         "quality": entry["quality"],
         "stage": entry["stage"],
@@ -3033,10 +3193,12 @@ market_payload = {
     },
 
     "macro": macro,
+    "macro_signal": macro_signal,
 
     "macro_calendar": {
         "risk_window": macro_calendar["risk_window"],
         "next_high_impact": macro_calendar["next_high_impact"],
+        "imminent_high_impact": macro_calendar["imminent_high_impact"],
         "upcoming_events": macro_calendar["events"][:12]
     },
 
@@ -3051,7 +3213,8 @@ should_run_ai, trigger_reason = ai_due(
     news_id,
     oi,
     delta,
-    liquidity
+    liquidity,
+    macro_signal=macro_signal
 )
 
 if ai_enabled and GROQ_API_KEY and should_run_ai:
@@ -3059,7 +3222,7 @@ if ai_enabled and GROQ_API_KEY and should_run_ai:
     try:
 
         with st.spinner(
-            "Groq AI analyzing BTC market..."
+            "Groq AI analyzing BTC market & macro..."
         ):
 
             result = call_groq(
@@ -3078,7 +3241,7 @@ if ai_enabled and GROQ_API_KEY and should_run_ai:
 
         add_event(
             "GROQ AI",
-            f"Successful analysis: {trigger_reason}"
+            f"Successful analysis: {trigger_reason} | Macro: {macro_signal['status']}"
         )
 
     except Exception as error:
@@ -3099,12 +3262,22 @@ if not GROQ_API_KEY and ai_enabled:
     )
 
 # ------------------------------------------------
-# AI VALIDATION
+# AI & MACRO VALIDATION + UNIFIED SIGNAL
 # ------------------------------------------------
 
 ai_gate = check_ai_gate(
     entry,
-    ai_result
+    ai_result,
+    macro_signal=macro_signal,
+    macro_gate_active=macro_gate_enabled
+)
+
+unified_signal = build_unified_signal(
+    entry=entry,
+    ai_result=ai_result,
+    ai_gate=ai_gate,
+    macro_signal=macro_signal,
+    risk_levels=risk_levels
 )
 
 # ------------------------------------------------
@@ -3123,15 +3296,10 @@ if paper_enabled:
         funding_rate
     )
 
-    if (
-        entry["direction"] in ["LONG", "SHORT"]
-        and entry["quality"] >= 75
-        and ai_gate["allowed"]
-        and risk_levels is not None
-    ):
+    if unified_signal["actionable"]:
 
         open_paper_trade(
-            entry["direction"],
+            unified_signal["direction"],
             risk_levels,
             entry["score"]
         )
@@ -3151,9 +3319,11 @@ connection.execute(
         score,
         stage,
         regime,
+        macro_status,
+        signal_label,
         ai_gate
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
     (
         now_string(),
@@ -3162,6 +3332,8 @@ connection.execute(
         entry["score"],
         entry["stage"],
         regime["regime"],
+        macro_signal["status"],
+        unified_signal["label"],
         int(ai_gate["allowed"])
     )
 )
@@ -3211,40 +3383,53 @@ c5.metric(
 )
 
 # ================================================================
-# SMART ENTRY
+# SMART ENTRY & UNIFIED SIGNAL (WITH MACRO)
 # ================================================================
 
 st.divider()
 
-st.subheader("SMART ENTRY ENGINE")
+st.subheader("SMART ENTRY & SIGNAL ENGINE (TECHNICAL + MACRO + AI)")
 
-s1, s2, s3 = st.columns(3)
+sig1, sig2, sig3, sig4 = st.columns(4)
 
-s1.metric(
+sig1.metric(
+    "UNIFIED SIGNAL",
+    unified_signal["label"]
+)
+
+sig2.metric(
     "TECHNICAL DIRECTION",
     entry["direction"]
 )
 
-s2.metric(
+sig3.metric(
     "ENTRY QUALITY",
     f"{entry['quality']:.1f}/100"
 )
 
-s3.metric(
-    "ENTRY STAGE",
-    entry["stage"]
+sig4.metric(
+    "MACRO SIGNAL STATUS",
+    macro_signal["status"]
 )
 
 st.write(
-    f"**Market regime:** {regime['regime']}"
+    f"**Signal breakdown:** {unified_signal['summary']}"
 )
 
 st.write(
-    f"**Volatility:** {regime['volatility']}"
+    f"**Entry stage:** {entry['stage']}"
 )
 
 st.write(
-    f"**AI gate:** {ai_gate['reason']}"
+    f"**Market regime:** {regime['regime']} | **Volatility:** {regime['volatility']}"
+)
+
+st.write(
+    f"**Macro bias & note:** {macro_signal['bias']} — {macro_signal['reason']}"
+)
+
+st.write(
+    f"**AI & Macro gate:** {ai_gate['reason']}"
 )
 
 st.bar_chart(
@@ -3603,22 +3788,29 @@ st.warning(
     macro["message"]
 )
 
-mc1, mc2 = st.columns(2)
+mc1, mc2, mc3 = st.columns(3)
 
 mc1.metric(
+    "Macro Signal Status",
+    macro_signal["status"]
+)
+
+mc2.metric(
     "Macro Risk Window",
     macro_calendar["risk_window"]
 )
 
 next_hi = macro_calendar["next_high_impact"]
 
-mc2.metric(
+mc3.metric(
     "Next High-Impact Event",
     (
         f"{next_hi['currency']} {next_hi['event']} ({next_hi['hours_until']}h)"
         if next_hi else "None in window"
     )
 )
+
+st.write(f"**Macro signal note:** {macro_signal['reason']}")
 
 if macro_calendar["events"]:
 
@@ -3712,49 +3904,56 @@ else:
         )
 
         st.write(
-            ai_result.get(
+            "**Summary:** " + ai_result.get(
                 "summary",
                 "No summary."
             )
         )
 
         st.write(
-            ai_result.get(
+            "**Technical:** " + ai_result.get(
                 "technical_analysis",
                 ""
             )
         )
 
         st.write(
-            ai_result.get(
+            "**Order Flow:** " + ai_result.get(
                 "order_flow_analysis",
                 ""
             )
         )
 
         st.write(
-            ai_result.get(
+            "**Liquidity:** " + ai_result.get(
                 "liquidity_analysis",
                 ""
             )
         )
 
         st.write(
-            ai_result.get(
+            "**Macro Analysis:** " + ai_result.get(
+                "macro_analysis",
+                ""
+            )
+        )
+
+        st.write(
+            "**News Impact:** " + ai_result.get(
                 "news_impact",
                 ""
             )
         )
 
         st.write(
-            ai_result.get(
+            "**Risk:** " + ai_result.get(
                 "risk",
                 ""
             )
         )
 
         st.write(
-            ai_result.get(
+            "**Invalidation:** " + ai_result.get(
                 "invalidation",
                 ""
             )
@@ -3785,12 +3984,12 @@ else:
         )
 
 # ================================================================
-# AI / TECHNICAL AGREEMENT
+# AI / MACRO / TECHNICAL AGREEMENT
 # ================================================================
 
 st.divider()
 
-st.subheader("AI / Technical Agreement")
+st.subheader("AI / Macro / Technical Agreement")
 
 if ai_result:
 
@@ -3800,6 +3999,10 @@ if ai_result:
 
     st.write(
         f"AI: {ai_result['direction']}"
+    )
+
+    st.write(
+        f"Macro Signal: {macro_signal['status']} ({macro_signal['bias']})"
     )
 
     if ai_gate["allowed"]:
