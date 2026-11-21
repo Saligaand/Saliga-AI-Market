@@ -1760,7 +1760,10 @@ if ai_result:
     st.write(f"Technical: {entry['direction']}")
     st.write(f"AI: {ai_result['direction']}")
     st.write(f"Macro Signal: {macro_signal['status']} ({macro_signal['bias']})")
-    st.success(ai_gate["reason"]) if ai_gate["allowed"] else st.error(ai_gate["reason"])
+    if ai_gate["allowed"]:
+        st.success(ai_gate["reason"])
+    else:
+        st.error(ai_gate["reason"])
 else:
     st.warning("No successful AI validation. New paper trades are blocked.")
 
