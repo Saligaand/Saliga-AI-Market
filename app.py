@@ -764,8 +764,6 @@ def analyze_historical_patterns(df):
     }
 
 # ---------------- LIVE MACRO CALENDAR / DIRECTIONAL ENGINE ----------------
-# Primary calendar: public Forex Factory weekly JSON feed.
-# No synthetic release dates are generated. Missing values remain blank/unknown.
 FOREX_FACTORY_CALENDAR_URLS = [
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
     "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
@@ -822,7 +820,6 @@ def _fetch_forexfactory_calendar_cached():
                 })
         except Exception as exc:
             errors.append(f"{url}: {type(exc).__name__}: {exc}")
-    # Deduplicate the overlapping current/next-week feeds by event timestamp + currency + title.
     unique = {}
     for event in events:
         key = (event["datetime_utc"], event["currency"], event["event"])
@@ -830,7 +827,6 @@ def _fetch_forexfactory_calendar_cached():
     return list(unique.values()), errors, successful_sources, now_utc().isoformat()
 
 def _macro_numeric_value(value):
-    """Parse calendar values such as 3.2%, 210K, 1.4M, 2.1T; unknowns stay None."""
     if value is None:
         return None
     text_value = str(value).strip().upper().replace(",", "").replace(" ", "")
@@ -852,7 +848,6 @@ def _macro_numeric_value(value):
         return None
 
 def _score_macro_surprise(event):
-    """Score only published actual-vs-consensus surprises for relevant US macro releases."""
     if event.get("currency") != "USD":
         return 0.0, "NEUTRAL", "NO USD SURPRISE SCORE"
     actual = _macro_numeric_value(event.get("actual"))
@@ -866,8 +861,6 @@ def _score_macro_surprise(event):
     if abs(relative_surprise) < 0.0005:
         return 0.0, "NEUTRAL", "IN LINE WITH FORECAST"
     name = str(event.get("event", "")).lower()
-    # Higher inflation, stronger activity/retail sales and stronger payrolls can
-    # lift rate expectations/yields: typically a short-term BTC headwind.
     inflation_terms = ("cpi", "pce", "ppi", "inflation", "price index", "import prices")
     labor_strong_terms = ("non-farm", "nonfarm", "payroll", "employment change", "average hourly earnings", "wage")
     claims_terms = ("unemployment claims", "jobless claims", "initial claims", "continuing claims")
@@ -883,7 +876,6 @@ def _score_macro_surprise(event):
         category = "STRONGER THAN EXPECTED" if relative_surprise > 0 else "WEAKER THAN EXPECTED"
     else:
         return 0.0, "NEUTRAL", "RELEASED; NO GENERIC DIRECTION ASSIGNED"
-    # A bounded surprise contribution; it supplements, never replaces, market price action.
     magnitude = min(1.0, max(0.25, abs(relative_surprise) * 10.0))
     score = round(btc_sign * magnitude, 3)
     lean = "BULLISH_BTC" if score > 0 else "BEARISH_BTC"
@@ -917,7 +909,6 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
             surprise_score, macro_lean, surprise = _score_macro_surprise(event)
             combined.append({**event, "surprise_score": surprise_score, "macro_lean": macro_lean, "surprise": surprise})
 
-    # User-created events remain supported, but are clearly marked as manual, not live feed data.
     custom_rows = database_read(
         "SELECT id,event_date,time_utc,currency,event_name,impact,macro_lean,notes FROM macro_calendar WHERE event_date BETWEEN ? AND ? ORDER BY event_date,time_utc",
         (start_dt.isoformat(), end_dt.isoformat())
@@ -1021,7 +1012,6 @@ def analyze_macro_signal(macro_calendar, news_analysis=None, funding=None, direc
     else:
         reasons.append("No verified HIGH-impact calendar event in the immediate risk window.")
 
-    # Only already-published actual-vs-forecast surprises can create a data-driven macro tilt.
     surprise_events = [e for e in macro_calendar.get("events", []) if e.get("source") == "FOREX_FACTORY_LIVE" and safe_float(e.get("hours_until"), 999) <= 0 and safe_float(e.get("hours_until"), -999) >= -36 and abs(safe_float(e.get("surprise_score"))) > 0]
     surprise_total = 0.0
     for event in surprise_events:
@@ -1103,7 +1093,6 @@ def calculate_entry_quality(df, structure, regime, oi, delta, book, liquidity, m
     if funding["classification"] == "EXTREME LONG CROWDING": components["funding"] = -5
     elif funding["classification"] == "EXTREME SHORT CROWDING": components["funding"] = 5
     if isinstance(sr_analysis, dict):
-        # S/R is deliberately capped and cannot override macro gate or risk controls.
         components["support_resistance"] = clamp(safe_float(sr_analysis.get("directional_score")), -12, 12)
     raw_score = sum(v for k, v in components.items() if k not in ("macro", "support_resistance"))
     raw_score += components["support_resistance"]
@@ -1117,8 +1106,33 @@ def calculate_entry_quality(df, structure, regime, oi, delta, book, liquidity, m
     components["macro"] = round(macro_component, 2)
     score = raw_score + components["macro"]
     direction = "LONG" if score > 0 else "SHORT" if score < 0 else "WAIT"
-    quality = abs(score)
-    stage = "HIGH QUALITY SETUP" if quality >= 85 else "STRONG SETUP" if quality >= 75 else "EARLY SETUP" if quality >= 65 else "WATCH" if quality >= 50 else "WAIT"
+
+    # --- Ellenállás előtti LONG ellenőrzés (room-to-resistance check) ---
+    sr_blocked = False
+    if direction == "LONG" and isinstance(sr_analysis, dict):
+        price = safe_float(df["close"].iloc[-1])
+        atr = safe_float(df["atr"].iloc[-1])
+        b_state = str(sr_analysis.get("breakout_state", ""))
+        has_confirmed_breakout = b_state.startswith("BULLISH S/R BREAKOUT") or "BULLISH RETEST" in b_state
+        if not has_confirmed_breakout and price > 0:
+            candidates = [z for z in (sr_analysis.get("nearest_resistance"), sr_analysis.get("strongest_resistance")) if isinstance(z, dict)]
+            for res in candidates:
+                res_lower = safe_float(res.get("lower"))
+                res_score = safe_float(res.get("score"))
+                res_tfs = res.get("timeframes") or []
+                is_strong_or_htf = res_score >= 60 or any(tf in ("1H", "4H") for tf in res_tfs)
+                if res_lower > price and is_strong_or_htf:
+                    room_abs = res_lower - price
+                    room_pct = room_abs / price * 100
+                    min_room = max(atr * 1.2 if atr > 0 else 0.0, price * 0.0045)
+                    if room_abs < min_room or room_pct < 0.45:
+                        direction = "WAIT"
+                        score = 0.0
+                        sr_blocked = True
+                        break
+
+    quality = 0.0 if sr_blocked else abs(score)
+    stage = "RESISTANCE BLOCK - WAIT" if sr_blocked else ("HIGH QUALITY SETUP" if quality >= 85 else "STRONG SETUP" if quality >= 75 else "EARLY SETUP" if quality >= 65 else "WATCH" if quality >= 50 else "WAIT")
     if macro_signal and macro_signal.get("block_new_trade"): stage = "MACRO EVENT HOLD (<=1h)"
     elif regime["volatility"] == "EXTREME": stage = "HIGH VOLATILITY - CAUTION"
     return {"direction": direction, "raw_score": round(raw_score, 2), "score": round(score, 2), "quality": round(quality, 2), "stage": stage, "components": components}
@@ -1451,7 +1465,6 @@ flow = analyze_position_flow(oi, delta, structure)
 patterns = analyze_historical_patterns(main_df)
 reversals = analyze_reversals(main_df, structure, delta, liquidity, divergences)
 
-# Multi-timeframe S/R is calculated from all fetched candle sets.
 sr_analysis = analyze_support_resistance(timeframe_data, price)
 
 entry = calculate_entry_quality(
@@ -1825,7 +1838,6 @@ try:
             open=chart_df["open"], high=chart_df["high"], low=chart_df["low"],
             close=chart_df["close"], name="BTC"
         ))
-        # Draw S/R zones as shaded rectangles; use chart timeframe coordinates.
         x0 = pd.to_datetime(chart_df["timestamp"].iloc[0], unit="ms")
         x1 = pd.to_datetime(chart_df["timestamp"].iloc[-1], unit="ms")
         for zone in sr_analysis.get("zones", []):
