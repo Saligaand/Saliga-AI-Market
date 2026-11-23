@@ -48,6 +48,7 @@ NEWS_FEEDS = {
     "Cointelegraph": "https://cointelegraph.com/rss"
 }
 REQUEST_TIMEOUT = 15
+DEFAULT_TELEGRAM_BOT_TOKEN = "9112981021:AAHXIfGBAzq_oWUgs5Z1vAIoxGMuY-u4-nw"
 
 # ---------------- STREAMLIT CONFIG ----------------
 st.set_page_config(page_title=APP_NAME, page_icon="₿", layout="wide")
@@ -71,6 +72,8 @@ def load_secret(name, default=""):
 
 GROQ_API_KEY = load_secret("GROQ_API_KEY", "")
 GROQ_MODEL = load_secret("GROQ_MODEL", GROQ_DEFAULT_MODEL)
+TELEGRAM_BOT_TOKEN = load_secret("TELEGRAM_BOT_TOKEN", DEFAULT_TELEGRAM_BOT_TOKEN)
+TELEGRAM_CHAT_ID = load_secret("TELEGRAM_CHAT_ID", "")
 
 # ---------------- DATABASE ----------------
 def get_connection():
@@ -128,11 +131,11 @@ DEFAULT_STATE = {
     "last_ai_time": 0, "last_ai_result": None, "last_ai_error": None,
     "last_news_hash": None, "last_trigger_time": 0, "last_oi": None,
     "last_price": None, "last_refresh": None, "last_news": [],
-    "last_data_errors": []
+    "last_data_errors": [], "seen_news_keys": [], "alerted_macro_keys": []
 }
 for key, value in DEFAULT_STATE.items():
     if key not in st.session_state:
-        st.session_state[key] = value
+        st.session_state[key] = list(value) if isinstance(value, list) else value
 
 # ---------------- SIDEBAR ----------------
 st.sidebar.title("SALIGA AI PRO 31.2")
@@ -188,6 +191,58 @@ def database_read(query, params=()):
     result = pd.read_sql_query(query, connection, params=params)
     connection.close()
     return result
+
+def send_telegram_alert(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=10
+        )
+    except Exception:
+        pass
+
+def process_news_and_macro_alerts(news_analysis, macro_calendar):
+    seen_news = set(st.session_state.get("seen_news_keys", []))
+    first_news_run = len(seen_news) == 0
+    for article in news_analysis.get("articles", []):
+        key = hashlib.sha256((article.get("source", "") + "|" + article.get("title", "")).lower().encode()).hexdigest()
+        if key not in seen_news:
+            seen_news.add(key)
+            stance = article.get("stance", "Neutral")
+            if not first_news_run and stance in ("Bullish", "Bearish"):
+                msg = f"BTC HÍR [{stance}]: {article.get('title')} ({article.get('source')})"
+                send_telegram_alert(msg)
+                add_event("ALERT NEWS", msg)
+    st.session_state.seen_news_keys = list(seen_news)[-200:]
+
+    alerted_macro = set(st.session_state.get("alerted_macro_keys", []))
+    first_macro_run = len(alerted_macro) == 0
+    for ev in macro_calendar.get("events", []):
+        ev_key = f"{ev.get('date')}|{ev.get('time_utc')}|{ev.get('currency')}|{ev.get('event')}"
+        hours_until = safe_float(ev.get("hours_until"), 999)
+        impact = str(ev.get("impact", "")).upper()
+        actual = str(ev.get("actual") or "").strip()
+        stance = ev.get("stance", "Neutral")
+        has_release = hours_until <= 0 and actual not in ("", "-", "N/A", "NA", "--", "TBD")
+        upcoming_high = impact == "HIGH" and 0 <= hours_until <= 0.5
+        if has_release or upcoming_high:
+            state_key = f"{ev_key}|{'REL' if has_release else 'UP'}"
+            if state_key not in alerted_macro:
+                alerted_macro.add(state_key)
+                if not first_macro_run:
+                    if has_release:
+                        msg = (
+                            f"MAKRO ADAT [{stance}]: {ev.get('currency')} - {ev.get('event')} "
+                            f"(Actual: {actual} | Forecast: {ev.get('forecast') or '-'} | Prev: {ev.get('previous') or '-'})"
+                        )
+                    else:
+                        msg = f"KÖZELGŐ HIGH MAKRO ({hours_until:.2f}h): {ev.get('currency')} - {ev.get('event')} [{stance}]"
+                    send_telegram_alert(msg)
+                    add_event("ALERT MACRO", msg)
+    st.session_state.alerted_macro_keys = list(alerted_macro)[-200:]
 
 # ---------------- OKX API ----------------
 def okx_request(endpoint, params=None):
@@ -1475,6 +1530,7 @@ book = analyze_order_book(book_raw)
 oi = analyze_open_interest(oi_raw)
 funding = analyze_funding(funding_raw)
 macro_calendar = get_macro_calendar_data()
+process_news_and_macro_alerts(news_analysis, macro_calendar)
 macro_signal = analyze_macro_signal(macro_calendar, news_analysis=news_analysis, funding=funding, directional_weight=macro_directional_weight)
 macro = get_macro_status(macro_calendar, macro_signal)
 liquidity = analyze_liquidity(main_df)
