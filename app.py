@@ -1185,7 +1185,9 @@ def analyze_news_sentiment(news):
         content = (article["title"] + " " + article["description"]).lower()
         positive = sum(word in content for word in POSITIVE_WORDS)
         negative = sum(word in content for word in NEGATIVE_WORDS)
-        scored.append({**article, "sentiment": clamp(positive - negative, -2, 2)})
+        raw_s = clamp(positive - negative, -2, 2)
+        stance = "Bullish" if raw_s > 0 else "Bearish" if raw_s < 0 else "Neutral"
+        scored.append({**article, "sentiment": raw_s, "stance": stance})
     if not scored:
         return {"score": 0, "classification": "NO NEWS DATA", "articles": []}
     average = float(np.mean([x["sentiment"] for x in scored]))
@@ -1492,7 +1494,7 @@ market_payload = {
     "historical_patterns": patterns,
     "news": {
         "classification": news_analysis["classification"], "score": news_analysis["score"],
-        "headlines": [{"source": x["source"], "title": x["title"], "description": x["description"], "sentiment": x["sentiment"]} for x in news_analysis["articles"][:5]]
+        "headlines": [{"source": x["source"], "title": x["title"], "description": x["description"], "sentiment": x["sentiment"], "stance": x["stance"]} for x in news_analysis["articles"][:5]]
     },
     "macro": macro, "macro_signal": macro_signal,
     "macro_calendar": {
@@ -1677,9 +1679,16 @@ n1.metric("News Sentiment", news_analysis["classification"])
 n2.metric("Sentiment Score", f"{news_analysis['score']:.2f}")
 if news_analysis["articles"]:
     for article in news_analysis["articles"]:
+        stance = article.get("stance", "Neutral")
+        badge_color = "#2e7d32" if stance == "Bullish" else "#c62828" if stance == "Bearish" else "#607d8b"
+        st.markdown(
+            f"<div style='margin-bottom:4px;'><span style='color:#9aa7b8;font-size:0.85em;'>{article['published']}</span> "
+            f"<span style='color:{badge_color};font-weight:700;margin-left:6px;'>{stance}</span></div>",
+            unsafe_allow_html=True
+        )
         with st.expander(f"{article['source']} | {article['title']}"):
             st.write(article["description"])
-            st.write(f"Sentiment: {article['sentiment']}")
+            st.write(f"Sentiment: {article['sentiment']} ({stance})")
             st.write(f"Published: {article['published']}")
             if article["link"]: st.markdown(f"[Open article]({article['link']})")
 else:
