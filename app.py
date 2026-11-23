@@ -881,6 +881,15 @@ def _score_macro_surprise(event):
     lean = "BULLISH_BTC" if score > 0 else "BEARISH_BTC"
     return score, lean, category
 
+def _macro_event_stance(event):
+    lean = str(event.get("macro_lean") or "NEUTRAL").upper()
+    score = safe_float(event.get("surprise_score"), 0.0)
+    if lean in ("BULLISH_BTC", "DOVISH_RELIEF") or score > 0:
+        return "Bullish"
+    if lean in ("BEARISH_BTC", "HAWKISH_RISK") or score < 0:
+        return "Bearish"
+    return "Neutral"
+
 def add_macro_event(event_date, time_utc, currency, event_name, impact="HIGH", macro_lean="NEUTRAL", notes=""):
     connection = get_connection()
     connection.execute(
@@ -924,7 +933,7 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
             })
 
     enriched = []
-    next_high_impact = next_minor_impact = imminent_high_impact = imminent_medium_impact = None
+    next_high_impact = next_minor_impact = imminent_high_impact = imminent_medium_impact = last_released_event = None
     min_future_high_hours = min_future_any_hours = None
     for ev in combined:
         try:
@@ -938,20 +947,28 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
             continue
         hours_until = (ev_dt - now).total_seconds() / 3600
         impact = str(ev.get("impact", "LOW")).upper()
+        stance = _macro_event_stance(ev)
+        ev_enriched = {**ev, "hours_until": round(hours_until, 2), "stance": stance, "_dt": ev_dt}
+        if hours_until <= 0:
+            if last_released_event is None or ev_dt > last_released_event["_dt"]:
+                last_released_event = ev_enriched
         if hours_until >= 0:
             min_future_any_hours = hours_until if min_future_any_hours is None else min(min_future_any_hours, hours_until)
             if impact == "HIGH":
                 min_future_high_hours = hours_until if min_future_high_hours is None else min(min_future_high_hours, hours_until)
                 if next_high_impact is None:
-                    next_high_impact = {**ev, "hours_until": round(hours_until, 2)}
+                    next_high_impact = {k: v for k, v in ev_enriched.items() if k != "_dt"}
                 if hours_until <= 2 and (imminent_high_impact is None or hours_until < imminent_high_impact["hours_until"]):
-                    imminent_high_impact = {**ev, "hours_until": round(hours_until, 2)}
+                    imminent_high_impact = {k: v for k, v in ev_enriched.items() if k != "_dt"}
             else:
                 if next_minor_impact is None:
-                    next_minor_impact = {**ev, "hours_until": round(hours_until, 2)}
+                    next_minor_impact = {k: v for k, v in ev_enriched.items() if k != "_dt"}
                 if impact == "MEDIUM" and hours_until <= 2 and (imminent_medium_impact is None or hours_until < imminent_medium_impact["hours_until"]):
-                    imminent_medium_impact = {**ev, "hours_until": round(hours_until, 2)}
-        enriched.append({**ev, "hours_until": round(hours_until, 2)})
+                    imminent_medium_impact = {k: v for k, v in ev_enriched.items() if k != "_dt"}
+        enriched.append({k: v for k, v in ev_enriched.items() if k != "_dt"})
+
+    if last_released_event is not None:
+        last_released_event = {k: v for k, v in last_released_event.items() if k != "_dt"}
 
     enriched.sort(key=lambda x: (x["date"], x["time_utc"], x["currency"], x["event"]))
     if not feed_sources:
@@ -975,6 +992,7 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
         "calendar_available": bool(feed_sources),
         "risk_window": risk_window,
         "next_high_impact": next_high_impact, "next_minor_impact": next_minor_impact,
+        "last_released_event": last_released_event,
         "imminent_high_impact": imminent_high_impact, "imminent_medium_impact": imminent_medium_impact,
         "min_abs_hours": round(min_future_high_hours, 2) if min_future_high_hours is not None else None,
         "min_any_hours": round(min_future_any_hours, 2) if min_future_any_hours is not None else None,
@@ -1500,6 +1518,7 @@ market_payload = {
     "macro_calendar": {
         "risk_window": macro_calendar["risk_window"], "next_high_impact": macro_calendar["next_high_impact"],
         "next_minor_impact": macro_calendar.get("next_minor_impact"),
+        "last_released_event": macro_calendar.get("last_released_event"),
         "imminent_high_impact": macro_calendar["imminent_high_impact"],
         "imminent_medium_impact": macro_calendar.get("imminent_medium_impact"),
         "upcoming_events": macro_calendar["events"][:15]
@@ -1711,11 +1730,24 @@ mc2.metric("Macro Risk Window", macro_calendar["risk_window"])
 next_hi, next_min = macro_calendar["next_high_impact"], macro_calendar.get("next_minor_impact")
 mc3.metric("Next High-Impact Event", f"{next_hi['currency']} {next_hi['event']} ({next_hi['hours_until']}h)" if next_hi else "None in window")
 mc4.metric("Next Medium/Low Event", f"[{next_min['impact']}] {next_min['currency']} {next_min['event']} ({next_min['hours_until']}h)" if next_min else "None in window")
+last_ev = macro_calendar.get("last_released_event")
+if last_ev:
+    ev_stance = last_ev.get("stance", "Neutral")
+    ev_color = "#2e7d32" if ev_stance == "Bullish" else "#c62828" if ev_stance == "Bearish" else "#607d8b"
+    st.markdown(
+        f"<div style='margin:6px 0 8px 0;padding:8px 12px;border-left:3px solid {ev_color};background:#111a27;border-radius:6px;'>"
+        f"<span style='color:#9aa7b8;font-size:0.85em;'>{last_ev['date']} {last_ev['time_utc']} UTC</span> "
+        f"<span style='color:{ev_color};font-weight:700;margin-left:6px;'>{ev_stance}</span><br>"
+        f"<span style='font-weight:600;'>{last_ev['currency']} – {last_ev['event']}</span> "
+        f"<span style='color:#9aa7b8;font-size:0.85em;'>(Actual: {last_ev.get('actual') or '-'} | Forecast: {last_ev.get('forecast') or '-'} | Previous: {last_ev.get('previous') or '-'})</span>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
 st.write(f"**Macro directional tilt:** {macro_signal['directional_score']:+.2f}")
 st.write(f"**Macro signal note:** {macro_signal['reason']}")
 if macro_calendar["events"]:
     macro_table = pd.DataFrame(macro_calendar["events"])
-    display_columns = [c for c in ["date", "time_utc", "currency", "impact", "event", "actual", "forecast", "previous", "surprise", "source", "hours_until"] if c in macro_table.columns]
+    display_columns = [c for c in ["date", "time_utc", "currency", "impact", "event", "stance", "actual", "forecast", "previous", "surprise", "source", "hours_until"] if c in macro_table.columns]
     st.dataframe(macro_table[display_columns], use_container_width=True, hide_index=True)
 else:
     st.warning("No calendar events returned for the selected date window. This is not interpreted as proof that no economic events exist.")
