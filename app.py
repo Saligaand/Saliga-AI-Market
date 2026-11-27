@@ -179,6 +179,7 @@ st.sidebar.caption("ULTIMATE BTC INTELLIGENCE ENGINE")
 st.sidebar.success("Groq API: configured" if GROQ_API_KEY else "Groq API: missing")
 st.sidebar.caption(f"Model: {GROQ_MODEL}")
 ai_enabled = st.sidebar.toggle("Groq AI enabled", value=True)
+force_ai_now = st.sidebar.button("AI ELEMZÉS MOST", use_container_width=True)
 macro_gate_enabled = st.sidebar.toggle("Macro event gate (<=1h HIGH)", value=True)
 macro_directional_weight = st.sidebar.slider("Macro directional influence", 0.0, 15.0, 8.0, 0.5)
 auto_refresh = st.sidebar.toggle("Automatic refresh", value=True)
@@ -1381,7 +1382,7 @@ def analyze_news_sentiment(news):
         positive = sum(word in content for word in POSITIVE_WORDS)
         negative = sum(word in content for word in NEGATIVE_WORDS)
         raw_sentiment = clamp(positive - negative, -2, 2)
-        stance = "Strong Bullish" if raw_sentiment >= 2 else "Bullish" if raw_sentiment == 1 else "Strong Bearish" if raw_sentiment <= -2 else "Bearish" if raw_sentiment == -1 else "Neutral"
+        stance = "ERŐSEN BIKÁS" if raw_sentiment >= 2 else "BIKÁS" if raw_sentiment == 1 else "ERŐSEN MEDVÉS" if raw_sentiment <= -2 else "MEDVÉS" if raw_sentiment == -1 else "SEMLEGES"
         scored.append({**article, "sentiment": raw_sentiment, "stance": stance, "priority": rank_news_article(article)})
     scored.sort(key=lambda x: (x.get("priority", 0), x.get("published", ""), x.get("engagement", 0)), reverse=True)
     if not scored:
@@ -1399,7 +1400,7 @@ def call_groq(payload):
         raise RuntimeError("GROQ_API_KEY is missing from secrets.toml or environment.")
     system_prompt = (
         "You are SALIGA AI PRO 31.3, an analytical BTC market intelligence engine. "
-        "Output valid JSON only. Analyze technicals, order flow, liquidity, macro, news and especially the supplied support_resistance engine. "
+        "Write every user-facing explanation in clear Hungarian. Keep JSON keys and direction values in the required schema, but all text values must be Hungarian. Output valid JSON only. Analyze technicals, order flow, liquidity, macro, news and especially the supplied support_resistance engine. "
         "S/R zones are high-priority context: evaluate strength, touches, timeframe confluence, rejection, volume confirmation, distance, role reversal, breakout/retest and false-breakout state. "
         "Do not call a zone a confirmed breakout unless candle closes beyond its boundary. Distinguish wick-only false breaks. "
         "News items are pre-ranked by importance and recency; review them in supplied order, with priority 10-15 first. "
@@ -1423,11 +1424,14 @@ def call_groq(payload):
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
         ]
     }
-    response = requests.post(
-        GROQ_API_URL,
+    try:
+        response = requests.post(
+            GROQ_API_URL,
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        json=request_data, timeout=45
-    )
+            json=request_data, timeout=60
+        )
+    except requests.RequestException as error:
+        raise RuntimeError(f"Groq hálózati/API kapcsolat hiba: {type(error).__name__}: {error}") from error
     if response.status_code == 429:
         raise RuntimeError(f"Groq rate limit 429. Retry-After: {response.headers.get('Retry-After', 'not provided')}. AI result not marked successful.")
     if response.status_code >= 400:
@@ -1709,6 +1713,10 @@ market_payload = {
 }
 
 should_run_ai, trigger_reason = ai_due(news_id, oi, delta, liquidity, macro_signal=macro_signal)
+if st.session_state.last_ai_result is None:
+    should_run_ai, trigger_reason = True, "FIRST ANALYSIS / NO PREVIOUS RESULT"
+if force_ai_now:
+    should_run_ai, trigger_reason = True, "MANUAL USER REQUEST"
 if ai_enabled and GROQ_API_KEY and should_run_ai:
     try:
         with st.spinner("Groq AI analyzing BTC market, S/R and macro..."):
@@ -1874,19 +1882,19 @@ st.caption("Historical similarity is descriptive, not a calibrated prediction.")
 
 # ---------------- NEWS ----------------
 st.divider()
-st.subheader("News Intelligence")
+st.subheader("HÍREK – BIKÁS / MEDVÉS ÉRTÉKELÉS")
 n1, n2 = st.columns(2)
-n1.metric("News Sentiment", news_analysis["classification"])
-n2.metric("Sentiment Score", f"{news_analysis['score']:.2f}")
+n1.metric("Hírek összesített iránya", news_analysis["classification"])
+n2.metric("Hangulati pontszám", f"{news_analysis['score']:.2f}")
 if news_analysis["articles"]:
     rss_count = sum(1 for x in news_analysis["articles"] if x.get("channel") != "X")
     x_count = sum(1 for x in news_analysis["articles"] if x.get("channel") == "X")
     st.caption(f"Collected: {len(news_analysis['articles'])} | RSS: {rss_count} | X posts (>=100k followers): {x_count} | Sorted by importance")
     for rank, article in enumerate(news_analysis["articles"], start=1):
-        label = f"#{rank} | P{article.get('priority', 0)} | {article['stance']} | {article['source']} | {article['title']}"
+        label = f"#{rank} | PRIORITÁS {article.get('priority', 0)} | {article['stance']} | {article['source']} | {article['title']}"
         with st.expander(label):
             st.write(article["description"])
-            st.write(f"Sentiment: {article['stance']} ({article['sentiment']:+d})")
+            st.markdown(f"**HÍR IRÁNYA: {article['stance']}** · Pontszám: {article['sentiment']:+d}")
             st.write(f"Priority: {article.get('priority', 0)}/15")
             st.write(f"Published: {article['published']}")
             if article.get("channel") == "X":
@@ -1948,9 +1956,9 @@ with st.expander("Add / Manage Custom Macro Events (Manual SQLite Events)"):
 
 # ---------------- GROQ ----------------
 st.divider()
-st.subheader("GROQ AI INTELLIGENCE")
+st.subheader("GROQ AI ELEMZÉS")
 if not GROQ_API_KEY:
-    st.error("Groq API key not found. Check .streamlit/secrets.toml.")
+    st.error("A Groq API-kulcs nem található. Ellenőrizd a Streamlit Secrets-ben a GROQ_API_KEY nevű értéket.")
 elif not ai_enabled:
     st.info("Groq AI is disabled.")
 else:
@@ -1971,7 +1979,7 @@ else:
         st.write("**Invalidation:** " + ai_result.get("invalidation", ""))
         with st.expander("Full AI response"): st.json(ai_result)
     else:
-        st.info("No successful AI analysis yet.")
+        st.info("Még nincs sikeres AI-elemzés. Kattints a bal oldali AI ELEMZÉS MOST gombra.")
     st.caption(f"AI trigger: {trigger_reason}")
     if st.session_state.last_ai_time:
         st.caption("Last successful AI update: " + datetime.fromtimestamp(st.session_state.last_ai_time, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
