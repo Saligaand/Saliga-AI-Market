@@ -3,6 +3,20 @@
 # ULTIMATE BTC INTELLIGENCE ENGINE 31.5
 # BTC ONLY | OKX | GROQ AI | NO EMA | NO SMA
 #
+# Original 31.0 features retained:
+# Secrets, SQLite/migrations, OKX market data, MTF, market structure/regime,
+# OI, funding, order book, delta, position flow, liquidity sweep,
+# breakout/retest, divergences, historical patterns, RSS news,
+# Groq AI, macro calendar/directional macro engine, conflict/macro gate,
+# entry quality, risk management, paper trading, fees/slippage,
+# signal/event journals, CSV exports, API health and dashboard.
+#
+# Enhanced in 31.1 S/R + 31.2 live macro calendar:
+# Multi-timeframe Support/Resistance zones, clustered pivot levels,
+# independent touch counting, rejection/volume/recency scoring,
+# role reversal, false-breakout detection, breakout/retest states,
+# S/R confluence score, AI payload and chart zone visualization.
+#
 # Analysis and paper trading only. No guarantee of profitability.
 # ================================================================
 
@@ -45,6 +59,7 @@ NEWS_FEEDS = {
     "CryptoPotato": "https://cryptopotato.com/feed/",
     "CoinJournal": "https://coinjournal.net/news/feed/",
 }
+# Public X RSS/index collection is best-effort; no X API key is used.
 X_RSSHUB_URL = "https://rsshub.app/twitter/user/{}"
 X_GOOGLE_NEWS_URL = "https://news.google.com/rss/search?q={}&hl=en-US&gl=US&ceid=US:en"
 X_ACCOUNTS = [
@@ -1404,6 +1419,14 @@ def call_groq(payload):
         '"support_resistance_analysis":"string","macro_analysis":"string","news_impact":"string",'
         '"risk":"string","invalidation":"string"}'
     )
+    compact_headlines = []
+    for h in (payload.get("news", {}).get("headlines", []) or [])[:5]:
+        compact_headlines.append({
+            "source": h.get("source"),
+            "title": str(h.get("title", ""))[:160],
+            "sentiment": h.get("sentiment"),
+            "stance": h.get("stance"),
+        })
     compact_payload = {
         "instrument": payload.get("instrument"),
         "timestamp": payload.get("timestamp"),
@@ -1423,7 +1446,7 @@ def call_groq(payload):
         "news": {
             "classification": payload.get("news", {}).get("classification"),
             "score": payload.get("news", {}).get("score"),
-            "headlines": payload.get("news", {}).get("headlines", [])[:8],
+            "headlines": compact_headlines,
         },
         "macro": payload.get("macro"),
         "macro_signal": payload.get("macro_signal"),
@@ -1431,7 +1454,7 @@ def call_groq(payload):
             "risk_window": payload.get("macro_calendar", {}).get("risk_window"),
             "next_high_impact": payload.get("macro_calendar", {}).get("next_high_impact"),
             "next_minor_impact": payload.get("macro_calendar", {}).get("next_minor_impact"),
-            "upcoming_events": payload.get("macro_calendar", {}).get("upcoming_events", [])[:8],
+            "upcoming_events": payload.get("macro_calendar", {}).get("upcoming_events", [])[:5],
         },
         "risk_levels": payload.get("risk_levels"),
     }
@@ -1443,39 +1466,52 @@ def call_groq(payload):
     last_err = None
     for model_name in models_to_try:
         request_data = {
-            "model": model_name, "temperature": 0.1, "max_tokens": 1700,
+            "model": model_name,
+            "temperature": 0.1,
+            "max_tokens": 1300,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":"))}
             ]
         }
-        response = requests.post(
-            GROQ_API_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json=request_data, timeout=45
-        )
-        if response.status_code == 429:
-            last_err = RuntimeError(f"Groq rate limit 429 ({model_name}). Retry-After: {response.headers.get('Retry-After', 'not provided')}.")
-            continue
-        if response.status_code >= 400:
-            last_err = RuntimeError(f"Groq HTTP {response.status_code} ({model_name}): {response.text[:600]}")
-            continue
-        content = response.json()["choices"][0]["message"]["content"]
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            parsed = json.loads(content.replace("```json", "").replace("```", "").strip())
-        if not isinstance(parsed, dict):
-            raise RuntimeError("Groq returned an invalid response structure.")
-        direction = str(parsed.get("direction", "WAIT")).upper()
-        parsed["direction"] = direction if direction in ("LONG", "SHORT", "WAIT") else "WAIT"
-        parsed["conflict"] = bool(parsed.get("conflict", False))
-        parsed["_model_used"] = model_name
-        for key in ("macro_analysis", "support_resistance_analysis"):
-            if not parsed.get(key):
-                parsed[key] = "No separate analysis returned."
-        return parsed
+        for attempt in range(2):
+            response = requests.post(
+                GROQ_API_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json=request_data,
+                timeout=45
+            )
+            if response.status_code == 429:
+                retry_raw = response.headers.get("Retry-After", "5")
+                try:
+                    wait_sec = clamp(float(retry_raw), 1.0, 12.0)
+                except Exception:
+                    wait_sec = 5.0
+                last_err = RuntimeError(f"Groq rate limit 429 ({model_name}). Retry-After: {retry_raw}.")
+                if attempt == 0:
+                    time.sleep(wait_sec)
+                    continue
+                break
+            if response.status_code >= 400:
+                last_err = RuntimeError(f"Groq HTTP {response.status_code} ({model_name}): {response.text[:600]}")
+                break
+
+            content = response.json()["choices"][0]["message"]["content"]
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                parsed = json.loads(content.replace("```json", "").replace("```", "").strip())
+            if not isinstance(parsed, dict):
+                raise RuntimeError("Groq returned an invalid response structure.")
+            direction = str(parsed.get("direction", "WAIT")).upper()
+            parsed["direction"] = direction if direction in ("LONG", "SHORT", "WAIT") else "WAIT"
+            parsed["conflict"] = bool(parsed.get("conflict", False))
+            parsed["_model_used"] = model_name
+            for key in ("macro_analysis", "support_resistance_analysis"):
+                if not parsed.get(key):
+                    parsed[key] = "No separate analysis returned."
+            return parsed
 
     raise last_err or RuntimeError("Groq call failed.")
 
@@ -1682,7 +1718,6 @@ st.session_state.last_news = news_raw
 news_analysis = analyze_news_sentiment(news_raw)
 news_id = calculate_news_hash(news_raw)
 
-# Régebbi hírek megjelölése feldolgozottként, hogy oldalnyitáskor ne nyisson rájuk azonnal
 for art in news_analysis.get("articles", []):
     akey = hashlib.sha256((art.get("source", "") + "|" + art.get("title", "")).lower().encode()).hexdigest()
     tkey = f"NEWS|{akey}"
