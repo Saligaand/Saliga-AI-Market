@@ -1,21 +1,7 @@
 # ================================================================
 # AI PRO by Sali
-# ULTIMATE BTC INTELLIGENCE ENGINE 31.2
+# ULTIMATE BTC INTELLIGENCE ENGINE 31.5 (FIXED MACRO + GROQ AI)
 # BTC ONLY | OKX | GROQ AI | NO EMA | NO SMA
-#
-# Original 31.0 features retained:
-# Secrets, SQLite/migrations, OKX market data, MTF, market structure/regime,
-# OI, funding, order book, delta, position flow, liquidity sweep,
-# breakout/retest, divergences, historical patterns, RSS news,
-# Groq AI, macro calendar/directional macro engine, conflict/macro gate,
-# entry quality, risk management, paper trading, fees/slippage,
-# signal/event journals, CSV exports, API health and dashboard.
-#
-# Enhanced in 31.1 S/R + 31.2 live macro calendar:
-# Multi-timeframe Support/Resistance zones, clustered pivot levels,
-# independent touch counting, rejection/volume/recency scoring,
-# role reversal, false-breakout detection, breakout/retest states,
-# S/R confluence score, AI payload and chart zone visualization.
 #
 # Analysis and paper trading only. No guarantee of profitability.
 # ================================================================
@@ -44,7 +30,7 @@ APP_NAME = "AI PRO by Sali"
 INSTRUMENT = "BTC-USDT-SWAP"
 BASE_URL = "https://www.okx.com"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_DEFAULT_MODEL = "openai/gpt-oss-120b"
+GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
 DATABASE_FILE = "saliga_ai_31.db"
 TIMEFRAMES = {"1m": "1m", "5m": "5m", "15m": "15m", "1H": "1H", "4H": "4H"}
 NEWS_FEEDS = {
@@ -59,7 +45,6 @@ NEWS_FEEDS = {
     "CryptoPotato": "https://cryptopotato.com/feed/",
     "CoinJournal": "https://coinjournal.net/news/feed/",
 }
-# Public X RSS/index collection is best-effort; no X API key is used.
 X_RSSHUB_URL = "https://rsshub.app/twitter/user/{}"
 X_GOOGLE_NEWS_URL = "https://news.google.com/rss/search?q={}&hl=en-US&gl=US&ceid=US:en"
 X_ACCOUNTS = [
@@ -92,12 +77,18 @@ h1,h2,h3,h4,h5,h6 {color:#ffffff !important;}
 # ---------------- SECRETS ----------------
 def load_secret(name, default=""):
     try:
-        value = st.secrets.get(name, default)
-        if value:
-            return str(value)
+        if name in st.secrets and st.secrets[name]:
+            return str(st.secrets[name]).strip()
     except Exception:
         pass
-    return os.getenv(name, default)
+    try:
+        value = st.secrets.get(name, default)
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    env_val = os.getenv(name, default)
+    return str(env_val).strip() if env_val else default
 
 GROQ_API_KEY = load_secret("GROQ_API_KEY", "")
 GROQ_MODEL = load_secret("GROQ_MODEL", GROQ_DEFAULT_MODEL)
@@ -224,7 +215,7 @@ def database_read(query, params=()):
 def okx_request(endpoint, params=None):
     response = requests.get(
         BASE_URL + endpoint, params=params or {}, timeout=REQUEST_TIMEOUT,
-        headers={"User-Agent": "SALIGA-AI-PRO-31.1"}
+        headers={"User-Agent": "SALIGA-AI-PRO-31.5"}
     )
     response.raise_for_status()
     data = response.json()
@@ -352,7 +343,6 @@ def market_structure(df):
 
 # ---------------- ENHANCED SUPPORT / RESISTANCE ENGINE ----------------
 def _pivot_points(df, left=3, right=3):
-    """Confirmed swing pivots. The right-side bars prevent using unconfirmed pivots."""
     points = []
     if df.empty or len(df) < left + right + 5:
         return points
@@ -367,7 +357,6 @@ def _pivot_points(df, left=3, right=3):
     return points
 
 def _cluster_sr_points(points, tolerance):
-    """Cluster nearby pivot prices; each cluster becomes a price zone."""
     clusters = []
     for point in sorted(points, key=lambda x: x["price"]):
         chosen = None
@@ -389,12 +378,9 @@ def _score_sr_cluster(cluster, df, timeframe, current_price, atr):
     spread = float(np.max(prices) - np.min(prices)) if len(prices) > 1 else 0.0
     zone_half = max(atr * 0.12, center * 0.00025, spread * 0.55)
     lower, upper = center - zone_half, center + zone_half
-    # Count independent reactions, not adjacent candles repeatedly touching the same zone.
     touch_indices = []
     rejection_strengths = []
     volumes = []
-    # Evaluate pivots in chronological order so nearby price-sorted points
-    # cannot accidentally suppress or inflate independent reaction counts.
     for point in sorted(cluster, key=lambda item: item["index"]):
         idx = int(point["index"])
         if not touch_indices or idx - touch_indices[-1] >= 3:
@@ -434,7 +420,6 @@ def _score_sr_cluster(cluster, df, timeframe, current_price, atr):
 def _build_sr_zones_for_timeframe(df, timeframe):
     if df.empty or len(df) < 35:
         return []
-    # Use timeframe-adaptive pivots and ATR; pivot history is limited to avoid stale zones.
     work = df.tail(260).reset_index(drop=True)
     atr = safe_float(work["atr"].iloc[-1], 0.0) if "atr" in work else 0.0
     price = safe_float(work["close"].iloc[-1])
@@ -459,7 +444,6 @@ def _build_sr_zones_for_timeframe(df, timeframe):
     return zones
 
 def analyze_support_resistance(timeframe_data, current_price):
-    """Multi-timeframe S/R confluence, zone strength, breakout and role-reversal logic."""
     all_zones = []
     for tf in ("1m", "5m", "15m", "1H", "4H"):
         df = timeframe_data.get(tf, pd.DataFrame())
@@ -472,7 +456,6 @@ def analyze_support_resistance(timeframe_data, current_price):
             "zones": [], "directional_score": 0, "summary": "No valid price."
         }
 
-    # Merge zones across timeframes when their price bands overlap or centers are close.
     merged = []
     for zone in sorted(all_zones, key=lambda z: z["center"]):
         match = None
@@ -498,7 +481,6 @@ def analyze_support_resistance(timeframe_data, current_price):
             match["rejection"] = round(max(match["rejection"], zone["rejection"]), 3)
             match["volume_confirmation"] = round(max(match["volume_confirmation"], zone["volume_confirmation"]), 3)
 
-    # Classify zones relative to price and detect breaks / failed breaks.
     for zone in merged:
         if zone["lower"] <= current_price <= zone["upper"]:
             zone["position"] = "PRICE INSIDE ZONE"
@@ -509,8 +491,6 @@ def analyze_support_resistance(timeframe_data, current_price):
         zone["distance"] = abs(current_price - zone["center"])
         zone["distance_pct"] = zone["distance"] / current_price * 100
         zone["mtf_confluence"] = len(zone["timeframes"])
-        # Reversal of function: old resistance below price may now act as support;
-        # old support above price may now act as resistance after a move through it.
         if zone["position"] == "BELOW PRICE" and zone["type"] == "RESISTANCE":
             zone["role"] = "POSSIBLE RESISTANCE-TO-SUPPORT"
         elif zone["position"] == "ABOVE PRICE" and zone["type"] == "SUPPORT":
@@ -521,7 +501,6 @@ def analyze_support_resistance(timeframe_data, current_price):
 
     supports = [z for z in merged if z["upper"] < current_price and z["type"] == "SUPPORT"]
     resistances = [z for z in merged if z["lower"] > current_price and z["type"] == "RESISTANCE"]
-    # A broken prior resistance/support may be used as a role-reversal candidate.
     supports += [z for z in merged if z["upper"] < current_price and z["role"] == "POSSIBLE RESISTANCE-TO-SUPPORT"]
     resistances += [z for z in merged if z["lower"] > current_price and z["role"] == "POSSIBLE SUPPORT-TO-RESISTANCE"]
     nearest_support = max(supports, key=lambda z: z["center"], default=None)
@@ -529,7 +508,6 @@ def analyze_support_resistance(timeframe_data, current_price):
     strongest_support = max(supports, key=lambda z: z["score"], default=None)
     strongest_resistance = max(resistances, key=lambda z: z["score"], default=None)
 
-    # Latest candle across the principal execution timeframe, otherwise first available.
     execution_df = timeframe_data.get("5m", pd.DataFrame())
     if execution_df.empty:
         execution_df = timeframe_data.get("1m", pd.DataFrame())
@@ -561,7 +539,6 @@ def analyze_support_resistance(timeframe_data, current_price):
         elif nearest_support and safe_float(last["close"]) < nearest_support["center"] and safe_float(last["high"]) >= nearest_support["lower"] and safe_float(last["close"]) <= nearest_support["lower"]:
             breakout_state = "BEARISH RETEST OF BROKEN SUPPORT"
 
-    # Bounded directional contribution; proximity to a strong zone is context, not a signal alone.
     directional_score = 0.0
     if nearest_support:
         proximity = clamp(1 - nearest_support["distance_pct"] / 1.5, 0, 1)
@@ -795,18 +772,43 @@ def analyze_historical_patterns(df):
     }
 
 # ---------------- LIVE MACRO CALENDAR / DIRECTIONAL ENGINE ----------------
-# Primary calendar: public Forex Factory weekly JSON feed.
-# No synthetic release dates are generated. Missing values remain blank/unknown.
 FOREX_FACTORY_CALENDAR_URLS = [
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
     "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
 ]
+MACRO_FALLBACK_RSS_URLS = [
+    ("Google News USD Macro", "https://news.google.com/rss/search?q=(Federal+Reserve+OR+FOMC+OR+CPI+OR+Nonfarm+Payrolls+OR+Treasury+yields)+USD&hl=en-US&gl=US&ceid=US:en"),
+]
 MACRO_RELEVANT_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CNY", "CAD", "AUD", "CHF", "NZD"}
+
+def _parse_ff_event_datetime(raw_date):
+    s = str(raw_date or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+    return None
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _fetch_forexfactory_calendar_cached():
     events, errors, successful_sources = [], [], []
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; SALIGA-AI-PRO/31.2; +https://www.forexfactory.com/)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    }
     for url in FOREX_FACTORY_CALENDAR_URLS:
         try:
             response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -823,12 +825,8 @@ def _fetch_forexfactory_calendar_cached():
                 raw_date = str(raw.get("date") or raw.get("datetime") or "").strip()
                 if not title or not raw_date:
                     continue
-                try:
-                    parsed_dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-                    if parsed_dt.tzinfo is None:
-                        parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
-                    event_dt = parsed_dt.astimezone(timezone.utc)
-                except Exception:
+                event_dt = _parse_ff_event_datetime(raw_date)
+                if event_dt is None:
                     continue
                 impact_raw = str(raw.get("impact") or "LOW").strip().upper()
                 impact = "HIGH" if "HIGH" in impact_raw else "MEDIUM" if "MEDIUM" in impact_raw else "LOW"
@@ -849,11 +847,48 @@ def _fetch_forexfactory_calendar_cached():
                     "surprise_score": 0.0,
                     "surprise": "NOT RELEASED / NO VERIFIED ACTUAL",
                     "source": "FOREX_FACTORY_LIVE",
-                    "notes": "Live public economic-calendar feed; actual/forecast/previous shown as supplied by source."
+                    "notes": "Live public economic-calendar feed."
                 })
         except Exception as exc:
             errors.append(f"{url}: {type(exc).__name__}: {exc}")
-    # Deduplicate the overlapping current/next-week feeds by event timestamp + currency + title.
+
+    # Ha a Forex Factory JSON blokkolt vagy elérhetetlen, makró RSS-ből hozunk élő makró esemény-híreket
+    if not successful_sources:
+        for src_name, rss_url in MACRO_FALLBACK_RSS_URLS:
+            try:
+                resp = requests.get(rss_url, headers={"User-Agent": "Mozilla/5.0 SALIGA-AI-PRO/31.5"}, timeout=8)
+                resp.raise_for_status()
+                root = ET.fromstring(resp.content)
+                for item in root.findall(".//item")[:10]:
+                    title = " ".join((item.findtext("title") or "").split())[:220]
+                    pub = item.findtext("pubDate") or ""
+                    try:
+                        dt = parsedate_to_datetime(pub).astimezone(timezone.utc) if pub else now_utc()
+                    except Exception:
+                        dt = now_utc()
+                    if title:
+                        events.append({
+                            "id": None,
+                            "date": dt.date().isoformat(),
+                            "time_utc": dt.strftime("%H:%M"),
+                            "datetime_utc": dt.isoformat(),
+                            "currency": "USD",
+                            "event": title,
+                            "impact": "MEDIUM",
+                            "actual": "",
+                            "forecast": "",
+                            "previous": "",
+                            "macro_lean": "NEUTRAL",
+                            "surprise_score": 0.0,
+                            "surprise": "MACRO FEED FALLBACK",
+                            "source": "MACRO_RSS_FALLBACK",
+                            "notes": src_name
+                        })
+                if events:
+                    successful_sources.append(src_name)
+            except Exception as exc:
+                errors.append(f"{src_name}: {type(exc).__name__}: {exc}")
+
     unique = {}
     for event in events:
         key = (event["datetime_utc"], event["currency"], event["event"])
@@ -861,7 +896,6 @@ def _fetch_forexfactory_calendar_cached():
     return list(unique.values()), errors, successful_sources, now_utc().isoformat()
 
 def _macro_numeric_value(value):
-    """Parse calendar values such as 3.2%, 210K, 1.4M, 2.1T; unknowns stay None."""
     if value is None:
         return None
     text_value = str(value).strip().upper().replace(",", "").replace(" ", "")
@@ -883,7 +917,6 @@ def _macro_numeric_value(value):
         return None
 
 def _score_macro_surprise(event):
-    """Score only published actual-vs-consensus surprises for relevant US macro releases."""
     if event.get("currency") != "USD":
         return 0.0, "NEUTRAL", "NO USD SURPRISE SCORE"
     actual = _macro_numeric_value(event.get("actual"))
@@ -897,8 +930,6 @@ def _score_macro_surprise(event):
     if abs(relative_surprise) < 0.0005:
         return 0.0, "NEUTRAL", "IN LINE WITH FORECAST"
     name = str(event.get("event", "")).lower()
-    # Higher inflation, stronger activity/retail sales and stronger payrolls can
-    # lift rate expectations/yields: typically a short-term BTC headwind.
     inflation_terms = ("cpi", "pce", "ppi", "inflation", "price index", "import prices")
     labor_strong_terms = ("non-farm", "nonfarm", "payroll", "employment change", "average hourly earnings", "wage")
     claims_terms = ("unemployment claims", "jobless claims", "initial claims", "continuing claims")
@@ -914,7 +945,6 @@ def _score_macro_surprise(event):
         category = "STRONGER THAN EXPECTED" if relative_surprise > 0 else "WEAKER THAN EXPECTED"
     else:
         return 0.0, "NEUTRAL", "RELEASED; NO GENERIC DIRECTION ASSIGNED"
-    # A bounded surprise contribution; it supplements, never replaces, market price action.
     magnitude = min(1.0, max(0.25, abs(relative_surprise) * 10.0))
     score = round(btc_sign * magnitude, 3)
     lean = "BULLISH_BTC" if score > 0 else "BEARISH_BTC"
@@ -928,6 +958,7 @@ def add_macro_event(event_date, time_utc, currency, event_name, impact="HIGH", m
     )
     connection.commit()
     connection.close()
+    _fetch_forexfactory_calendar_cached.clear()
     add_event("MACRO CALENDAR", f"Added custom event: {event_date} {time_utc} UTC | {currency} {event_name} ({impact}, {macro_lean})")
 
 def delete_macro_event(event_id):
@@ -935,6 +966,7 @@ def delete_macro_event(event_id):
     connection.execute("DELETE FROM macro_calendar WHERE id=?", (int(event_id),))
     connection.commit()
     connection.close()
+    _fetch_forexfactory_calendar_cached.clear()
     add_event("MACRO CALENDAR", f"Deleted custom event ID #{event_id}")
 
 def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
@@ -948,7 +980,6 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
             surprise_score, macro_lean, surprise = _score_macro_surprise(event)
             combined.append({**event, "surprise_score": surprise_score, "macro_lean": macro_lean, "surprise": surprise})
 
-    # User-created events remain supported, but are clearly marked as manual, not live feed data.
     custom_rows = database_read(
         "SELECT id,event_date,time_utc,currency,event_name,impact,macro_lean,notes FROM macro_calendar WHERE event_date BETWEEN ? AND ? ORDER BY event_date,time_utc",
         (start_dt.isoformat(), end_dt.isoformat())
@@ -967,15 +998,14 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
     next_high_impact = next_minor_impact = imminent_high_impact = imminent_medium_impact = None
     min_future_high_hours = min_future_any_hours = None
     for ev in combined:
-        try:
-            if ev.get("datetime_utc"):
-                ev_dt = datetime.fromisoformat(ev["datetime_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
-            else:
+        ev_dt = _parse_ff_event_datetime(ev.get("datetime_utc"))
+        if ev_dt is None:
+            try:
                 hh, mm = [int(x) for x in (ev.get("time_utc") or "00:00").split(":")[:2]]
                 y, m, d = [int(x) for x in ev["date"].split("-")[:3]]
                 ev_dt = datetime(y, m, d, hh, mm, tzinfo=timezone.utc)
-        except Exception:
-            continue
+            except Exception:
+                continue
         hours_until = (ev_dt - now).total_seconds() / 3600
         impact = str(ev.get("impact", "LOW")).upper()
         if hours_until >= 0:
@@ -994,7 +1024,8 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
         enriched.append({**ev, "hours_until": round(hours_until, 2)})
 
     enriched.sort(key=lambda x: (x["date"], x["time_utc"], x["currency"], x["event"]))
-    if not feed_sources:
+    has_any_data = bool(feed_sources) or bool(enriched)
+    if not has_any_data:
         risk_window = "CALENDAR DATA UNAVAILABLE"
     elif imminent_high_impact is not None:
         risk_window = "IMMINENT / ACTIVE HIGH-IMPACT EVENT (<=2h)"
@@ -1007,12 +1038,12 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
     else:
         risk_window = "NORMAL - LIVE CALENDAR CHECKED"
     return {
-        "mode": "LIVE_FOREX_FACTORY_JSON" if feed_sources else "LIVE_CALENDAR_UNAVAILABLE",
-        "source": "Forex Factory public economic calendar JSON",
+        "mode": "LIVE_FOREX_FACTORY_JSON" if any("faireconomy.media" in s for s in feed_sources) else ("MACRO_FALLBACK_ACTIVE" if has_any_data else "LIVE_CALENDAR_UNAVAILABLE"),
+        "source": "Forex Factory + Macro Fallback",
         "source_urls": feed_sources,
         "fetched_at": fetched_at,
         "feed_errors": feed_errors,
-        "calendar_available": bool(feed_sources),
+        "calendar_available": has_any_data,
         "risk_window": risk_window,
         "next_high_impact": next_high_impact, "next_minor_impact": next_minor_impact,
         "imminent_high_impact": imminent_high_impact, "imminent_medium_impact": imminent_medium_impact,
@@ -1020,12 +1051,6 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
         "min_any_hours": round(min_future_any_hours, 2) if min_future_any_hours is not None else None,
         "events": enriched
     }
-
-def _lean_to_signed_tilt(lean):
-    value = str(lean or "NEUTRAL").upper()
-    if value in ("HAWKISH_RISK", "BEARISH_BTC"): return -1.0
-    if value in ("DOVISH_RELIEF", "BULLISH_BTC"): return 1.0
-    return 0.0
 
 def analyze_macro_signal(macro_calendar, news_analysis=None, funding=None, directional_weight=8.0):
     risk_window = macro_calendar.get("risk_window", "CALENDAR DATA UNAVAILABLE")
@@ -1052,7 +1077,6 @@ def analyze_macro_signal(macro_calendar, news_analysis=None, funding=None, direc
     else:
         reasons.append("No verified HIGH-impact calendar event in the immediate risk window.")
 
-    # Only already-published actual-vs-forecast surprises can create a data-driven macro tilt.
     surprise_events = [e for e in macro_calendar.get("events", []) if e.get("source") == "FOREX_FACTORY_LIVE" and safe_float(e.get("hours_until"), 999) <= 0 and safe_float(e.get("hours_until"), -999) >= -36 and abs(safe_float(e.get("surprise_score"))) > 0]
     surprise_total = 0.0
     for event in surprise_events:
@@ -1099,7 +1123,7 @@ def get_macro_status(macro_cal=None, macro_signal=None):
         "macro_bias": macro_signal["bias"], "macro_directional_score": macro_signal.get("directional_score", 0),
         "macro_reason": macro_signal["reason"], "next_high_impact": macro_cal["next_high_impact"],
         "next_minor_impact": macro_cal.get("next_minor_impact"),
-        "message": ("Live Forex Factory economic calendar connected. Actual, forecast and previous values are sourced from the feed; missing values are not invented." if available else "Live economic calendar unavailable. No synthetic release dates or fabricated Actual/Forecast/Previous values are used. Check network/feed availability.")
+        "message": ("Macro calendar data active." if available else "Live economic calendar unavailable. Check network/feed availability.")
     }
 
 # ---------------- ENTRY QUALITY (S/R ADDED) ----------------
@@ -1134,7 +1158,6 @@ def calculate_entry_quality(df, structure, regime, oi, delta, book, liquidity, m
     if funding["classification"] == "EXTREME LONG CROWDING": components["funding"] = -5
     elif funding["classification"] == "EXTREME SHORT CROWDING": components["funding"] = 5
     if isinstance(sr_analysis, dict):
-        # S/R is deliberately capped and cannot override macro gate or risk controls.
         components["support_resistance"] = clamp(safe_float(sr_analysis.get("directional_score")), -12, 12)
     raw_score = sum(v for k, v in components.items() if k not in ("macro", "support_resistance"))
     raw_score += components["support_resistance"]
@@ -1172,7 +1195,6 @@ def _clean_news_text(value, limit=900):
     raw = re.sub(r"<[^>]+>", " ", raw)
     return " ".join(raw.split())[:limit]
 
-
 def _parse_feed_datetime(value):
     if not value:
         return ""
@@ -1189,7 +1211,6 @@ def _parse_feed_datetime(value):
             return dt.astimezone(timezone.utc).isoformat()
         except Exception:
             return str(value)
-
 
 def _feed_items(root):
     items = root.findall(".//item")
@@ -1209,7 +1230,6 @@ def _feed_items(root):
                "published": item.findtext("a:published", default="", namespaces=ns) or item.findtext("a:updated", default="", namespaces=ns),
                "link": link_el.attrib.get("href", "") if link_el is not None else ""}
 
-
 def _fetch_one_rss_feed(source, url):
     response = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0 SALIGA-AI-PRO/31.5"})
     response.raise_for_status()
@@ -1224,10 +1244,8 @@ def _fetch_one_rss_feed(source, url):
                           "link": raw.get("link", ""), "channel": "RSS", "followers": None, "engagement": 0})
     return found
 
-
 def fetch_rss_news():
     articles, errors = [], []
-    # Each source is isolated. A timeout or bad RSS response cannot stop the app.
     with ThreadPoolExecutor(max_workers=min(12, max(1, len(NEWS_FEEDS)))) as pool:
         jobs = {pool.submit(_fetch_one_rss_feed, source, url): source for source, url in NEWS_FEEDS.items()}
         for future in as_completed(jobs):
@@ -1238,11 +1256,9 @@ def fetch_rss_news():
                 errors.append(f"{source}: {type(error).__name__}")
     return articles, errors
 
-
 def _fetch_one_x_account(username):
     headers = {"User-Agent": "Mozilla/5.0 SALIGA-AI-PRO/31.5"}
     keywords = ("bitcoin", "btc", "crypto", "ethereum", "etf", "sec", "fed", "inflation", "cpi", "rates", "treasury", "yield", "liquidation", "stablecoin", "market", "macro")
-    # Public RSSHub endpoint; no authenticated X API. Availability is not guaranteed by X.
     try:
         response = requests.get(X_RSSHUB_URL.format(username), headers=headers, timeout=4)
         response.raise_for_status()
@@ -1261,7 +1277,6 @@ def _fetch_one_x_account(username):
             return found
     except Exception:
         pass
-    # Google News index fallback is incomplete and is not a full X search.
     try:
         query = requests.utils.quote(f'site:x.com/{username} (bitcoin OR BTC OR crypto OR macro OR ETF OR Fed)')
         response = requests.get(X_GOOGLE_NEWS_URL.format(query), headers=headers, timeout=5)
@@ -1280,20 +1295,17 @@ def _fetch_one_x_account(username):
     except Exception:
         return []
 
-
 def fetch_x_news():
     articles = []
     usernames = list(dict.fromkeys(X_ACCOUNTS))
     with ThreadPoolExecutor(max_workers=min(12, len(usernames) or 1)) as pool:
         futures = [pool.submit(_fetch_one_x_account, username) for username in usernames]
-        # No global as_completed timeout: each request has its own short timeout.
         for future in as_completed(futures):
             try:
                 articles.extend(future.result())
             except Exception:
                 continue
     return articles, []
-
 
 def fetch_news():
     rss_articles, rss_errors = fetch_rss_news()
@@ -1351,37 +1363,80 @@ def call_groq(payload):
         '"support_resistance_analysis":"string","macro_analysis":"string","news_impact":"string",'
         '"risk":"string","invalidation":"string"}'
     )
-    request_data = {
-        "model": GROQ_MODEL, "temperature": 0.1, "max_tokens": 1700,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
-        ]
+    compact_payload = {
+        "instrument": payload.get("instrument"),
+        "timestamp": payload.get("timestamp"),
+        "price": payload.get("price"),
+        "technical": payload.get("technical"),
+        "support_resistance": {
+            "status": payload.get("support_resistance", {}).get("status"),
+            "breakout_state": payload.get("support_resistance", {}).get("breakout_state"),
+            "nearest_support": payload.get("support_resistance", {}).get("nearest_support"),
+            "nearest_resistance": payload.get("support_resistance", {}).get("nearest_resistance"),
+            "directional_score": payload.get("support_resistance", {}).get("directional_score"),
+            "summary": payload.get("support_resistance", {}).get("summary"),
+        },
+        "order_flow": payload.get("order_flow"),
+        "liquidity": payload.get("liquidity"),
+        "historical_patterns": payload.get("historical_patterns"),
+        "news": {
+            "classification": payload.get("news", {}).get("classification"),
+            "score": payload.get("news", {}).get("score"),
+            "headlines": payload.get("news", {}).get("headlines", [])[:8],
+        },
+        "macro": payload.get("macro"),
+        "macro_signal": payload.get("macro_signal"),
+        "macro_calendar": {
+            "risk_window": payload.get("macro_calendar", {}).get("risk_window"),
+            "next_high_impact": payload.get("macro_calendar", {}).get("next_high_impact"),
+            "next_minor_impact": payload.get("macro_calendar", {}).get("next_minor_impact"),
+            "upcoming_events": payload.get("macro_calendar", {}).get("upcoming_events", [])[:8],
+        },
+        "risk_levels": payload.get("risk_levels"),
     }
-    response = requests.post(
-        GROQ_API_URL,
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        json=request_data, timeout=45
-    )
-    if response.status_code == 429:
-        raise RuntimeError(f"Groq rate limit 429. Retry-After: {response.headers.get('Retry-After', 'not provided')}. AI result not marked successful.")
-    if response.status_code >= 400:
-        raise RuntimeError(f"Groq HTTP {response.status_code}: {response.text[:1000]}")
-    content = response.json()["choices"][0]["message"]["content"]
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        parsed = json.loads(content.replace("```json", "").replace("```", "").strip())
-    if not isinstance(parsed, dict):
-        raise RuntimeError("Groq returned an invalid response structure.")
-    direction = str(parsed.get("direction", "WAIT")).upper()
-    parsed["direction"] = direction if direction in ("LONG", "SHORT", "WAIT") else "WAIT"
-    parsed["conflict"] = bool(parsed.get("conflict", False))
-    for key in ("macro_analysis", "support_resistance_analysis"):
-        if not parsed.get(key):
-            parsed[key] = "No separate analysis returned."
-    return parsed
+    models_to_try = [GROQ_MODEL] if GROQ_MODEL else []
+    for fallback_model in ("llama-3.3-70b-versatile", "llama-3.1-8b-instant"):
+        if fallback_model not in models_to_try:
+            models_to_try.append(fallback_model)
+
+    last_err = None
+    for model_name in models_to_try:
+        request_data = {
+            "model": model_name, "temperature": 0.1, "max_tokens": 1700,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":"))}
+            ]
+        }
+        response = requests.post(
+            GROQ_API_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json=request_data, timeout=45
+        )
+        if response.status_code == 429:
+            last_err = RuntimeError(f"Groq rate limit 429 ({model_name}). Retry-After: {response.headers.get('Retry-After', 'not provided')}.")
+            continue
+        if response.status_code >= 400:
+            last_err = RuntimeError(f"Groq HTTP {response.status_code} ({model_name}): {response.text[:600]}")
+            continue
+        content = response.json()["choices"][0]["message"]["content"]
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            parsed = json.loads(content.replace("```json", "").replace("```", "").strip())
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Groq returned an invalid response structure.")
+        direction = str(parsed.get("direction", "WAIT")).upper()
+        parsed["direction"] = direction if direction in ("LONG", "SHORT", "WAIT") else "WAIT"
+        parsed["conflict"] = bool(parsed.get("conflict", False))
+        parsed["_model_used"] = model_name
+        for key in ("macro_analysis", "support_resistance_analysis"):
+            if not parsed.get(key):
+                parsed[key] = "No separate analysis returned."
+        return parsed
+
+    raise last_err or RuntimeError("Groq call failed.")
 
 # ---------------- AI SCHEDULER ----------------
 def ai_due(news_id, oi, delta, liquidity, macro_signal=None):
@@ -1603,7 +1658,6 @@ flow = analyze_position_flow(oi, delta, structure)
 patterns = analyze_historical_patterns(main_df)
 reversals = analyze_reversals(main_df, structure, delta, liquidity, divergences)
 
-# Multi-timeframe S/R is calculated from all fetched candle sets.
 sr_analysis = analyze_support_resistance(timeframe_data, price)
 
 entry = calculate_entry_quality(
@@ -1656,7 +1710,7 @@ if ai_enabled and GROQ_API_KEY and should_run_ai:
         st.session_state.last_trigger_time = time.time()
         st.session_state.last_news_hash = news_id
         st.session_state.last_ai_error = None
-        add_event("GROQ AI", f"Successful analysis: {trigger_reason} | Macro: {macro_signal['status']} | S/R: {sr_analysis['status']}")
+        add_event("GROQ AI", f"Successful analysis ({result.get('_model_used', GROQ_MODEL)}): {trigger_reason}")
     except Exception as error:
         st.session_state.last_ai_error = str(error)
         add_event("GROQ AI ERROR", str(error))
@@ -1854,7 +1908,7 @@ if macro_calendar["events"]:
     display_columns = [c for c in ["date", "time_utc", "currency", "impact", "event", "actual", "forecast", "previous", "surprise", "source", "hours_until"] if c in macro_table.columns]
     st.dataframe(macro_table[display_columns], use_container_width=True, hide_index=True)
 else:
-    st.warning("No calendar events returned for the selected date window. This is not interpreted as proof that no economic events exist.")
+    st.warning("No calendar events returned for the selected date window.")
 
 with st.expander("Add / Manage Custom Macro Events (Manual SQLite Events)"):
     with st.form("add_macro_event_form", clear_on_submit=True):
@@ -1891,7 +1945,7 @@ elif not ai_enabled:
 else:
     if st.session_state.last_ai_error: st.error(st.session_state.last_ai_error)
     if ai_result:
-        st.success("Last successful AI analysis")
+        st.success(f"Last successful AI analysis ({ai_result.get('_model_used', GROQ_MODEL)})")
         a1, a2 = st.columns(2)
         a1.metric("AI Direction", ai_result.get("direction", "UNKNOWN"))
         a2.metric("AI Confidence", ai_result.get("confidence", "N/A"))
@@ -1980,7 +2034,6 @@ try:
             open=chart_df["open"], high=chart_df["high"], low=chart_df["low"],
             close=chart_df["close"], name="BTC"
         ))
-        # Draw S/R zones as shaded rectangles; use chart timeframe coordinates.
         x0 = pd.to_datetime(chart_df["timestamp"].iloc[0], unit="ms")
         x1 = pd.to_datetime(chart_df["timestamp"].iloc[-1], unit="ms")
         for zone in sr_analysis.get("zones", []):
@@ -2022,7 +2075,3 @@ if auto_refresh:
         st_autorefresh(interval=refresh_seconds * 1000, key="saliga_auto_refresh")
     except ImportError:
         st.warning("Install streamlit-autorefresh for automatic refresh.")
-
-# ================================================================
-# END OF SALIGA AI PRO 31.5
-# ================================================================
