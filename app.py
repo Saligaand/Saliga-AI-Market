@@ -1,6 +1,6 @@
 # ================================================================
 # AI PRO by Sali
-# ULTIMATE BTC INTELLIGENCE ENGINE 31.3
+# ULTIMATE BTC INTELLIGENCE ENGINE 31.4
 # BTC ONLY | OKX | GROQ AI | NO EMA | NO SMA
 #
 # Original 31.0 features retained:
@@ -38,6 +38,7 @@ from email.utils import parsedate_to_datetime
 
 from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 APP_NAME = "AI PRO by Sali"
 INSTRUMENT = "BTC-USDT-SWAP"
@@ -60,7 +61,7 @@ NEWS_FEEDS = {
     "DL News": "https://www.dlnews.com/arc/outboundfeeds/rss/",
     "CryptoPotato": "https://cryptopotato.com/feed/",
     "CoinJournal": "https://coinjournal.net/news/feed/",
-    "Reuters Business": "https://feeds.reuters.com/reuters/businessNews",
+    "Reuters (Google News index)": "https://news.google.com/rss/search?q=site%3Areuters.com+(bitcoin+OR+crypto+OR+Federal+Reserve+OR+markets)&hl=en-US&gl=US&ceid=US:en",
     "CNBC Finance": "https://www.cnbc.com/id/100003114/device/rss/rss.html",
 }
 X_MIN_FOLLOWERS = 100000  # Account list is manually curated; public RSS does not expose live follower counts.
@@ -73,7 +74,7 @@ X_ACCOUNTS = [
     "santimentfeed", "CryptoQuant_com", "DocumentingBTC",
     "BitcoinNewsCom", "CointelegraphMT", "WuBlockchain",
 ]
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 7
 
 # ---------------- STREAMLIT CONFIG ----------------
 st.set_page_config(page_title=APP_NAME, page_icon="₿", layout="wide")
@@ -174,7 +175,7 @@ for key, value in DEFAULT_STATE.items():
         st.session_state[key] = value
 
 # ---------------- SIDEBAR ----------------
-st.sidebar.title("SALIGA AI PRO 31.3")
+st.sidebar.title("SALIGA AI PRO 31.4")
 st.sidebar.caption("ULTIMATE BTC INTELLIGENCE ENGINE")
 st.sidebar.success("Groq API: configured" if GROQ_API_KEY else "Groq API: missing")
 st.sidebar.caption(f"Model: {GROQ_MODEL}")
@@ -815,7 +816,7 @@ MACRO_RELEVANT_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CNY", "CAD", "AUD", "C
 @st.cache_data(ttl=600, show_spinner=False)
 def _fetch_forexfactory_calendar_cached():
     events, errors, successful_sources = [], [], []
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; SALIGA-AI-PRO/31.3; +https://www.forexfactory.com/)"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SALIGA-AI-PRO/31.4; +https://www.forexfactory.com/)"}
     for url in FOREX_FACTORY_CALENDAR_URLS:
         try:
             response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -1207,7 +1208,7 @@ def _feed_items(root):
         for item in items:
             yield {
                 "title": item.findtext("title") or "",
-                "description": item.findtext("description") or item.findtext("content:encoded") or "",
+                "description": item.findtext("description") or next((el.text or "" for el in item.iter() if el.tag.endswith("}encoded") or el.tag.endswith(":encoded")), ""),
                 "published": item.findtext("pubDate") or item.findtext("published") or item.findtext("updated") or "",
                 "link": item.findtext("link") or "",
             }
@@ -1223,108 +1224,104 @@ def _feed_items(root):
         }
 
 
+def _fetch_one_rss_feed(source, url):
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SALIGA-AI-PRO/31.4)"}
+    response = requests.get(url, timeout=5, headers=headers)
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    articles = []
+    for raw in list(_feed_items(root))[:15]:
+        title = _clean_news_text(raw.get("title", ""), 300)
+        if not title:
+            continue
+        # Google News titles commonly append the actual publisher after a dash.
+        actual_source = source
+        if source == "Reuters (Google News index)" and " - " in title:
+            maybe_title, publisher = title.rsplit(" - ", 1)
+            if "reuters" in publisher.lower():
+                title, actual_source = maybe_title, "Reuters"
+        articles.append({"source": actual_source, "title": title,
+            "description": _clean_news_text(raw.get("description", ""), 900),
+            "published": _parse_feed_datetime(raw.get("published", "")),
+            "link": raw.get("link", ""), "channel": "RSS", "followers": None, "engagement": 0})
+    return articles
+
+
 def fetch_rss_news():
     articles, errors = [], []
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; SALIGA-AI-PRO/31.3)"}
-    for source, url in NEWS_FEEDS.items():
-        try:
-            response = requests.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
-            response.raise_for_status()
-            root = ET.fromstring(response.content)
-            for raw in list(_feed_items(root))[:15]:
-                title = _clean_news_text(raw.get("title", ""), 300)
-                if not title:
-                    continue
-                articles.append({
-                    "source": source,
-                    "title": title,
-                    "description": _clean_news_text(raw.get("description", ""), 900),
-                    "published": _parse_feed_datetime(raw.get("published", "")),
-                    "link": raw.get("link", ""),
-                    "channel": "RSS",
-                    "followers": None,
-                    "engagement": 0,
-                })
-        except Exception as error:
-            errors.append(f"RSS {source}: {type(error).__name__}: {error}")
+    # Parallel fetching keeps a slow/broken publisher from blocking Groq analysis.
+    with ThreadPoolExecutor(max_workers=min(16, len(NEWS_FEEDS) or 1)) as pool:
+        jobs = {pool.submit(_fetch_one_rss_feed, source, url): source for source, url in NEWS_FEEDS.items()}
+        for future in as_completed(jobs, timeout=8):
+            source = jobs[future]
+            try:
+                articles.extend(future.result())
+            except Exception as error:
+                errors.append(f"{source}: {type(error).__name__}")
     return articles, errors
+
+
+def _fetch_one_x_account(username):
+    """Best-effort public X RSS/index lookup; no X API key required."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SALIGA-AI-PRO/31.4)"}
+    terms = ("bitcoin", "btc", "crypto", "cryptocurrency", "ethereum", "etf", "sec", "fed",
+             "federal reserve", "inflation", "cpi", "rates", "treasury", "yield", "liquidation",
+             "stablecoin", "blockchain", "market", "macro", "dollar", "usd", "oil")
+    # First public RSSHub endpoint only; short timeout prevents news collection
+    # from blocking the whole market/AI refresh when a mirror is unavailable.
+    try:
+        response = requests.get(X_RSSHUB_BASES[0] + username, headers=headers, timeout=4)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        items = list(_feed_items(root))
+        found = []
+        for raw in items[:8]:
+            title = _clean_news_text(raw.get("title", ""), 300)
+            description = _clean_news_text(raw.get("description", ""), 900)
+            combined = (title + " " + description).lower()
+            if title and any(term in combined for term in terms):
+                found.append({"source": f"X @{username}", "title": title, "description": description,
+                    "published": _parse_feed_datetime(raw.get("published", "")),
+                    "link": raw.get("link", "") or f"https://x.com/{username}", "channel": "X",
+                    "followers": None, "engagement": 0,
+                    "account_filter": "CURATED_100K_PLUS_LIST; live follower count unavailable"})
+        if found:
+            return found
+    except Exception:
+        pass
+    # Google News indexed-X fallback. One short request per account.
+    try:
+        query = requests.utils.quote(f'site:x.com/{username} (bitcoin OR BTC OR crypto OR macro OR ETF OR Fed)')
+        response = requests.get(X_GOOGLE_NEWS_URL.format(query=query), headers=headers, timeout=4)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        found = []
+        for raw in list(_feed_items(root))[:5]:
+            title = _clean_news_text(raw.get("title", ""), 300)
+            description = _clean_news_text(raw.get("description", ""), 900)
+            if title:
+                found.append({"source": f"X @{username} (indexed)", "title": title, "description": description,
+                    "published": _parse_feed_datetime(raw.get("published", "")),
+                    "link": raw.get("link", "") or f"https://x.com/{username}", "channel": "X",
+                    "followers": None, "engagement": 0,
+                    "account_filter": "CURATED_100K_PLUS_LIST; live follower count unavailable"})
+        return found
+    except Exception:
+        return []
 
 
 def fetch_x_news():
-    """Collect public X posts without an X API key.
-
-    First tries public RSSHub user timelines. If an RSSHub instance is unavailable,
-    falls back to Google News RSS results indexed from each public X profile.
-    Public RSS/index feeds do not reliably expose live follower counts, so the
-    configured account list is treated as a manually curated >=100k shortlist;
-    follower_count is deliberately left unknown rather than fabricated.
-    """
-    articles, errors = [], []
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; SALIGA-AI-PRO/31.3; +https://streamlit.io)"}
-    for username in dict.fromkeys(X_ACCOUNTS):
-        found_for_user = False
-        # Public RSSHub timeline mirrors: no X Bearer Token is requested by this app.
-        for base in X_RSSHUB_BASES:
+    """Fetch best-effort public X posts concurrently; never delays the AI loop for long."""
+    articles = []
+    usernames = list(dict.fromkeys(X_ACCOUNTS))
+    with ThreadPoolExecutor(max_workers=max(1, len(usernames))) as pool:
+        futures = [pool.submit(_fetch_one_x_account, username) for username in usernames]
+        for future in as_completed(futures, timeout=9):
             try:
-                response = requests.get(base + username, headers=headers, timeout=REQUEST_TIMEOUT)
-                response.raise_for_status()
-                root = ET.fromstring(response.content)
-                items = list(_feed_items(root))
-                if not items:
-                    continue
-                for raw in items[:10]:
-                    title = _clean_news_text(raw.get("title", ""), 300)
-                    description = _clean_news_text(raw.get("description", ""), 900)
-                    combined = (title + " " + description).lower()
-                    if not title or not any(term in combined for term in (
-                        "bitcoin", "btc", "crypto", "cryptocurrency", "ethereum", "eth ",
-                        "etf", "sec", "fed", "federal reserve", "inflation", "cpi", "rates",
-                        "treasury", "yield", "liquidation", "stablecoin", "blockchain",
-                        "market", "macro", "dollar", "usd", "oil", "risk-on", "risk off"
-                    )):
-                        continue
-                    link = raw.get("link", "")
-                    articles.append({
-                        "source": f"X @{username}", "title": title,
-                        "description": description,
-                        "published": _parse_feed_datetime(raw.get("published", "")),
-                        "link": link or f"https://x.com/{username}",
-                        "channel": "X", "followers": None, "engagement": 0,
-                        "account_filter": "CURATED_100K_PLUS_LIST; live follower count unavailable"
-                    })
-                    found_for_user = True
-                if found_for_user:
-                    break
-            except Exception as error:
-                errors.append(f"X RSS @{username} ({base}): {type(error).__name__}: {error}")
-
-        # Search-index fallback: can surface public X posts indexed by Google News.
-        if not found_for_user:
-            try:
-                query = requests.utils.quote(f'site:x.com/{username} (bitcoin OR BTC OR crypto OR macro OR ETF OR Fed)')
-                url = X_GOOGLE_NEWS_URL.format(query=query)
-                response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-                response.raise_for_status()
-                root = ET.fromstring(response.content)
-                for raw in list(_feed_items(root))[:8]:
-                    title = _clean_news_text(raw.get("title", ""), 300)
-                    description = _clean_news_text(raw.get("description", ""), 900)
-                    if not title:
-                        continue
-                    articles.append({
-                        "source": f"X @{username} (indexed)", "title": title,
-                        "description": description,
-                        "published": _parse_feed_datetime(raw.get("published", "")),
-                        "link": raw.get("link", "") or f"https://x.com/{username}",
-                        "channel": "X", "followers": None, "engagement": 0,
-                        "account_filter": "CURATED_100K_PLUS_LIST; live follower count unavailable"
-                    })
-                    found_for_user = True
-            except Exception as error:
-                errors.append(f"X indexed search @{username}: {type(error).__name__}: {error}")
-        if not found_for_user:
-            errors.append(f"X @{username}: no public RSS/indexed posts returned this refresh.")
-    return articles, errors
+                articles.extend(future.result())
+            except Exception:
+                continue
+    return articles, []
 
 
 def fetch_news():
@@ -1399,7 +1396,7 @@ def call_groq(payload):
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is missing from secrets.toml or environment.")
     system_prompt = (
-        "You are SALIGA AI PRO 31.3, an analytical BTC market intelligence engine. "
+        "You are SALIGA AI PRO 31.4, an analytical BTC market intelligence engine. "
         "Write every user-facing explanation in clear Hungarian. Keep JSON keys and direction values in the required schema, but all text values must be Hungarian. Output valid JSON only. Analyze technicals, order flow, liquidity, macro, news and especially the supplied support_resistance engine. "
         "S/R zones are high-priority context: evaluate strength, touches, timeframe confluence, rejection, volume confirmation, distance, role reversal, breakout/retest and false-breakout state. "
         "Do not call a zone a confirmed breakout unless candle closes beyond its boundary. Distinguish wick-only false breaks. "
@@ -1417,11 +1414,12 @@ def call_groq(payload):
         '"risk":"string","invalidation":"string"}'
     )
     request_data = {
-        "model": GROQ_MODEL, "temperature": 0.1, "max_tokens": 1700,
+        "model": GROQ_MODEL, "temperature": 0.1, "max_completion_tokens": 2600,
+        "reasoning_effort": "low", "reasoning_format": "hidden",
         "response_format": {"type": "json_object"},
+        # Groq recommends putting instructions in the user message for reasoning models.
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
+            {"role": "user", "content": system_prompt + "\n\nMARKET DATA JSON:\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
         ]
     }
     try:
@@ -1436,11 +1434,23 @@ def call_groq(payload):
         raise RuntimeError(f"Groq rate limit 429. Retry-After: {response.headers.get('Retry-After', 'not provided')}. AI result not marked successful.")
     if response.status_code >= 400:
         raise RuntimeError(f"Groq HTTP {response.status_code}: {response.text[:1000]}")
-    content = response.json()["choices"][0]["message"]["content"]
+    try:
+        body = response.json()
+        choice = body["choices"][0]
+        message = choice.get("message", {})
+        content = message.get("content")
+        if not content:
+            raise RuntimeError(f"Groq üres AI-választ adott. finish_reason={choice.get('finish_reason')}; válasz: {str(body)[:700]}")
+    except (ValueError, KeyError, IndexError, TypeError) as error:
+        raise RuntimeError(f"Groq válaszformátum-hiba: {type(error).__name__}: {error}; HTTP {response.status_code}; {response.text[:700]}") from error
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
-        parsed = json.loads(content.replace("```json", "").replace("```", "").strip())
+        cleaned = content.replace("```json", "").replace("```", "").strip()
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Groq nem érvényes JSON-t adott: {content[:700]}") from error
     if not isinstance(parsed, dict):
         raise RuntimeError("Groq returned an invalid response structure.")
     direction = str(parsed.get("direction", "WAIT")).upper()
@@ -1601,7 +1611,7 @@ def save_market_snapshot(price, oi, delta, funding, book):
 # ================================================================
 # MAIN APPLICATION
 # ================================================================
-st.title("₿ SALIGA AI PRO 31.3")
+st.title("₿ SALIGA AI PRO 31.4")
 st.caption("ULTIMATE BTC INTELLIGENCE ENGINE | OKX MARKET DATA | GROQ AI | ENHANCED MACRO + S/R")
 st.write(f"Last update: {now_string()}")
 errors = []
@@ -1894,7 +1904,7 @@ if news_analysis["articles"]:
         label = f"#{rank} | PRIORITÁS {article.get('priority', 0)} | {article['stance']} | {article['source']} | {article['title']}"
         with st.expander(label):
             st.write(article["description"])
-            st.markdown(f"**HÍR IRÁNYA: {article['stance']}** · Pontszám: {article['sentiment']:+d}")
+            st.markdown(f"**HÍR IRÁNYA: {article.get('stance', 'SEMLEGES')}** · Pontszám: {article.get('sentiment', 0):+d}")
             st.write(f"Priority: {article.get('priority', 0)}/15")
             st.write(f"Published: {article['published']}")
             if article.get("channel") == "X":
@@ -1903,8 +1913,9 @@ if news_analysis["articles"]:
 else:
     st.warning("No news articles available.")
 if news_errors:
-    st.warning("RSS source errors")
-    for error in news_errors: st.write(f"- {error}")
+    # Feed outages are non-fatal: display a compact summary instead of flooding
+    # the dashboard with a separate warning for every publisher.
+    st.caption(f"Néhány hírcsatorna most nem elérhető ({len(news_errors)} hiba). A többi forrásból érkező hírek és az AI-elemzés ettől még működnek.")
 
 # ---------------- MACRO ----------------
 st.divider()
@@ -2097,5 +2108,5 @@ if auto_refresh:
         st.warning("Install streamlit-autorefresh for automatic refresh.")
 
 # ================================================================
-# END OF SALIGA AI PRO 31.3
+# END OF SALIGA AI PRO 31.4
 # ================================================================
