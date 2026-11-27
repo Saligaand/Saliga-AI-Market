@@ -1,6 +1,6 @@
 # ================================================================
 # AI PRO by Sali
-# ULTIMATE BTC INTELLIGENCE ENGINE 31.5 (FIXED MACRO + GROQ AI)
+# ULTIMATE BTC INTELLIGENCE ENGINE 31.5
 # BTC ONLY | OKX | GROQ AI | NO EMA | NO SMA
 #
 # Analysis and paper trading only. No guarantee of profitability.
@@ -30,7 +30,7 @@ APP_NAME = "AI PRO by Sali"
 INSTRUMENT = "BTC-USDT-SWAP"
 BASE_URL = "https://www.okx.com"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
+GROQ_DEFAULT_MODEL = "openai/gpt-oss-120b"
 DATABASE_FILE = "saliga_ai_31.db"
 TIMEFRAMES = {"1m": "1m", "5m": "5m", "15m": "15m", "1H": "1H", "4H": "4H"}
 NEWS_FEEDS = {
@@ -139,6 +139,12 @@ def initialize_database():
             macro_lean TEXT DEFAULT 'NEUTRAL', notes TEXT
         )""")
     _ensure_column(connection, "macro_calendar", "macro_lean", "TEXT DEFAULT 'NEUTRAL'")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS processed_triggers (
+            trigger_key TEXT PRIMARY KEY,
+            created_at TEXT,
+            description TEXT
+        )""")
     connection.commit()
     connection.close()
 
@@ -849,10 +855,12 @@ def _fetch_forexfactory_calendar_cached():
                     "source": "FOREX_FACTORY_LIVE",
                     "notes": "Live public economic-calendar feed."
                 })
+        except requests.HTTPError as exc:
+            if "nextweek" not in url or not successful_sources:
+                errors.append(f"{url}: {type(exc).__name__}: {exc}")
         except Exception as exc:
             errors.append(f"{url}: {type(exc).__name__}: {exc}")
 
-    # Ha a Forex Factory JSON blokkolt vagy elérhetetlen, makró RSS-ből hozunk élő makró esemény-híreket
     if not successful_sources:
         for src_name, rss_url in MACRO_FALLBACK_RSS_URLS:
             try:
@@ -1345,6 +1353,39 @@ def analyze_news_sentiment(news):
 def calculate_news_hash(news):
     return hashlib.sha256("|".join(x["title"] for x in news).encode()).hexdigest()
 
+# ---------------- TRIGGER DEDUP & FRESHNESS ----------------
+def is_trigger_processed(trigger_key):
+    if not trigger_key:
+        return False
+    connection = get_connection()
+    row = connection.execute(
+        "SELECT 1 FROM processed_triggers WHERE trigger_key = ?",
+        (str(trigger_key),)
+    ).fetchone()
+    connection.close()
+    return row is not None
+
+def mark_trigger_processed(trigger_key, description=""):
+    if not trigger_key:
+        return
+    connection = get_connection()
+    connection.execute(
+        "INSERT OR IGNORE INTO processed_triggers (trigger_key, created_at, description) VALUES (?,?,?)",
+        (str(trigger_key), now_string(), str(description))
+    )
+    connection.commit()
+    connection.close()
+
+def is_article_fresh(published_str, max_age_minutes=30):
+    if not published_str:
+        return False
+    dt = _parse_feed_datetime(published_str)
+    parsed = _parse_ff_event_datetime(dt)
+    if parsed is None:
+        return False
+    age_minutes = (now_utc() - parsed).total_seconds() / 60.0
+    return 0 <= age_minutes <= max_age_minutes
+
 # ---------------- GROQ AI ----------------
 def call_groq(payload):
     if not GROQ_API_KEY:
@@ -1395,7 +1436,7 @@ def call_groq(payload):
         "risk_levels": payload.get("risk_levels"),
     }
     models_to_try = [GROQ_MODEL] if GROQ_MODEL else []
-    for fallback_model in ("llama-3.3-70b-versatile", "llama-3.1-8b-instant"):
+    for fallback_model in ("openai/gpt-oss-120b", "openai/gpt-oss-20b"):
         if fallback_model not in models_to_try:
             models_to_try.append(fallback_model)
 
@@ -1640,6 +1681,13 @@ news_raw, news_errors = fetch_news()
 st.session_state.last_news = news_raw
 news_analysis = analyze_news_sentiment(news_raw)
 news_id = calculate_news_hash(news_raw)
+
+# Régebbi hírek megjelölése feldolgozottként, hogy oldalnyitáskor ne nyisson rájuk azonnal
+for art in news_analysis.get("articles", []):
+    akey = hashlib.sha256((art.get("source", "") + "|" + art.get("title", "")).lower().encode()).hexdigest()
+    tkey = f"NEWS|{akey}"
+    if not is_article_fresh(art.get("published"), max_age_minutes=30):
+        mark_trigger_processed(tkey, f"AGED_ON_LOAD: {art.get('title')}")
 
 structure = market_structure(main_df)
 regime = market_regime(main_df)
@@ -2075,3 +2123,7 @@ if auto_refresh:
         st_autorefresh(interval=refresh_seconds * 1000, key="saliga_auto_refresh")
     except ImportError:
         st.warning("Install streamlit-autorefresh for automatic refresh.")
+
+# ================================================================
+# END OF SALIGA AI PRO 31.5
+# ================================================================
