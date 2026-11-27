@@ -1,21 +1,7 @@
 # ================================================================
 # AI PRO by Sali
-# ULTIMATE BTC INTELLIGENCE ENGINE 31.2
+# ULTIMATE BTC INTELLIGENCE ENGINE 31.2 (FIXED TRIGGER EDITION)
 # BTC ONLY | OKX | GROQ AI | NO EMA | NO SMA
-#
-# Original 31.0 features retained:
-# Secrets, SQLite/migrations, OKX market data, MTF, market structure/regime,
-# OI, funding, order book, delta, position flow, liquidity sweep,
-# breakout/retest, divergences, historical patterns, RSS news,
-# Groq AI, macro calendar/directional macro engine, conflict/macro gate,
-# entry quality, risk management, paper trading, fees/slippage,
-# signal/event journals, CSV exports, API health and dashboard.
-#
-# Enhanced in 31.1 S/R + 31.2 live macro calendar:
-# Multi-timeframe Support/Resistance zones, clustered pivot levels,
-# independent touch counting, rejection/volume/recency scoring,
-# role reversal, false-breakout detection, breakout/retest states,
-# S/R confluence score, AI payload and chart zone visualization.
 #
 # Analysis and paper trading only. No guarantee of profitability.
 # ================================================================
@@ -131,7 +117,8 @@ DEFAULT_STATE = {
     "last_ai_time": 0, "last_ai_result": None, "last_ai_error": None,
     "last_news_hash": None, "last_trigger_time": 0, "last_oi": None,
     "last_price": None, "last_refresh": None, "last_news": [],
-    "last_data_errors": [], "seen_news_keys": [], "alerted_macro_keys": []
+    "last_data_errors": [], "seen_news_keys": [], "alerted_macro_keys": [],
+    "triggered_event_keys": []
 }
 for key, value in DEFAULT_STATE.items():
     if key not in st.session_state:
@@ -145,6 +132,8 @@ st.sidebar.caption(f"Model: {GROQ_MODEL}")
 ai_enabled = st.sidebar.toggle("Groq AI enabled", value=True)
 macro_gate_enabled = st.sidebar.toggle("Macro event gate (<=1h HIGH)", value=True)
 macro_directional_weight = st.sidebar.slider("Macro directional influence", 0.0, 15.0, 8.0, 0.5)
+news_macro_trigger_enabled = st.sidebar.toggle("News / Macro auto-entry trigger", value=True)
+min_news_sentiment = st.sidebar.slider("Min news sentiment strength", 1, 2, 1)
 auto_refresh = st.sidebar.toggle("Automatic refresh", value=True)
 refresh_seconds = st.sidebar.slider("Refresh interval", 15, 120, 30)
 ai_interval = st.sidebar.slider("Normal AI interval (minutes)", 5, 60, 15)
@@ -376,7 +365,6 @@ def market_structure(df):
 
 # ---------------- ENHANCED SUPPORT / RESISTANCE ENGINE ----------------
 def _pivot_points(df, left=3, right=3):
-    """Confirmed swing pivots. The right-side bars prevent using unconfirmed pivots."""
     points = []
     if df.empty or len(df) < left + right + 5:
         return points
@@ -391,7 +379,6 @@ def _pivot_points(df, left=3, right=3):
     return points
 
 def _cluster_sr_points(points, tolerance):
-    """Cluster nearby pivot prices; each cluster becomes a price zone."""
     clusters = []
     for point in sorted(points, key=lambda x: x["price"]):
         chosen = None
@@ -413,12 +400,9 @@ def _score_sr_cluster(cluster, df, timeframe, current_price, atr):
     spread = float(np.max(prices) - np.min(prices)) if len(prices) > 1 else 0.0
     zone_half = max(atr * 0.12, center * 0.00025, spread * 0.55)
     lower, upper = center - zone_half, center + zone_half
-    # Count independent reactions, not adjacent candles repeatedly touching the same zone.
     touch_indices = []
     rejection_strengths = []
     volumes = []
-    # Evaluate pivots in chronological order so nearby price-sorted points
-    # cannot accidentally suppress or inflate independent reaction counts.
     for point in sorted(cluster, key=lambda item: item["index"]):
         idx = int(point["index"])
         if not touch_indices or idx - touch_indices[-1] >= 3:
@@ -458,7 +442,6 @@ def _score_sr_cluster(cluster, df, timeframe, current_price, atr):
 def _build_sr_zones_for_timeframe(df, timeframe):
     if df.empty or len(df) < 35:
         return []
-    # Use timeframe-adaptive pivots and ATR; pivot history is limited to avoid stale zones.
     work = df.tail(260).reset_index(drop=True)
     atr = safe_float(work["atr"].iloc[-1], 0.0) if "atr" in work else 0.0
     price = safe_float(work["close"].iloc[-1])
@@ -483,7 +466,6 @@ def _build_sr_zones_for_timeframe(df, timeframe):
     return zones
 
 def analyze_support_resistance(timeframe_data, current_price):
-    """Multi-timeframe S/R confluence, zone strength, breakout and role-reversal logic."""
     all_zones = []
     for tf in ("1m", "5m", "15m", "1H", "4H"):
         df = timeframe_data.get(tf, pd.DataFrame())
@@ -496,7 +478,6 @@ def analyze_support_resistance(timeframe_data, current_price):
             "zones": [], "directional_score": 0, "summary": "No valid price."
         }
 
-    # Merge zones across timeframes when their price bands overlap or centers are close.
     merged = []
     for zone in sorted(all_zones, key=lambda z: z["center"]):
         match = None
@@ -522,7 +503,6 @@ def analyze_support_resistance(timeframe_data, current_price):
             match["rejection"] = round(max(match["rejection"], zone["rejection"]), 3)
             match["volume_confirmation"] = round(max(match["volume_confirmation"], zone["volume_confirmation"]), 3)
 
-    # Classify zones relative to price and detect breaks / failed breaks.
     for zone in merged:
         if zone["lower"] <= current_price <= zone["upper"]:
             zone["position"] = "PRICE INSIDE ZONE"
@@ -533,8 +513,6 @@ def analyze_support_resistance(timeframe_data, current_price):
         zone["distance"] = abs(current_price - zone["center"])
         zone["distance_pct"] = zone["distance"] / current_price * 100
         zone["mtf_confluence"] = len(zone["timeframes"])
-        # Reversal of function: old resistance below price may now act as support;
-        # old support above price may now act as resistance after a move through it.
         if zone["position"] == "BELOW PRICE" and zone["type"] == "RESISTANCE":
             zone["role"] = "POSSIBLE RESISTANCE-TO-SUPPORT"
         elif zone["position"] == "ABOVE PRICE" and zone["type"] == "SUPPORT":
@@ -545,7 +523,6 @@ def analyze_support_resistance(timeframe_data, current_price):
 
     supports = [z for z in merged if z["upper"] < current_price and z["type"] == "SUPPORT"]
     resistances = [z for z in merged if z["lower"] > current_price and z["type"] == "RESISTANCE"]
-    # A broken prior resistance/support may be used as a role-reversal candidate.
     supports += [z for z in merged if z["upper"] < current_price and z["role"] == "POSSIBLE RESISTANCE-TO-SUPPORT"]
     resistances += [z for z in merged if z["lower"] > current_price and z["role"] == "POSSIBLE SUPPORT-TO-RESISTANCE"]
     nearest_support = max(supports, key=lambda z: z["center"], default=None)
@@ -553,7 +530,6 @@ def analyze_support_resistance(timeframe_data, current_price):
     strongest_support = max(supports, key=lambda z: z["score"], default=None)
     strongest_resistance = max(resistances, key=lambda z: z["score"], default=None)
 
-    # Latest candle across the principal execution timeframe, otherwise first available.
     execution_df = timeframe_data.get("5m", pd.DataFrame())
     if execution_df.empty:
         execution_df = timeframe_data.get("1m", pd.DataFrame())
@@ -585,7 +561,6 @@ def analyze_support_resistance(timeframe_data, current_price):
         elif nearest_support and safe_float(last["close"]) < nearest_support["center"] and safe_float(last["high"]) >= nearest_support["lower"] and safe_float(last["close"]) <= nearest_support["lower"]:
             breakout_state = "BEARISH RETEST OF BROKEN SUPPORT"
 
-    # Bounded directional contribution; proximity to a strong zone is context, not a signal alone.
     directional_score = 0.0
     if nearest_support:
         proximity = clamp(1 - nearest_support["distance_pct"] / 1.5, 0, 1)
@@ -1054,12 +1029,6 @@ def get_macro_calendar_data(lookahead_days=14, lookback_days=2):
         "events": enriched
     }
 
-def _lean_to_signed_tilt(lean):
-    value = str(lean or "NEUTRAL").upper()
-    if value in ("HAWKISH_RISK", "BEARISH_BTC"): return -1.0
-    if value in ("DOVISH_RELIEF", "BULLISH_BTC"): return 1.0
-    return 0.0
-
 def analyze_macro_signal(macro_calendar, news_analysis=None, funding=None, directional_weight=8.0):
     risk_window = macro_calendar.get("risk_window", "CALENDAR DATA UNAVAILABLE")
     next_hi, next_minor = macro_calendar.get("next_high_impact"), macro_calendar.get("next_minor_impact")
@@ -1180,7 +1149,6 @@ def calculate_entry_quality(df, structure, regime, oi, delta, book, liquidity, m
     score = raw_score + components["macro"]
     direction = "LONG" if score > 0 else "SHORT" if score < 0 else "WAIT"
 
-    # --- Ellenállás előtti LONG ellenőrzés (room-to-resistance check) ---
     sr_blocked = False
     if direction == "LONG" and isinstance(sr_analysis, dict):
         price = safe_float(df["close"].iloc[-1])
@@ -1385,7 +1353,58 @@ def calculate_risk_levels(price, atr, direction, regime):
         return None
     return {"entry": price, "stop": stop, "tp1": tp1, "tp2": tp2, "tp3": tp3}
 
-# ---------------- PAPER TRADING ----------------
+# ---------------- NEWS / MACRO & STRONG ENTRY TRIGGER ----------------
+def detect_fixed_entry_trigger(news_analysis, macro_calendar, unified_signal, entry):
+    """
+    Kiváltja a fix pozíciót:
+    1) Új, egyértelműen bikás (LONG) vagy medvés (SHORT) hírre
+    2) Újonnan megjelent (Actual adatot kapott) bikás/medvés makró eseményre
+    3) Ha nincs új hír/makró trigger, erős összesített jelzésre (actionable / quality >= 75)
+    """
+    triggered_keys = set(st.session_state.get("triggered_event_keys", []))
+
+    if news_macro_trigger_enabled:
+        for article in news_analysis.get("articles", []):
+            key = hashlib.sha256(
+                (article.get("source", "") + "|" + article.get("title", "")).lower().encode()
+            ).hexdigest()
+            trig_key = f"NEWS|{key}"
+            stance = article.get("stance", "Neutral")
+            strength = abs(safe_float(article.get("sentiment"), 0))
+            if trig_key not in triggered_keys and strength >= min_news_sentiment and stance in ("Bullish", "Bearish"):
+                return {
+                    "active": True,
+                    "direction": "LONG" if stance == "Bullish" else "SHORT",
+                    "reason": f"HÍR [{stance}]: {article.get('title')}",
+                    "trigger_key": trig_key
+                }
+
+        for ev in macro_calendar.get("events", []):
+            ev_key = f"{ev.get('date')}|{ev.get('time_utc')}|{ev.get('currency')}|{ev.get('event')}"
+            hours_until = safe_float(ev.get("hours_until"), 999)
+            actual = str(ev.get("actual") or "").strip()
+            stance = ev.get("stance", "Neutral")
+            has_release = hours_until <= 0 and actual not in ("", "-", "N/A", "NA", "--", "TBD")
+            trig_key = f"MACRO|{ev_key}|{actual}"
+            if has_release and stance in ("Bullish", "Bearish") and trig_key not in triggered_keys:
+                return {
+                    "active": True,
+                    "direction": "LONG" if stance == "Bullish" else "SHORT",
+                    "reason": f"MAKRO [{stance}]: {ev.get('currency')} {ev.get('event')} (Actual: {actual})",
+                    "trigger_key": trig_key
+                }
+
+    if unified_signal.get("actionable") and unified_signal.get("direction") in ("LONG", "SHORT"):
+        return {
+            "active": True,
+            "direction": unified_signal["direction"],
+            "reason": f"ERŐS BELÉPÉSI JEL ({entry.get('quality', 0):.1f}/100)",
+            "trigger_key": None
+        }
+
+    return {"active": False, "direction": None, "reason": "Nincs új belépési jel", "trigger_key": None}
+
+# ---------------- PAPER TRADING (FIXED LEVELS) ----------------
 def get_open_trade():
     connection = get_connection()
     row = connection.execute("SELECT * FROM paper_trades WHERE status='OPEN' ORDER BY id DESC LIMIT 1").fetchone()
@@ -1397,22 +1416,38 @@ def get_paper_equity():
     pnl = safe_float(closed.iloc[0]["pnl"]) if not closed.empty else 0
     return starting_balance + pnl
 
-def open_paper_trade(direction, levels, score):
-    if not paper_enabled or levels is None or get_open_trade() is not None: return
+def open_fixed_paper_trade(direction, levels, score, reason, trigger_key=None):
+    if not paper_enabled or levels is None or get_open_trade() is not None:
+        return False
     equity = get_paper_equity()
     risk_amount = equity * risk_percent / 100
-    distance = abs(levels["entry"] - levels["stop"])
-    if distance <= 0: return
+    distance = abs(safe_float(levels["entry"]) - safe_float(levels["stop"]))
+    if distance <= 0:
+        return False
     quantity = risk_amount / distance
     connection = get_connection()
     connection.execute(
-        """INSERT INTO paper_trades (opened,direction,entry,stop,tp1,tp2,tp3,quantity,score,status)
-        VALUES (?,?,?,?,?,?,?,?,?,'OPEN')""",
-        (now_string(), direction, levels["entry"], levels["stop"], levels["tp1"], levels["tp2"], levels["tp3"], quantity, score)
+        """INSERT INTO paper_trades
+        (opened,direction,entry,stop,tp1,tp2,tp3,quantity,score,status,reason)
+        VALUES (?,?,?,?,?,?,?,?,?,'OPEN',?)""",
+        (
+            now_string(), direction,
+            safe_float(levels["entry"]), safe_float(levels["stop"]),
+            safe_float(levels["tp1"]), safe_float(levels["tp2"]), safe_float(levels["tp3"]),
+            quantity, safe_float(score), str(reason)
+        )
     )
     connection.commit()
     connection.close()
-    add_event("PAPER TRADE", f"Opened {direction} at {levels['entry']:.2f}")
+    if trigger_key:
+        keys = list(st.session_state.get("triggered_event_keys", []))
+        if trigger_key not in keys:
+            keys.append(trigger_key)
+            st.session_state.triggered_event_keys = keys[-300:]
+    msg = f"FIX POZÍCIÓ NYITVA [{direction}] @ {levels['entry']:.2f} | SL: {levels['stop']:.2f} | TP1: {levels['tp1']:.2f} | {reason}"
+    add_event("PAPER TRADE", msg)
+    send_telegram_alert(msg)
+    return True
 
 def close_paper_trade(trade, exit_price, reason, funding_rate=0):
     entry, quantity = safe_float(trade["entry"]), safe_float(trade["quantity"])
@@ -1429,19 +1464,22 @@ def close_paper_trade(trade, exit_price, reason, funding_rate=0):
     )
     connection.commit()
     connection.close()
-    add_event("PAPER TRADE", f"Closed {trade['direction']} | {reason} | Net PnL {net:.2f} USDT")
+    msg = f"FIX POZÍCIÓ ZÁRVA [{trade['direction']}] | {reason} | Net PnL: {net:.2f} USDT"
+    add_event("PAPER TRADE", msg)
+    send_telegram_alert(msg)
 
 def manage_paper_trade(df, funding_rate=0):
     trade = get_open_trade()
-    if trade is None or df.empty: return
+    if trade is None or df.empty:
+        return
     latest = df.iloc[-1]
     high, low = safe_float(latest["high"]), safe_float(latest["low"])
-    stop_hit = low <= trade["stop"] if trade["direction"] == "LONG" else high >= trade["stop"]
-    target_hit = high >= trade["tp1"] if trade["direction"] == "LONG" else low <= trade["tp1"]
+    stop_hit = low <= safe_float(trade["stop"]) if trade["direction"] == "LONG" else high >= safe_float(trade["stop"])
+    target_hit = high >= safe_float(trade["tp1"]) if trade["direction"] == "LONG" else low <= safe_float(trade["tp1"])
     if stop_hit:
-        close_paper_trade(trade, trade["stop"], "STOP LOSS", funding_rate)
+        close_paper_trade(trade, safe_float(trade["stop"]), "STOP LOSS", funding_rate)
     elif target_hit:
-        close_paper_trade(trade, trade["tp1"], "TAKE PROFIT 1", funding_rate)
+        close_paper_trade(trade, safe_float(trade["tp1"]), "TAKE PROFIT 1", funding_rate)
 
 # ---------------- PERFORMANCE ----------------
 def get_performance():
@@ -1471,7 +1509,7 @@ def save_market_snapshot(price, oi, delta, funding, book):
 # MAIN APPLICATION
 # ================================================================
 st.title("₿ SALIGA AI PRO 31.2")
-st.caption("ULTIMATE BTC INTELLIGENCE ENGINE | OKX MARKET DATA | GROQ AI | ENHANCED MACRO + S/R")
+st.caption("ULTIMATE BTC INTELLIGENCE ENGINE | OKX MARKET DATA | GROQ AI | FIXED SIGNAL & NEWS/MACRO TRADES")
 st.write(f"Last update: {now_string()}")
 errors = []
 
@@ -1530,7 +1568,6 @@ book = analyze_order_book(book_raw)
 oi = analyze_open_interest(oi_raw)
 funding = analyze_funding(funding_raw)
 macro_calendar = get_macro_calendar_data()
-process_news_and_macro_alerts(news_analysis, macro_calendar)
 macro_signal = analyze_macro_signal(macro_calendar, news_analysis=news_analysis, funding=funding, directional_weight=macro_directional_weight)
 macro = get_macro_status(macro_calendar, macro_signal)
 liquidity = analyze_liquidity(main_df)
@@ -1604,11 +1641,22 @@ if not GROQ_API_KEY and ai_enabled:
 ai_gate = check_ai_gate(entry, ai_result, macro_signal=macro_signal, macro_gate_active=macro_gate_enabled)
 unified_signal = build_unified_signal(entry, ai_result, ai_gate, macro_signal, risk_levels)
 
+# Először megnézzük a friss hír/makró/jel trigger-t, és csak utána jelöljük meg a híreket/makrókat riasztottként
+fixed_trigger = detect_fixed_entry_trigger(news_analysis, macro_calendar, unified_signal, entry)
+process_news_and_macro_alerts(news_analysis, macro_calendar)
+
 funding_rate = funding_raw["funding"] if funding_raw and "funding" in funding_raw else 0
 if paper_enabled:
     manage_paper_trade(df1 if not df1.empty else main_df, funding_rate)
-    if unified_signal["actionable"]:
-        open_paper_trade(unified_signal["direction"], risk_levels, entry["score"])
+    if fixed_trigger["active"] and fixed_trigger["direction"] in ("LONG", "SHORT"):
+        fixed_levels = calculate_risk_levels(price, atr, fixed_trigger["direction"], regime)
+        open_fixed_paper_trade(
+            fixed_trigger["direction"],
+            fixed_levels,
+            entry["score"],
+            fixed_trigger["reason"],
+            trigger_key=fixed_trigger.get("trigger_key")
+        )
 
 connection = get_connection()
 connection.execute(
@@ -1640,6 +1688,7 @@ sig2.metric("TECHNICAL DIRECTION", entry["direction"])
 sig3.metric("ENTRY QUALITY", f"{entry['quality']:.1f}/100")
 sig4.metric("MACRO SIGNAL STATUS", macro_signal["status"])
 st.write(f"**Signal breakdown:** {unified_signal['summary']}")
+st.write(f"**Fixed entry trigger:** {fixed_trigger['reason'] if fixed_trigger['active'] else 'Várakozás új hírre, makró adatra vagy erős belépési jelre'}")
 st.write(f"**Entry stage:** {entry['stage']}")
 st.write(f"**Market regime:** {regime['regime']} | **Volatility:** {regime['volatility']}")
 st.write(f"**Macro bias & note:** {macro_signal['bias']} (Tilt: {macro_signal['directional_score']:+.2f}) — {macro_signal['reason']}")
@@ -1665,10 +1714,20 @@ if sr_analysis["zones"]:
 else:
     st.info("Not enough confirmed pivots to build reliable S/R zones.")
 
-# ---------------- RISK LEVELS ----------------
+# ---------------- RISK LEVELS (FIXED WHEN TRADE IS OPEN) ----------------
 st.divider()
 st.subheader("Risk Management")
-if risk_levels:
+active_open_trade = get_open_trade()
+if active_open_trade:
+    st.success(f"FIX NYITOTT POZÍCIÓ ({active_open_trade['direction']}) — Ok: {active_open_trade.get('reason') or '-'}")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("FIXED ENTRY", f"${safe_float(active_open_trade['entry']):,.2f}")
+    r2.metric("FIXED STOP LOSS", f"${safe_float(active_open_trade['stop']):,.2f}")
+    r3.metric("FIXED TP1", f"${safe_float(active_open_trade['tp1']):,.2f}")
+    r4.metric("FIXED TP2", f"${safe_float(active_open_trade['tp2']):,.2f}")
+    st.write(f"FIXED TP3: ${safe_float(active_open_trade['tp3']):,.2f} | Opened: {active_open_trade['opened']}")
+elif risk_levels:
+    st.caption("Jelenleg nincs nyitott fix pozíció — alább az aktuális piaci szintbecslés látható:")
     r1, r2, r3, r4 = st.columns(4)
     r1.metric("ENTRY", f"${risk_levels['entry']:,.2f}")
     r2.metric("STOP LOSS", f"${risk_levels['stop']:,.2f}")
