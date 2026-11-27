@@ -1406,18 +1406,18 @@ def call_groq(payload):
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is missing from secrets.toml or environment.")
     system_prompt = (
-        "You are SALIGA AI PRO 31.5, an analytical BTC market intelligence engine. Write every user-facing explanation in clear Hungarian. "
-        "Output valid JSON only. Analyze technicals, order flow, liquidity, macro, news and especially the supplied support_resistance engine. "
-        "S/R zones are high-priority context: evaluate strength, touches, timeframe confluence, rejection, volume confirmation, distance, role reversal, breakout/retest and false-breakout state. "
-        "Do not call a zone a confirmed breakout unless candle closes beyond its boundary. Distinguish wick-only false breaks. "
-        "Do not let S/R alone force a trade. Respect macro gate, technical conflicts and risk management. "
-        "If imminent HIGH impact macro event within 1h, lean WAIT or conflict=true unless a clear post-event move is established. "
-        "Use the live economic calendar Actual vs Forecast vs Previous fields. Only treat a release as published when Actual is present; never invent missing values or release dates. Explain the likely BTC impact of verified surprises, and distinguish scheduled-event volatility risk from directional macro bias. If the calendar feed is unavailable, explicitly say macro calendar data is unavailable rather than assuming no events. "
-        "Return this exact JSON structure: "
-        '{"direction":"LONG","confidence":0,"conflict":false,"summary":"string",'
-        '"technical_analysis":"string","order_flow_analysis":"string","liquidity_analysis":"string",'
-        '"support_resistance_analysis":"string","macro_analysis":"string","news_impact":"string",'
-        '"risk":"string","invalidation":"string"}'
+        "You are SALIGA AI PRO 31.5, an analytical BTC market intelligence engine. "
+        "Write every user-facing explanation in clear Hungarian. "
+        "Respond ONLY with a single valid JSON object (no markdown fences, no extra text). "
+        "Analyze technicals, order flow, liquidity, macro, news and especially support_resistance. "
+        "Do not call a zone a confirmed breakout unless candle closes beyond its boundary. "
+        "Respect macro gate, technical conflicts and risk management. "
+        "If calendar feed is unavailable, state that macro calendar data is unavailable. "
+        "JSON keys required: "
+        '{"direction":"LONG|SHORT|WAIT","confidence":0,"conflict":false,"summary":"...",'
+        '"technical_analysis":"...","order_flow_analysis":"...","liquidity_analysis":"...",'
+        '"support_resistance_analysis":"...","macro_analysis":"...","news_impact":"...",'
+        '"risk":"...","invalidation":"..."}'
     )
     compact_headlines = []
     for h in (payload.get("news", {}).get("headlines", []) or [])[:5]:
@@ -1468,8 +1468,7 @@ def call_groq(payload):
         request_data = {
             "model": model_name,
             "temperature": 0.1,
-            "max_tokens": 1300,
-            "response_format": {"type": "json_object"},
+            "max_tokens": 2200,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":"))}
@@ -1497,13 +1496,21 @@ def call_groq(payload):
                 last_err = RuntimeError(f"Groq HTTP {response.status_code} ({model_name}): {response.text[:600]}")
                 break
 
-            content = response.json()["choices"][0]["message"]["content"]
+            content = (response.json()["choices"][0]["message"].get("content") or "").strip()
+            cleaned = content.replace("```json", "").replace("```", "").strip()
+            match = re.search(r"\{.*\}", cleaned, re.S)
+            json_str = match.group(0) if match else cleaned
             try:
-                parsed = json.loads(content)
-            except json.JSONDecodeError:
-                parsed = json.loads(content.replace("```json", "").replace("```", "").strip())
+                parsed = json.loads(json_str)
+            except Exception as exc:
+                last_err = RuntimeError(f"Groq JSON parse error ({model_name}): {exc} | Raw: {content[:300]}")
+                if attempt == 0:
+                    continue
+                break
+
             if not isinstance(parsed, dict):
-                raise RuntimeError("Groq returned an invalid response structure.")
+                last_err = RuntimeError("Groq returned an invalid response structure.")
+                break
             direction = str(parsed.get("direction", "WAIT")).upper()
             parsed["direction"] = direction if direction in ("LONG", "SHORT", "WAIT") else "WAIT"
             parsed["conflict"] = bool(parsed.get("conflict", False))
